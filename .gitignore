@@ -1,0 +1,8 @@
+.idea/
+.last-cleanup
+shell-snapshots/
+sessions/
+session-env/
+tasks/
+projects/*/*
+!projects/*/memory

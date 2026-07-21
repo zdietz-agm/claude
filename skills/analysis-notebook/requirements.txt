@@ -1,0 +1,5 @@
+# Pinned to versions installed on this machine as of 2026-07-21.
+# Install manually: pip install -r requirements.txt
+pandas==2.3.3
+numpy==2.3.4
+matplotlib==3.10.7

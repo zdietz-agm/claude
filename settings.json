@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Bash(*)"
+    ],
+    "defaultMode": "default"
+  },
+  "autoApprove": true,
+  "theme": "light-daltonized"
+}

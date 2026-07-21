@@ -1,0 +1,5 @@
+- [Never suppress call outputs](feedback_never_suppress_output.md) -- don't redirect/suppress stdout from library calls
+- [Spread recap process](spread_recap_process.md) -- how to build position recaps from for_claude.xlsx-style files (use Price column, sum YTD PnL legs, back out avg cost)
+- [Backtest imbal timing: use t not t-1](backtest_imbal_t_vs_tm1.md) -- BTIC backtest gate should look up imbal at t (not t-1); prod's cap_time aligns sub-$1M median with backtest DB at t
+- [355PM 7/17 no-fill investigation](355pm_grouping_code_collision_bug.md) -- resolved: wrong logfile read; fills real, no gc collision; open: 7/16 CLOSER filled>attempted in algo_trade_log
+- [PyCharm pinned to 2024.2](pycharm-version-2024-2.md) -- intentional rollback from 2026.1 (Jupyter display()-in-loop render bug); don't suggest upgrading; test loop-display before any future upgrade
