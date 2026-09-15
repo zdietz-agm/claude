@@ -1,0 +1,113 @@
+import io
+
+def sub(s, old, new, path):
+    assert s.count(old) == 1, f"{path}: pattern not unique/found:\n{old[:120]}"
+    return s.replace(old, new)
+
+p = 'D:/agent_projects/large_index_flows/baseline_richness.py'
+s = io.open(p, encoding='utf-8').read()
+s = sub(s, '''def strangle_cost_bps(eng, symbol, date, spot, entry_time, otm_bps=0, window_sec=bs.ENTRY_WINDOW_SEC):
+    """Closest-OTM (>= otm_bps) call + put cost in bps of spot at entry_time on one day; NaN if no chain."""''',
+'''def strangle_cost_bps(eng, symbol, date, spot, entry_time, otm_bps=0, window_sec=bs.ENTRY_WINDOW_SEC, leg=None):
+    """Closest-OTM (>= otm_bps) call + put cost in bps of spot at entry_time on one day; NaN if no chain.
+    leg='call' or 'put' prices only that leg (wrong-way variant); None = both legs."""''', p)
+s = sub(s, '''    call_px, _ = bs.median_fill(q, k_call, 'Call')
+    put_px, _ = bs.median_fill(q, k_put, 'Put')
+    return (call_px + put_px) / spot * 1e4, k_call, k_put''',
+'''    call_px, _ = bs.median_fill(q, k_call, 'Call')
+    put_px, _ = bs.median_fill(q, k_put, 'Put')
+    cost = call_px if leg == 'call' else put_px if leg == 'put' else call_px + put_px
+    return cost / spot * 1e4, k_call, k_put''', p)
+s = sub(s, '''def build(eng, entry_time, save=True):
+    """One row per event: event cost_bps, each baseline Friday's cost_bps, baseline median, richness."""''',
+'''def build(eng, entry_time, save=True, leg_map=None):
+    """One row per event: event cost_bps, each baseline Friday's cost_bps, baseline mean, richness.
+    leg_map: optional {(eff_date, symbol): 'call'|'put'} to price a single leg (wrong-way variant)."""''', p)
+s = sub(s, '''        ev_bps, kc, kp = strangle_cost_bps(eng, ev.symbol, ev.eff_date, ev.spot_1500, entry_time)''',
+'''        leg = leg_map.get((ev.eff_date, ev.symbol)) if leg_map else None
+        ev_bps, kc, kp = strangle_cost_bps(eng, ev.symbol, ev.eff_date, ev.spot_1500, entry_time, leg=leg)''', p)
+s = sub(s, '''            base[d], _, _ = strangle_cost_bps(eng, ev.symbol, d, spot, entry_time)''',
+'''            base[d], _, _ = strangle_cost_bps(eng, ev.symbol, d, spot, entry_time, leg=leg)''', p)
+io.open(p, 'w', encoding='utf-8').write(s)
+
+p = 'D:/agent_projects/large_index_flows/export_backtest_excel.py'
+s = io.open(p, encoding='utf-8').read()
+s = sub(s, '''EVENT_TYPE = {('sp500_add', 'buy'): 'ADD', ('other_index_event', 'buy'): 'UPWGT', ('other_index_event', 'sell'): 'DOWNWGT'}''',
+'''EVENT_TYPE = {('sp500_add', 'buy'): 'ADD', ('other_index_event', 'buy'): 'UPWGT', ('other_index_event', 'sell'): 'DOWNWGT'}
+WRONG_WAY = {'ADD': 'put', 'UPWGT': 'put', 'DOWNWGT': 'call'}   # option that pays if the index flow reverses''', p)
+s = sub(s, '''              max_pushes=bs.MAX_PUSHES):
+    """One row per event for `entry_time` (hold to expiry), columns per COLUMNS + TAIL_COLS (baseline-Friday
+    richness and realized-vol richness), sorted by est_flow_bn desc. Args -- eng: dev engine; entry_time: entry
+    snap; flows: eff_date/symbol/event_type frame; spread_paid: fraction of spread paid; otm_bps: min OTM per leg;
+    window_sec: median-fill window; max_pushes: one-strike push-outs allowed when cost > MAX_COST_BPS."""''',
+'''              max_pushes=bs.MAX_PUSHES, wrong_way=False):
+    """One row per event for `entry_time` (hold to expiry), columns per COLUMNS + TAIL_COLS (baseline-Friday
+    richness and realized-vol richness), sorted by est_flow_bn desc. Args -- eng: dev engine; entry_time: entry
+    snap; flows: eff_date/symbol/event_type frame; spread_paid: fraction of spread paid; otm_bps: min OTM per leg;
+    window_sec: median-fill window; max_pushes: one-strike push-outs allowed when cost > MAX_COST_BPS;
+    wrong_way: buy only the leg that pays if the flow reverses (put on ADD/UPWGT, call on DOWNWGT) -- cost,
+    payout, pnl, winner and both richness measures then refer to that single leg."""''', p)
+s = sub(s, '''        total = c['px'] + p['px']
+        payoff = max(r.close - r.call_strike, 0.0) + max(r.put_strike - r.close, 0.0)
+        rows.append({
+            'eff_date': r.eff_date, 'symbol': r.symbol, 'pnl_bps': r.pnl_hold_bps,
+            'event_type': EVENT_TYPE.get((r.event_type, r.direction), r.event_type),''',
+'''        etype = EVENT_TYPE.get((r.event_type, r.direction), r.event_type)
+        leg = WRONG_WAY[etype] if wrong_way else 'both'
+        call_intr = max(r.close - r.call_strike, 0.0)
+        put_intr = max(r.put_strike - r.close, 0.0)
+        if leg == 'call':
+            total, payoff = c['px'], call_intr
+        elif leg == 'put':
+            total, payoff = p['px'], put_intr
+        else:
+            total, payoff = c['px'] + p['px'], call_intr + put_intr
+        pnl_bps = (payoff - total) / r.spot_1500 * 1e4
+        winner = ('call' if call_intr > 0 and leg != 'put' else 'put' if put_intr > 0 and leg != 'call' else 'none')
+        rows.append({
+            'eff_date': r.eff_date, 'symbol': r.symbol, 'pnl_bps': pnl_bps, 'traded_leg': leg,
+            'event_type': etype,''', p)
+s = sub(s, '''            'total_cost': total, 'total_cost_bps': r.cost_bps,
+            'payout': (payoff - total) / total if total else np.nan,   # net: -1 = expired worthless
+            'winner': r.winner,''',
+'''            'total_cost': total, 'total_cost_bps': total / r.spot_1500 * 1e4,
+            'payout': (payoff - total) / total if total else np.nan,   # net: -1 = expired worthless
+            'winner': winner,''', p)
+s = sub(s, '''    tab = pd.DataFrame(rows)[COLUMNS]
+    # trailing richness columns: baseline Fridays (annc Friday excluded, mean) and realized-vol one-day move
+    base = br.build(eng, entry_time, save=False)''',
+'''    tab = pd.DataFrame(rows)[COLUMNS]
+    # trailing richness columns: baseline Fridays (annc Friday excluded, mean) and realized-vol one-day move,
+    # priced on the same leg(s) as the trade
+    leg_map = ({(r.eff_date, r.symbol): r.traded_leg for r in tab.itertuples(index=False)} if wrong_way else None)
+    base = br.build(eng, entry_time, save=False, leg_map=leg_map)''', p)
+s = sub(s, '''COLUMNS = ['eff_date', 'symbol', 'pnl_bps', 'payout', 'event_type',''',
+'''COLUMNS = ['eff_date', 'symbol', 'pnl_bps', 'payout', 'traded_leg', 'event_type',''', p)
+s = sub(s, '''def settings_tab():
+    """Settings / formulas used, one row each."""
+    return pd.DataFrame([''',
+'''def settings_tab(wrong_way=False):
+    """Settings / formulas used, one row each."""
+    return pd.DataFrame([
+        ('strategy',
+         'WRONG-WAY: buy only the option that pays if the flow reverses -- put on ADD / UPWGT, call on DOWNWGT' if wrong_way
+         else 'STRANGLE: buy the closest-OTM call AND put',
+         'traded_leg column; cost / payout / pnl / winner / richness refer to the traded leg only' if wrong_way
+         else 'traded_leg = both'),''', p)
+s = sub(s, '''    ap.add_argument('--max-pushes', type=int, default=bs.MAX_PUSHES,
+                    help=f'one-strike push-outs allowed when cost > {bs.MAX_COST_BPS} bps (default {bs.MAX_PUSHES}); 0 = never push')
+    args = ap.parse_args()''',
+'''    ap.add_argument('--max-pushes', type=int, default=bs.MAX_PUSHES,
+                    help=f'one-strike push-outs allowed when cost > {bs.MAX_COST_BPS} bps (default {bs.MAX_PUSHES}); 0 = never push')
+    ap.add_argument('--wrong-way', action='store_true',
+                    help='buy only the wrong-way leg (put on ADD/UPWGT, call on DOWNWGT) instead of the strangle')
+    args = ap.parse_args()''', p)
+s = sub(s, '''        tab = build_tab(eng, t, flows, otm_bps=args.otm_bps, max_pushes=args.max_pushes)''',
+'''        tab = build_tab(eng, t, flows, otm_bps=args.otm_bps, max_pushes=args.max_pushes, wrong_way=args.wrong_way)''', p)
+s = sub(s, '''    sheets['Settings'] = settings_tab()
+    export(sheets, f"large_index_flows_strangle_hold_otm{args.otm_bps:g}" + ("_nopush" if args.max_pushes == 0 else ""))''',
+'''    sheets['Settings'] = settings_tab(args.wrong_way)
+    export(sheets, f"large_index_flows_strangle_hold_otm{args.otm_bps:g}" + ("_nopush" if args.max_pushes == 0 else "")
+           + ("_wrong-way" if args.wrong_way else ""))''', p)
+io.open(p, 'w', encoding='utf-8').write(s)
+print('patched')

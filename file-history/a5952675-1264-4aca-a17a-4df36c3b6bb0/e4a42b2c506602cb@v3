@@ -1,0 +1,890 @@
+# EOD Option Algos
+
+End-of-day options strategy backtesting and PnL tracking for SPX/SPXW and NDX/NDXP 0DTE options.
+
+## Quick Reference
+
+**Generate Excel with all SPX + NDX trades:**
+```python
+compare_two_versions_in_excel("TEST_350PM_SPREAD_SALES_SPX_ALL_DAYS", "TEST_350PM_SPREAD_SALES_NDX_ALL_DAYS", cp_mode=True, names=("SPX", "NDX"))
+```
+
+**Test a single strategy (stats + chart):**
+```python
+results = test_strategy("TEST_350PM_SPREAD_SALES_SPX_IMBAL_GROWS")
+```
+
+**Test + download backtest to Excel with factors:**
+```python
+results = test_strategy("TEST_350PM_SPREAD_SALES_SPX_IMBAL_GROWS", download=True)
+```
+
+**Compare two strategies side-by-side:**
+```python
+r1, r2 = compare_strategies("TEST_350PM_SPREAD_SALES_SPX_IMBAL_GROWS", "TEST_350PM_SPREAD_SALES_SPX_ALL_DAYS")
+```
+
+**Show 5 worst PnL days with leg detail:**
+```python
+show_worst("350PM_SPREAD_SALES_SPX", n=5)
+```
+
+**Test a non-month-end strategy on month-end days:**
+
+`apply_config` skips month-end rows for regular configs (line 1527-1528). To test how a strategy would perform on month-ends, override `month_end_only` and run against the full combined data:
+```python
+cfg = find_config(configs, "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET")
+cfg_me = {**cfg, "month_end_only": True}
+r_me = apply_config(combined, cfg_me)  # full combined, NOT a pre-filtered subset
+traded = r_me[r_me["total_pnl"] != 0]
+display(traded[["trade_date", "put_size", "call_size", "put_pnl", "call_pnl", "total_pnl"]])
+```
+
+**Debug a single date:**
+```python
+combined_data, configs = ensure_data()
+cfg = find_config(configs, "IMBAL_GROWS")
+debug_date(combined_data, cfg, dt.date(2026, 2, 3))
+```
+
+## Files
+
+### `update_data.py`
+Automated pipeline that refreshes all upstream data sources needed by `create_backtests.py`. Each step has a freshness check — if data is already current, it skips. Designed to be idempotent: run it repeatedly and it only pulls what's missing.
+
+**Usage:**
+```bash
+python update_data.py              # default: SPXW, 30-day lookback, all steps
+python update_data.py NDXP         # run for NDX/QQQ instead
+python update_data.py --lookback 60  # extend lookback window to 60 trading days
+python update_data.py SPXW --lookback 60  # both
+python update_data.py SPXW --full --steps 5a,5b  # full backfill, OPRA steps only
+python update_data.py NDXP --full --steps 5b      # rebuild full NDXP panel
+python update_data.py --steps 0,3a,3b,4           # only run universal factor steps
+python update_data.py NDXP --force-check          # bypass fast-path, full DB scan for gaps
+python update_data.py SPXW --backfill-opra        # pull OPRA for pre-0DTE expiration dates
+```
+
+**Steps:**
+
+| Step | Function | What it does |
+|------|----------|--------------|
+| 0 | `update_imbalances` | Pulls SPY/QQQ MOC imbalances and prices from VBAM. Saves a dated CSV to `LOCAL_IMBAL_DIR`. Old file is deleted on re-pull. **Staleness guard (7/29/26):** the source table is backfilled T+1 by a lambda that can race an early-morning run (7/29/26: the 7:01am pull was missing exactly 7/28); if max `business_date` < last full trading day, prints an ALL-CAPS warning, sleeps 3 min, retries once, and warns again (still saving) if the day is still missing -- the warnings surface in the emailed task log. |
+| 0b | `update_recreated_paired_imbalances` | Pulls recreated SPY paired imbalance from `EODStrategies.t_strat_FuturesStrategyCKSmash1550_Detail`. Computes `SUM(lastExchVolumeTheoValue)` per day where `event='Terminated'` and ticker count is 400–510 (guards against incomplete writes). Exact zeros are set to NaN (data error). Available same-day (no t+1 lag unlike `t_report_consolidated_imbalances`). Saves `spy_paired_recreated_*.csv`. |
+| 1 | `update_options_cache` | Finds 0DTE dates missing from `t_historical_options_snaps` in the last `LOOKBACK_DAYS` (default 30), then backfills them via `snowflake_helpers.cache_options_range` (**switched from the SpiderRock liberator subprocess to Snowflake on 8/27/2026**; `cache_data_with_liberator.py` kept as manual fallback). Snowflake-era rows differ from liberator history: TIMESTMP is the raw collection time on a ~5-min grid (e.g. 15:55:05.5, was 15:56:0x 1-min-ish grid), session bounds 09:30:00-16:15:30 ET (liberator kept 09:00-16:55), afternoon window starts 13:55 (same), and index symbols (SPX/SPXW/NDX/NDXP/RUT/RUTW/VIX/VIXW) cache only tte < (22*1+5)/252 =~ 0.107y (liberator kept 0.583y; non-index symbols keep tte < 1.107y). Filters live in `D:/PycharmProjects/utils/snowflake_helpers.py`. |
+| 2 | `update_options_panels` | Exports 4 options panel CSVs (Call/Put x 15:38/15:48) from the options DB via `pull_data_spx_sql_fast.py`. These are the strike-level panel files consumed by backtesting. |
+| 3a/3b | `update_market_metrics` | Pulls VIX level, SPY trade price, and SPY high/low from VBAM at two timestamps (3:50:01 and 3:40:00). Merges with Bloomberg close prices (dividend-adjusted) to compute intraday return, market ratio (return / rolling vol), RSI-3, and high-low range ratio. Saves `vix_*.csv`, `spy_daily_moves_*.csv`, `spy_high_low_*.csv`. **Keep-alive note (2026-07-15):** although `factor_high_low` itself is dead (only reference is a commented-out line in `configs/ALGO_42_340PM_OUTRIGHT_SALES_SPX.py`), the `spy_high_low_*.csv` output remains load-bearing because `create_backtests.py` (line ~667) pulls `highest_trade_price`, `lowest_trade_price`, and `rolling_std` off it and merges them onto `panel_350`. Those raw columns feed `factor_market_move_from_high / _low` (see [create_backtests.py:886-898](create_backtests.py:886)), which is the live trigger for `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MOVE_NO_MKT` (a prod strategy). Do not remove this step even though the sibling 355 project did -- the panel columns are still needed here. |
+| 4 | `update_rolling_realized` | Pulls 10 years of dividend-adjusted SPY closes from Bloomberg, computes 66-day (3-month) rolling realized vol using forward log returns lagged by 2 days. Saves `rolling_realized.csv` with the vol level and its day-over-day change. |
+| 5a | `update_opra_cache` | Backfills missing OPRA quote data from ThetaData into `t_opra_quotes` in the options DB. For each missing date: gets SPX close from Bloomberg, enumerates available strikes via the ThetaData v3 library (filtered to within 401 pts of SPX close), then pulls per-strike 1-second quotes (only after 15:29) and writes to the DB. Rate-limited at 0.3s per strike. Uses the v3 `thetadata` pip library (`thetadata_helpers` `_v3` functions) -- no local ThetaTerminal needed; gracefully skips if v3 auth is not configured. |
+| 5a_backfill | `backfill_opra_cache` | Pulls OPRA quotes from ThetaData for pre-0DTE dates where `t_historical_options_snaps` has `trade_date=exp` (same-day-expiry dates before daily 0DTE existed). Only runs via `--backfill-opra` flag, never in default step set. Reuses Step 5a helpers. |
+| 6 | `update_index_snaps` | Caches **full-day 1s ThetaData index prices** (SPX for SPXW, NDX for NDXP) into the shared `optionsResearch.t_index_snaps_td` for any trading day in the lookback window not already cached (same table the eod_355 project's step 6 feeds). Primary `idx_price350pm` source for `create_backtests.py` (added 8/5/26). ThetaData v3 auth only, no Bloomberg; skips gracefully without auth. |
+| 5b | `update_opra_panel` | Builds a flat CSV panel (`{symbol}_0DTE_opra_panel.csv`) from `t_opra_quotes`. For each missing date, runs a single bulk DB query, then for each target time in `TRADE_TIMES` (15:40:03, 15:50:02, 15:50:03, 15:50:07) and each (strike, cp) pair, finds the closest quote — trying the exact second first, then walking forward in 1-second increments up to +20s until a valid bid (or valid ask with NaN bid, treated as bid=0) is found. Strikes are filtered to the `opra_strikes_per_side` nearest on each side of the index close (20 for SPXW, 40 for NDXP), falling back to `strikes_per_side * 2` if not set. Output columns: `trade_date, exp, timestamp, strike, cp, bid, ask`, sorted by `trade_date, timestamp, strike`. The full CSV is rewritten on each run (not appended). |
+
+**ThetaData v3 migration (2026-07):** Step 5a's OPRA pulls were moved off the old local ThetaTerminal v2 HTTP API (`127.0.0.1:25510`) onto the official `thetadata` v3 pip library, wrapped in `thetadata_helpers` (`get_bulk_chain_v3`, `get_option_quotes_v3`, `check_v3_connection`). The v3 library authenticates over HTTPS and streams via gRPC directly from Theta's servers, so **no local terminal is required**. Credentials come from the `THETADATA_API_KEY` env var or `D:/PycharmProjects/utils/thetadata_creds.json`; the step skips gracefully if auth fails.
+
+**Data flow:**
+
+```
+Bloomberg ──────┐
+VBAM DB ────────┤──> Steps 0, 3, 4 ──> local CSVs ──> create_backtests.py
+SpiderRock ─────┤──> Steps 1, 2 ────> options DB + panel CSVs
+ThetaData ──────┘──> Step 5a ──> t_opra_quotes ──> Step 5b ──> OPRA panel CSV
+EODStrategies DB ──> Step 0b ──> spy_paired_recreated CSV ──> create_backtests.py
+```
+
+**Dependencies:**
+- `calendar_utils` (from `D:/PycharmProjects/utils/`) — trading calendars, half-day list
+- `xbbg` — Bloomberg data via `blp.bdh` / `blp.bds`
+- `thetadata` (pip, v3 library via `thetadata_helpers`) -- OPRA quotes direct from Theta servers; no local ThetaTerminal. Creds: `THETADATA_API_KEY` env var or `D:/PycharmProjects/utils/thetadata_creds.json`
+- `sqlalchemy` + `pymysql` — VBAM and options research databases
+- `snowflake_helpers` (from `D:/PycharmProjects/utils/`) — SpiderRock ingestion via Snowflake (Step 1 source since 8/27/2026)
+- `cache_data_with_liberator.py` (in `D:/PycharmProjects/spdr_liberator/`) — legacy SpiderRock ingestion, manual fallback only
+- `pull_data_spx_sql_fast.py` (in `D:/PycharmProjects/spdr_historical/`) — panel CSV export
+
+**Config:**
+- `LOOKBACK_DAYS` (default 30): how far back Steps 1, 5a, and 5b check for missing data. Override with `--lookback`.
+- `--full`: auto-compute lookback to cover full history from `ZERO_DTE_START` (SPXW: 2022-05-16, NDXP: 2022-08-08). Mutually exclusive with `--lookback`.
+- `--force-check`: skip the fast-path freshness check on Steps 1 and 5a, forcing a full DB scan for missing dates. Useful if you suspect gaps in older data within the lookback window.
+- `--steps`: comma-separated list of steps to run (e.g. `5a,5b`). Valid steps: `0, 1, 2, 3a, 3b, 4, 5a, 5a_backfill, 5b`. Default: all steps except `5a_backfill`.
+- `--backfill-opra`: run only Step 5a_backfill (pulls OPRA quotes for pre-0DTE expiration dates from ThetaData). Overrides default steps.
+- `THETADATA_THRESHOLD` (401): max strike distance from SPX close for OPRA pulls.
+- `TRADE_TIMES` ([15:40:03, 15:50:02, 15:50:03, 15:50:07]): target timestamps for the OPRA panel in Step 5b. When adding a new timestamp here, existing dates in the panel CSV will NOT be backfilled — see the Gotcha below.
+- `strikes_per_side` (SPXW: 7, NDXP: 10): number of strikes to keep on each side of the index close in backtest panels. Defined in `symbol_configs/`.
+- `opra_strikes_per_side` (SPXW: 20, NDXP: 40): number of strikes per side in Step 5b OPRA panel CSV. Separate from `strikes_per_side`. Falls back to `strikes_per_side * 2` if not set. Defined in `symbol_configs/`.
+
+### `scheduled_update.py`
+Wrapper script that runs `update_data.py` in a subprocess, captures stdout/stderr, and posts the output to Google Chat via `google_chat_webhook.send_message()`. If the script crashes, a crash notification is sent.
+
+Currently configured to run only non-Bloomberg steps: `--steps 0,0b,1,2,5b`.
+
+**Scheduled via Windows Task Scheduler:**
+- **Task name:** `UpdateDataEOD`
+- **Schedule:** Weekdays (Mon–Fri) at 7:30 AM
+- **Output:** Posted to Google Chat (`my_chat` webhook)
+
+Steps 3a, 3b, 4, and 5a require Bloomberg and are excluded from the scheduled run. Run them manually after logging into Bloomberg:
+```bash
+python update_data.py --steps 3a,3b,4,5a
+```
+
+**Bloomberg dependency by step:**
+
+| Step | Needs Bloomberg? |
+|------|:---:|
+| 0, 0b | No |
+| 1 | No |
+| 2 | No |
+| 3a, 3b | Yes — close prices, VIX, dividends |
+| 4 | Yes — 10yr close prices |
+| 5a | Yes — settlement price |
+| 5b | No |
+
+**Manage the scheduled task:**
+```powershell
+# Disable
+Disable-ScheduledTask -TaskName 'UpdateDataEOD'
+# Re-enable
+Enable-ScheduledTask -TaskName 'UpdateDataEOD'
+# Delete
+Unregister-ScheduledTask -TaskName 'UpdateDataEOD'
+```
+
+### `create_backtests.py`
+Core backtest engine. Loads all upstream data, builds a combined panel with factors, applies strategy configs, calculates PnL, and exports results to a formatted Excel workbook. Works both as a CLI script and interactively via Jupyter `#%%` cells.
+
+**CLI Usage:**
+```bash
+python create_backtests.py                           # default: SPXW, prod configs
+python create_backtests.py NDXP                      # run for NDX/QQQ
+python create_backtests.py --configs path/to/dir/     # load configs from custom directory
+python create_backtests.py --configs path/to/file.py  # load a single config
+python create_backtests.py --test-configs             # use test_configs/ directory
+python create_backtests.py --start 2024-01-01 --end 2024-12-31  # date range filter
+python create_backtests.py --debug                   # verbose output at each pipeline stage
+python create_backtests.py NDXP --test-configs --debug  # combine options
+```
+
+**Data pipeline (internal stages):**
+
+| Stage | Function | What it does |
+|-------|----------|--------------|
+| 1 | `load_all_data()` | Loads imbalances, settlement/ETF closes (Bloomberg), rolling realized vol, VIX, SPY high/low, daily moves, options panels (SpiderRock CSVs), OPRA quotes |
+| 2 | `process_panel_data()` | For each timestamp (340PM, 350PM): extracts N strikes per side per date, merges in symbol-appropriate imbalances (SPY for SPXW, QQQ for NDXP) at multiple snap times, settlement closes, VIX, RSI, high/low ratio, realized vol change. Also merges intraday SPY high/low and rolling std (`highest_trade_price`, `lowest_trade_price`, `rolling_std`, `spy_trade_price`) used by IMBAL_VS_MOVE factors — these flow through `common_cols` in `combine_timestamps()` so they're available on both 340PM and 350PM rows. For 350PM: applies OPRA strike re-selection using `idx_price350pm` -- since 8/5/26 the **ThetaData index print at 15:50:06** from `t_index_snaps_td` (forward-walk to 15:50:09 on missing ticks), falling back to the cross-ratio ETF estimate (kept as `idx_price350pm_xratio`; `idx_price_source` says which per row; NDXP currently always cross-ratio) |
+| 3 | `add_factors()` | Bins raw data into discrete factor levels (imbalance magnitude/sign, vol, VIX, RSI, high/low, market type, realized vol change) |
+| 4 | `filter_special_days()` | Tags month-end and Fed days (filtering applied per-config in `apply_config`) |
+| 5 | `combine_timestamps()` | Merges 340PM and 350PM panels into a single DataFrame with suffixed columns (columns are manually renamed with ` 340PM`/` 350PM` suffixes before merge to ensure all strike columns are properly suffixed regardless of whether both timestamps have the same number of strikes). Adds 350PM-specific factors: first tick, cross-timestamp imbalance factors, threshold flags |
+| 6 | `apply_config()` | Applies a single strategy config: filters month-end/Fed days per config, selects strikes (distance-based or index-based), evaluates factor-based trade triggers via `get_size()`, computes spread/outright PnL at expiry using the symbol's `price_calc_method` (CROSS or MID_PLUS_COST), applies price/size limits. Tracks per-leg trade prices (`trade_price_sh`, `trade_price_ln`) alongside net `put_price`/`call_price` |
+
+**Missing long leg in spreads** — On some dates, the OPRA panel may not have enough OTM strikes to populate the long leg of a spread (e.g., `lg_strike = 0`). This happens when:
+- ThetaData had no quote data for far OTM strikes near 15:50 (no rows in `t_opra_quotes`)
+- The `min_strike_distance` shift pushed the long leg index beyond `strikes_per_side` (out of bounds)
+- The OPRA panel only had a few OTM strikes due to thin markets (common in early NDXP dates and low-vol environments)
+
+When the long leg strike is 0 but the short leg exists, `apply_config` treats the trade as an **outright** (naked) position rather than a spread — full short premium is collected, and expiry PnL is uncapped. This is intentional: the backtest reflects the worst-case scenario where only one leg could be executed.
+
+**MID_PLUS_COST pricing guard** — NDXP uses `MID_PLUS_COST` pricing (midpoint +/- cost per leg). When OPRA data has stale 0-bid quotes (wide/illiquid markets), the midpoint can be small, causing `net_entry` (short_price - long_price) to go negative on what should be a credit spread. Without a guard, `dollar_target` sizing divides by a tiny negative number, producing massive negative sizes and phantom PnL. **Fix:** `apply_config` floors `net_entry` to `$0.01` when `MID_PLUS_COST` produces a negative credit on a spread (both short and long legs present). This causes `dollar_target` sizing to produce a large positive size that gets clamped to `min_size` by the existing filters.
+
+**Strike selection modes** — `apply_config` supports two config formats:
+
+| Mode | Config keys | How it works |
+|------|------------|--------------|
+| **Distance-based** (preferred) | `short_put_distance`, `long_put_distance`, `short_call_distance`, `long_call_distance` | Dollar thresholds. Scans OTM strikes and picks the closest one at least $X from the index price. No `min_strike_distance` needed. |
+| **Index-based** (legacy) | `short_put_strikes: [1]`, `long_put_strikes: [4]`, etc. + `min_strike_distance` | Selects by array index into sorted OTM strikes (0=closest). Binary shift applied if strike is within `min_strike_distance` of index. |
+
+Detection is automatic: if `short_put_distance` or `short_call_distance` exists in the config, distance mode is used. Otherwise falls back to legacy index mode. Both formats work side-by-side.
+
+**Key functions:**
+
+- `build_combined_data(symbol)` — Orchestrates stages 1-5, returns `(combined_df, data_dict)`
+- `load_configs(sources)` — Flexible config loader: accepts a directory, single file, list of files, or list of config dicts. Tags configs with `month_end_only` based on `ME` in filename
+- `apply_config(combined, config)` — Runs a single strategy against combined data. Handles per-config ME (month-end-only) and Fed day filtering. Uses `price_calc_method` from config or symbol config (CROSS: bid/ask cross; MID_PLUS_COST: midpoint ± cost). Returns DataFrame with: `trade_date, put_pnl, call_pnl, total_pnl, put_size, call_size, put_price, call_price, put_trade_price_sh, put_trade_price_ln, call_trade_price_sh, call_trade_price_ln, idx_close, idx_at_trade, cp, sh_strike, sh_bid, sh_px, sh_ask, lg_strike, lg_bid, lg_px, lg_ask, cp_2, sh_strike_2, sh_bid_2, sh_px_2, sh_ask_2, lg_strike_2, lg_bid_2, lg_px_2, lg_ask_2`. The `cp` column is "P", "C", or "P+C"; `_2` columns hold the second side's data when both trade (otherwise NaN)
+- `find_strike_by_distance(row_dict, cp, min_distance, ref_price, n_strikes, suffix)` — Scans OTM strikes and returns `(strike, bid, ask)` for the closest one at least `min_distance` from `ref_price`. Used by distance-based configs.
+- `run_backtest(combined, configs)` — Runs all configs, returns `{name: {"config", "results", "stats"}}`
+- `export_backtest_excel(backtest_results, combined)` — Exports to formatted Excel with sheets: Chart (interactive dropdown), All (daily PnL + factors), Stats (summary metrics + Full Name row), Chart_Helper (cumulative PnL), and one sheet per strategy
+- `calculate_stats(pnl_series)` — Returns dict with Total PnL, Sharpe, Win Rate, Max Drawdown, etc.
+- `build_factors_from_row(row_dict, t)` — Shared helper (used by `debug_date.py` too) that extracts factor values from a combined_data row
+
+**Output:** `C:/Users/zdietz/Downloads/EOD_OPTION_ALGOS_{timestamp}.xlsx`
+
+**Earlier-fill OPRA override (experimental).** `OPRA_TRADE_TIMES` at the top of `create_backtests.py` maps labels to target OPRA timestamps (`"350"` → 15:50:07, `"350_early3"` → 15:50:03, `"350_early2"` → 15:50:02). `apply_opra_strikes(panel_df, opra_df, n_strikes, target_time=OPRA_TRADE_TIMES["350_early2"])` is the single hook for simulating an earlier fill. **Caveat — only the OPRA quote timestamp moves.** The imbal snap (`15:50:01`), paired imbal snap, `etf_price350pm` (used for `first_tick_bps` denominator), and `first_tick` window (15:50:00 → 15:50:05) are hardcoded elsewhere in `process_panel_data()` and `combine_timestamps()`. Using the early override without also shifting these creates look-ahead bias (signal built from 7s of MOC data, filled as if decided 5s earlier, with a forward-looking `first_tick`). Also requires the panel CSV to actually contain the target timestamp — see the Step 5b Gotcha below.
+
+**Interactive usage:**
+```python
+# In Jupyter / PyCharm interactive console
+from create_backtests import *
+
+if 'combined_data_dict' not in dir():
+    combined_data_dict = {}
+combined_data_dict["SPXW"], _ = build_combined_data("SPXW")
+
+configs = load_configs("d:/PycharmProjects/scratch/algos/configs/")
+results = run_backtest(combined_data_dict["SPXW"], configs)
+print_summary(results)
+export_backtest_excel(results, combined_data_dict["SPXW"])
+```
+
+### `debug_date.py`
+Interactive debugging tool to understand why a strategy triggered (or didn't) on a specific date. Imports `ensure_data` and `find_config` from `test_new_versions.py` to reuse session-cached data.
+
+**Usage:**
+```python
+from debug_date import *
+
+# SPX — uses session-cached combined_data from test_new_versions
+combined_data, configs = ensure_data()
+cfg = find_config(configs, "IMBAL_VS_MARKET")
+debug_date(combined_data, cfg, dt.date(2026, 2, 3))
+
+# NDX — use combined_data_dict directly if already cached
+from create_backtests import load_single_config
+cfg = load_single_config('D:/agent_projects/eod_option_algos/test_configs/TEST_350PM_SPREAD_SALES_NDX_IMBAL_GROWS.py')
+debug_date(combined_data_dict["NDXP"], cfg, dt.date(2024, 5, 22), cp_type="C")
+```
+
+### `test_new_versions.py`
+Interactive tool for testing and comparing strategy configs. Delegates all backtest logic to `create_backtests.py` (no duplicated PnL/factor code). Uses `ensure_data()` to reuse session-cached `combined_data` and `configs` when running interactively.
+
+**Usage:**
+```python
+from test_new_versions import *
+
+# Load data (reuses session variables if available)
+combined_data, configs = ensure_data()
+
+# Test a single strategy (by name, path, or config dict)
+results = test_strategy("350PM_OUTRIGHT_SALES_SPX")
+cfg = find_config(configs, "IMBAL_GROWS")
+results = test_strategy(cfg)
+
+# Compare two strategies side-by-side
+r1, r2 = compare_strategies("TEST_350PM_SPREAD_SALES_SPX_IMBAL_GROWS", "ALGO_42_350PM_OUTRIGHT_SALES_SPX_IMBAL_GROWS")
+
+# Sanity check: paired rows on 10 random shared dates
+sanity_strategies((r1, r2))
+
+# Show 5 worst PnL days with leg detail
+show_worst("350PM_SPREAD_SALES_SPX", n=5)
+```
+
+**Functions:**
+- `ensure_data(symbol)` — Checks IPython session for `combined_data`/`configs`; builds from scratch if missing
+- `find_config(configs, name_fragment)` — Partial case-insensitive name match against loaded configs
+- `test_strategy(strategy, combined, download)` — Apply a single strategy, print stats table + cumulative PnL chart. Accepts config dict, file path, or strategy name. Pass `download=True` to export the backtest to a formatted Excel file with factor values and raw input data for each traded day
+- `compare_strategies(strategy1, strategy2, combined)` — Side-by-side stats + overlaid cumulative PnL chart. Returns `(results1, results2)` with configs stashed via `.attrs`
+- `show_worst(strategy, combined, n)` — Display N worst PnL days with per-leg detail: short/long strikes, bid/ask for each leg, per-leg trade prices (`trade_price_sh`, `trade_price_ln`), net trade price, and PnL. Uses config strike indices and min-distance shift logic to show the actual traded strikes
+- `sanity_strategies(compare_result, seed, n)` — Paired sanity-check rows for two strategies on N random shared trading dates. Shows config-aware strikes and mid prices
+- `compare_two_versions_in_excel(strategy1, strategy2, combined, cp_mode, names)` — Export two strategies side-by-side to Excel with imbalance data. One row per date (outer join), filtered to days where at least one strategy traded. Pass `cp_mode=True` when both puts and calls trade on the same strategy (shows put as side 1, call as side 2). `names` overrides auto-generated column suffixes (e.g. `names=("SPX", "NDX")`). Saves to `C:/Users/zdietz/Downloads/`
+
+**Strategy name resolution:**
+- Full file path: `"D:/agent_projects/eod_option_algos/test_configs/MY_NEW_STRATEGY.py"`
+- Exact config name: `"350PM_SPREAD_SALES_SPX"` (searches test_configs first, then prod configs)
+- With or without ALGO prefix: `"ALGO_42_350PM_SPREAD_SALES_SPX"` resolves the same as `"350PM_SPREAD_SALES_SPX"`
+
+### `run_unit_test.py`
+Regression test that validates known backtest outputs haven't changed. Run after any code change to `create_backtests.py`, strategy configs, or `symbol_configs/` to confirm nothing is broken.
+
+**Usage:**
+```bash
+python run_unit_test.py          # CLI
+```
+Or run interactively via `#%%` cells in PyCharm/Jupyter.
+
+**What it checks:** A hardcoded list of (strategy, date) pairs with known-good `index_at_trade` and `pnl/1lot` values. Each value must match within 1% tolerance (or absolute 0.03 for near-zero values). Strategies are resolved from both `test_configs/` and prod configs.
+
+**Adding test cases:** Append a dict to the `EXPECTED` list at the top of the file with `trade_date`, `strategy`, `index_at_trade`, and `pnl_per_lot`.
+
+### `symbol_configs/`
+Shared symbol-level configuration used by both `update_data.py` and `create_backtests.py`. One `.py` file per symbol (e.g. `SPXW.py`, `NDXP.py`). Each exports a `config` dict with:
+- `settlement_ticker` — Bloomberg ticker for settlement close (e.g. `"SPX INDEX"`)
+- `etf_ticker` — Bloomberg ticker for the ETF (e.g. `"SPY US EQUITY"`)
+- `etf_symbol` — Short ETF name (e.g. `"SPY"`)
+- `panel_prefix` — Prefix for panel CSV filenames (e.g. `"SPXW_0DTE"`)
+- `settlement_col` — Column name for the settlement close in DataFrames (e.g. `"SPX_close"`)
+- `strikes_per_side` — Number of OTM strikes to keep on each side of ATM in backtest panels (7 for SPXW, 10 for NDXP)
+- `opra_strikes_per_side` — Number of strikes per side in Step 5b OPRA panel CSV (20 for SPXW, 40 for NDXP)
+- `price_calc_method` — How to compute trade prices from bid/ask. `"CROSS"` (SPXW): sell at bid, buy at ask. `"MID_PLUS_COST"` (NDXP): sell at mid - cost, buy at mid + cost
+- `cost` — Per-leg cost adjustment for MID_PLUS_COST pricing (`None` for SPXW, `0.2` for NDXP)
+
+Import via `from symbol_configs import SYMBOL_CONFIG` (returns a dict keyed by symbol name) or `from symbol_configs import load_symbol_config` (loads a single symbol).
+
+### `test_configs/`
+Directory for test strategy configs. Copy a config from `d:/PycharmProjects/scratch/algos/configs/` and modify to test variations before deploying to production.
+
+### `custom_test_factors.py`
+Define custom threshold factors for testing without modifying `create_backtests.py`. Factors are added to the combined DataFrame before `apply_config()` runs. `build_factors_from_row()` automatically passes through any `factor_*` column it finds.
+
+**Usage:**
+```python
+from custom_test_factors import add_custom_factors
+combined, _ = ensure_data("SPXW")
+combined = add_custom_factors(combined)
+test_strategy("TEST_350PM_SPREAD_SALES_SPX_IMBAL_GROWS2", combined=combined)
+```
+
+Includes recreated SPY paired imbalance threshold factors (`factor_spy_paired_recreated_gt_12b` through `_gt_25b`). These use the same-day CKSmash Detail data (no t+1 lag). Only created if `spy_paired_imbal_recreated 350PM` column exists in combined data (requires step 0b in `update_data.py`).
+
+**Iteration workflow:** Edit `custom_test_factors.py` → reimport → rerun. No cache clear or module chain reload needed.
+
+### `ndx_exploration.py`
+Visual exploration notebook for NDX (NDXP) 0DTE signal analysis. Uses `combined_data_dict["NDXP"]` with a train/test split at `SPLIT_DATE = 2025-03-01`. All analysis is train-set only to avoid look-ahead bias.
+
+**Sections:**
+- **Phase 1 — Baseline**: Cumulative PnL curves for the unconditional ALL_DAYS config
+- **Phase 2 — Univariate signal analysis**: Mean PnL bar charts binned by each signal (imbalance, vol, market ratio, etc.)
+- **Phase 3 — Bivariate heatmaps**: PnL/premium ratio heatmaps for 6 signal pairs, put + call
+- **Phase 4 — Signal correlation matrix**
+- **Phase 5 — Custom exploration** (placeholder)
+- **Phase 6 — Strategy deep dives**: For each NDX test config (IMBAL_GROWS, IMBAL_VS_MARKET, BUY_UNPAIRED), runs the strategy on train data and plots PnL binned against cross-factors
+
+**Key helpers:**
+- `plot_univariate_pnl()` — Bar chart of mean PnL by binned signal, with N and win rate annotations (min 8 observations)
+- `plot_heatmap_2d()` — Bivariate heatmap of mean PnL/premium ratio (green > 1, red < -1)
+- `plot_cumulative_pnl()` — Cumulative PnL with Sharpe, WR, Max DD, PnL/Prem in title
+- `strategy_deep_dive()` — Runs a config, merges raw signals, filters to train set
+- `plot_strategy_cross_factors()` — Plots put + call PnL vs each cross-factor for a strategy
+
+### `limit_spread_backtest.py`
+Spread-specific backtest that simulates limit order fills using second-by-second OPRA data. Runs on dates where a parent strategy already fired (reuses `combined_data_dict` from `test_new_versions.py` session cache).
+
+**Workflow:** Parent strategy fires → extract short/long strikes for the day → query `t_opra_quotes` for second-by-second spread prices in the time window → simulate staggered limit fills (each level triggers at most once per day at the first second where `spread_price >= threshold`) → aggregate PnL.
+
+**Configuration (top of file):**
+- `STRATEGY_NAMES` — list of parent strategy names whose fired days drive the simulation
+- `STRIKE_WIDTH` — dollar width between short and long legs (5 for SPXW)
+- `TIME_WINDOW_START` / `TIME_WINDOW_END` — time window for limit fill eligibility (e.g. 15:54:50 to 15:59:00)
+- `LIMIT_LEVELS` — list of `{"price": float, "size": int}` dicts defining limit price tiers
+
+**Tested strategies:**
+- Backtests well: `ALGO_42_350PM_OUTRIGHT_SALES_SPX_IMBAL_VS_MARKET`, `ALGO_42_350PM_OUTRIGHT_SALES_SPX_IMBAL_GROWS`
+- Tested poorly (not worth running in prod): `ALGO_42_350PM_SPREAD_SALES_SPX_HIGH_PAIRED`, `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_SML`, `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_SHRINKS`, `ALGO_42_350PM_SPREAD_IMBAL_AND_TICK`
+
+### `bumped_spread_backtest.py`
+Standalone backtest for selling credit spreads with strikes bumped 1 closer to ATM, on days where the parent strategy traded a 1-lot (hit `min_size` floor due to cheap spread price). Only trades the same side (put/call) as the parent's 1-lot trade. Now deployed to prod — see Prod Bumped Spread Strategy section below.
+
+**Configuration (top of file):**
+- `BUMP_CONFIGS` — per-strategy dict with `dollar_target` and `max_size` for each parent strategy
+- `BUMP_STEP` — how far to bump short strike toward ATM (default: 5 = 1 SPXW index)
+- `SPREAD_WIDTH` — distance between short and long legs (default: 15 to match prod; set to 5 for $5-wide testing)
+- `MAX_ATM_VOL` — vol filter; set to `None` to disable (default: 0.14)
+
+**How it works:** For each parent 1-lot day, creates a bumped config (short strike indices decremented by 1 within the parent's `min_strike_distance` ladder, long strike indices set to `bumped_short + SPREAD_WIDTH/STRIKE_STEP`), runs `apply_config`, then keeps only the PnL from the side that was a 1-lot in the original. Produces a cumulative PnL chart and exports to Excel.
+
+**9/11/26 -- double-bump bug fixed; backtest now matches prod strike selection.** Before this date the bumped config also lowered `min_strike_distance` by `BUMP_STEP`. Because the distance filter defines index 0 in the index-based strike logic, on days where spot sat within $1 of a strike (parent's filter dropped the near strike, ~25% of legs) the backtest sold TWO strikes closer than the parent, while prod (`bumped_spread_trader.py`) is always parent short +/- $5. Found on 9/9/26 (prod 7635/7620 @ 0.65 vs backtest 7640/7625 @ 1.90); confirmed on 3 of 8 prod triggers in the 7/16-9/10 logs. Any `bumped_spread_backtest_*.xlsx` dated before 9/11/26 overstates bumped PnL: fixing changes 43/172 legs, combined PnL 343k -> 190k, GROWS 192k -> 119k, SHRINKS 169k -> 85k, VS_MARKET -18k -> -14k; on affected days credit falls 1.83 -> 0.47 and WR rises 74% -> 95%. `--legacy-double-bump` reproduces the old method (writes `bumped_spread_LEGACY_DOUBLE_BUMP_backtest_*.xlsx`, deliberately outside the review pack's glob). Prod bumped sizing was halved the same day: `prod_change_logs/9_11_2026.md`.
+
+**Levered-rebal veto (9/9/26) -- modeled.** Prod blocks IMBAL_GROWS BUMPED (and CLOSER) when the projected 3:55pm levered-ETF rebal is adverse to the sold side (Calls if rebal > +T, Puts if rebal < -T). This backtest mirrors it via `REBAL_VETO_ENABLED` / `REBAL_VETO_THRESHOLD_B` (5.0B, the analysis threshold) / `REBAL_VETO_PARENTS`, with the historical rebal from `rebal_355_history.py` (vbam-data-oracle by-stock parquets, 3:55 exchange bucket). Vetoed legs are printed as `[rebal veto] ... BUMP: N leg(s) vetoed | PnL removed=$...`. **Prod runs a tighter 4.5B threshold** (deliberate buffer), so prod may veto a few legs the backtest keeps; the historical number is also the 15:50-snap pipeline while prod reads the live 15:49 estimate. See `prod_change_logs/9_9_2026.md`.
+
+**CLOSER precedence -- two different things.** (A) Closer-vs-bumped precedence (prod skips bumped on any parent/side where the CLOSER fired, `closer_applied` in `bumped_spread_trader.py`) **is modeled**: `RESPECT_CLOSER_PRECEDENCE=True` drops those sides via `closer_precedence.closer_fired_keys()` (printed as `[closer precedence] ... N bumped leg(s) suppressed`). (B) The parent RESIZE by the closer (prod moves lots from the parent to the CLOSER, e.g. "GROWS 1068 -> 320") is **not modeled in the main parent backtest** (`EOD_OPTION_ALGOS_*.xlsx` keeps the parent at full size and also counts the closer -- double-counting the offset lots); only `closer_strike_backtest.py` computes the decremented-parent counterfactual (`parent_new_size` / `pnl_diff_vs_base`). Decompose that gap per `algo_daily_review/review_corrections.txt` correction #15. The backtest also applies TODAY's prod sizing x SIZE_KNOB to all history, so magnitudes on older dates reflect current sizing, not what was deployed at the time.
+
+**Key finding (April 2026):** With `atmVol < 0.14` filter and $15-wide spreads, the bumped strategy looks decent since ~2024. Deployed to prod in April 2026 with $10k target / max 20 contracts.
+
+### `closer_strike_backtest.py`
+Standalone backtest for the CLOSER strike strategy (the prod-deployed companion to bumped — see Prod CLOSER Strategy section). Mirrors prod logic in `D:/PycharmProjects/scratch/algos/closer_spread_trader.py` exactly: signal "well-within" gate + parent credit ≤ `MAX_BASE_PRICE` + closest-to-uPrc strike selection in the allowed range (up to $1 ITM, up to $4.5 OTM), $5-wide spread, sizing matched to parent config.
+
+**Configuration:**
+- `CLOSER_CONFIGS` — auto-synced from prod's `CLOSER_PARENT_CONFIGS`. To override and test alternates, uncomment the MANUAL OVERRIDE block at the top of the file.
+- Strike rule constants (`MAX_ITM_DIST`, `MAX_OTM_DIST`, `SPREAD_WIDTH`, `MAX_BASE_PRICE`, `FP_EPS`) imported directly from prod config so any change in prod automatically flows through.
+
+**Levered-rebal veto (9/9/26) -- modeled:** prod blocks IMBAL_GROWS CLOSER when the projected 3:55pm levered-ETF rebal is adverse to the sold side (Calls if rebal > +T, Puts if rebal < -T). Mirrored here via `REBAL_VETO_ENABLED` / `REBAL_VETO_THRESHOLD_B` (5.0B analysis threshold; **prod runs 4.5B**) / `REBAL_VETO_PARENTS`, rebal history from `rebal_355_history.py`; the same veto is applied inside `closer_precedence.closer_fired_keys` so the bumped backtest does not credit a vetoed CLOSER with taking the day. Vetoed legs are still priced and printed (`[rebal veto] ... CLOSER: N leg(s) vetoed | closer-leg PnL removed=$... | diff-vs-base removed=$...`) but excluded from results; each row also carries `rebal_355_B`. See `prod_change_logs/9_9_2026.md`.
+
+**Pricing/sizing nuance:**
+- Backtest uses cross pricing (sell short at bid, buy long at ask) while prod sizes off SR `sprc` (closer to mid). In practice both produce the same size at typical CLOSER credits since `max_size` binds — but the backtest is slightly more pessimistic on thin-credit days.
+- Backtest does not enforce a min-price-to-trigger gate. Prod inherits `min_price` from the parent strategy and passes it as an order-fill floor to `send_complex_two_waves`. Not a trigger gate either way — but the backtest will record a trade at any credit, while prod's order may sit unfilled if the cross drops below parent's `min_price`.
+- Cheap-price rule (9/3/26): whenever the cross credit is <= `CHEAP_CREDIT_THRESHOLD` ($0.30) the backtest trades `CHEAP_CREDIT_SIZE` (1 lot) and sets the parent to `min_size` — the conservative model of prod's cheap-price guard (prod caps at 20 lots at the clamped $0.30 limit; the backtest assumes those floor-priced offers mostly don't fill). Historical impact: 1 of 96 closer trades (2023-11-02, -$10,640 total).
+
+**Terminal command:** `python D:/agent_projects/eod_option_algos/closer_strike_backtest.py` — saves Excel to `Downloads/closer_strike_backtest_<timestamp>.xlsx` then pops the cumulative-PnL chart.
+
+### `hacking_355_backtest.py`
+One-off standalone backtest that tests whether hack-closing 350pm short-credit-spread trades on a 355pm imbal flip improves PnL. Applies the flip rule to all 4 in-scope strategies at once:
+1. `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET` (parent)
+2. `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS` (parent)
+3. `..._IMBAL_VS_MARKET_CLOSER`
+4. `..._IMBAL_GROWS_CLOSER`
+
+**Hack rule (baked into the script):**
+- Flip trigger: short Put + `imbal_355 < -$1B` OR short Call + `imbal_355 > +$1B`.
+- **Backtest vs prod threshold (8/21/26):** the backtest stays at $1B; PROD gates at **$950M** (`factor_355_imbal_greater_than_950m` / `_less_than_neg_950m` in `355pm_script.py`, consumed by `hacker_trades.py`). Rationale: live (`.SPX` basket `exch_net_notional`) and T+1 (`t_report_consolidated_imbalances.spy_net_imbalance`) diverge -- measured over 40 sessions (6/15-8/20/26): median abs diff $25M but 14/40 days > $100M, occasional sign flips. The $50M buffer makes prod hack on the ~half of near-threshold fire days where the two sources track tightly; the structural-divergence days are accepted misses (no buffer can capture them). Sensitivity sweep (adhoc/hack_threshold_sensitivity.py, 8/20/26): sub-$1B thresholds get sharply negative fast (0.75B is ~-$530k worse pooled), so do NOT buffer materially below 950M; raising toward 1.25B backtests mildly better but is thin-sample.
+- Exit price when triggered: OPRA cross at 15:55:03 (`short_ask - long_bid`; NaN long-bid treated as $0 = long leg abandoned).
+- Threshold, exit tick, and strategies are constants at the top of the file for easy sensitivity testing.
+
+**Data sources:**
+- Combined data via `build_combined_data("SPXW")` -- cached (`combined_data_dict`) so re-runs are cheap.
+- `imbal_350`: sourced directly from combined (`350pm_imbal 350PM`); no SQL.
+- `imbal_355`: `auctionResearch.t_report_consolidated_imbalances` at `snap_time = '15:55:01'`.
+- Hack-exit prices: `optionsResearch.t_opra_quotes` at 15:55:03 (one-time cache in `opra_exits_all`).
+
+**Column semantics (detail sheets):**
+- `original_pnl` -- baseline (never hack); held to settlement.
+- `hacked_pnl` -- what PnL would be if we ALWAYS hack (close every leg at 15:55:03). NaN if OPRA missing.
+- `pnl_with_hacking` -- PnL under the conditional-hack rule (close only when flip triggers).
+- `delta_pnl` = `pnl_with_hacking - original_pnl` (the strategy's actual delta).
+
+**Output (Excel, saved to `Downloads/hacking_355_backtest_<timestamp>.xlsx`):**
+- **Sheet 1 "Summary"** -- three stacked tables:
+  1. 4-strategy comparison (N legs, N flip-eligible, N actually hacked, original / hacked / with-hacking totals, delta, Sharpe original / hacked / with-hacking).
+  2. Top 10 BEST hack days across all 4 strategies (by summed `delta_pnl`).
+  3. Top 10 WORST hack days across all 4 strategies.
+- **Sheets 2-5** -- per-strategy per-leg detail with `imbal_350`, `imbal_355`, OPRA bid/ask, all three PnL columns, and the delta.
+
+**Terminal command:** `python D:/agent_projects/eod_option_algos/hacking_355_backtest.py`
+
+**Daily task (added 9/3/26):** `scheduled_tasks/run_backtest_hacker.py` (Windows task `CreateBacktestsHacker`, weekdays 8:19) runs
+`hacking_355_backtest.py --max-cost <HACK_MAX_PRICE> --all-parents --last-days 5`, where the cap is regex-read from prod
+`scratch/algos/hacker_trades.py` at run time so it always matches prod (currently 1.70). The script's OWN defaults do NOT match
+prod (2.10 cap, 2 parents) -- never use a bare run for the daily review. Half-size unwind is the default and matches prod;
+`--full-size`, `--uncapped`, `--slip-floor/--slip-pct` and full-history runs (no `--last-days`, ~15-25 min) are research-only.
+Output `Downloads/hacking_355_backtest_cap<NNN>_last5_<ts>.xlsx` (~3 min) is read by `algo_daily_review/build_review_pack.py`,
+which prints a hacker sub-block inside the 355pm_script / 355pm_script_v8 digest blocks only on days with prod HACK_ rows or a
+modeled hack attempt. Prod-vs-backtest differences that are by design (1B/T+1 vs 950M/live trigger, fill price/timing,
+half-of-model vs half-of-filled size, v8 ratio size, unfilled parents) are named, not flagged; the review flags only trigger
+mismatch outside $0.9-1.1B, a fill above the cap, a wrong `sent != floor(parent filled / 2)`, or prod attempted-but-unfilled
+when the model filled (possible wave-3 malfunction).
+
+## Factor Reference
+
+Factors are discrete values computed from raw market data in `add_factors()` and `combine_timestamps()`. Configs reference them by name in `put_trade_factors`, `call_trade_factors`, etc. Each factor condition is a `(factor_name, value)` tuple.
+
+**Binned factors** (computed in `add_factors()` for both 340PM and 350PM timestamps):
+
+| Factor | Raw source | Values | Bin cutoffs |
+|--------|-----------|--------|-------------|
+| `factor_imbal_signed` | MOC imbalance | -1, 0, 1 | < -1B = SELL (-1), > 1B = BUY (1), else NONE (0) |
+| `factor_imbal_mag` | MOC imbalance | 0, 1, 2 | < 500M = 0, 500M-1B = 1, > 1B = 2 |
+| `factor_vol` | ATM implied vol | 0-4 | < 9.7%, < 12.4%, < 15.8%, < 21.2%, >= 21.2% |
+| `factor_vix` | VIX level | 0-4 | < 14.2, < 17.0, < 19.8, < 23.6, >= 23.6 |
+| `factor_rsi` | RSI-3 of SPY | 0-4 | < 24.8, < 48.2, < 67.3, < 91.0, >= 91.0 |
+| `factor_high_low` | SPY high-low range ratio | 0-4 | < 0.651, < 0.858, < 1.099, < 1.469, >= 1.469 |
+| `factor_realized_change` | 66-day RV day-over-day change | 0-9 | 10 bins from < -0.00272 to >= 0.00248 |
+| `factor_market_type` | Flat Market flag | int | From SPY daily moves data |
+| `factor_vol_high_enough` | ATM implied vol | 0, 1 | 1 if ATM vol > 15% |
+
+**350PM-only factors** (computed in `combine_timestamps()`, only available for 3:50 strategies):
+
+| Factor | Values | Meaning |
+|--------|--------|---------|
+| `factor_first_tick` | -1, 0, 1 | ETF price move 15:50:00 → 15:50:05: > 5 bps = 1, < -5 bps = -1, else 0 |
+| `factor_first_tick_sign` | -1, 0, 1 | Direction of first tick (any magnitude) |
+| `factor_first_tick_confirms` | -1, 1 | 1 if first tick and imbalance agree in sign, else -1 |
+| `factor_imbal_mag340` | 0, 1, 2 | Same bins as `factor_imbal_mag`, using 3:40 snapshot |
+| `factor_imbal_signed340` | -1, 0, 1 | Same bins as `factor_imbal_signed`, using 3:40 snapshot |
+| `factor_market_type340` | int | 340PM market type available in 350PM data |
+
+**Threshold flags** (binary 0/1, computed in `add_factors()` or `combine_timestamps()`):
+
+| Factor | Condition | Where |
+|--------|-----------|-------|
+| `factor_atm_vol_gt_16` | ATM vol > 16% | `add_factors()` (both timestamps) |
+| `factor_atm_vol_lt_15` | ATM vol < 15% | `add_factors()` (both timestamps) |
+| `factor_atm_vol_lt_17` | ATM vol < 17% | `add_factors()` (both timestamps) |
+| `factor_sell_imbal_greater_than_2` | 350pm imbal < -2B | `combine_timestamps()` (350PM only) |
+| `factor_350_imbal_greater_than_1b` | 350pm imbal > 1B | `combine_timestamps()` |
+| `factor_350_imbal_greater_than_800m` | 350pm imbal > 800M | `combine_timestamps()` |
+| `factor_350_imbal_greater_than_500m` | 350pm imbal > 500M | `combine_timestamps()` |
+| `factor_350_imbal_less_than_minus_1p5b` | 350pm imbal < -1.5B | `combine_timestamps()` |
+| `factor_350_imbal_less_than_minus_1b` | 350pm imbal < -1B | `combine_timestamps()` |
+| `factor_350_imbal_less_than_200m` | 350pm imbal < 200M | `combine_timestamps()` |
+| `factor_350_imbal_greater_than_minus_200m` | 350pm imbal > -200M | `combine_timestamps()` |
+| `factor_350_imbal_gt_0` | 350pm imbal > 0 | `combine_timestamps()` |
+| `factor_340_buy_imbal_greater_than_700` | 340pm imbal > 700M | `combine_timestamps()` |
+| `factor_340_imbal_greater_than_800m` | 340pm imbal > 800M | `combine_timestamps()` |
+| `factor_340_imbal_less_than_minus_800m` | 340pm imbal < -800M | `combine_timestamps()` |
+| `factor_340_imbal_less_than_500m` | 340pm imbal < 500M | `combine_timestamps()` |
+| `factor_340_imbal_greater_than_minus_500m` | 340pm imbal > -500M | `combine_timestamps()` |
+| `factor_qqq_mkt_ratio_gt_0` | QQQ market ratio > 0 | `combine_timestamps()` |
+| `factor_qqq_mkt_ratio_gt_0p5` | QQQ market ratio > 0.5 | `combine_timestamps()` |
+| `factor_qqq_mkt_ratio_gt_0p8` | QQQ market ratio > 0.8 | `combine_timestamps()` |
+| `factor_qqq_mkt_ratio_lt_0p8` | QQQ market ratio < 0.8 | `combine_timestamps()` |
+| `factor_qqq_paired_lt_4b` | QQQ paired imbal < 4B | `combine_timestamps()` |
+| `factor_qqq_paired_lt_5b` | QQQ paired imbal < 5B | `combine_timestamps()` |
+| `factor_qqq_paired_gt_6b` | QQQ paired imbal > 6B | `combine_timestamps()` |
+| `factor_spy_paired_recreated_gt_12b` through `_gt_25b` | Recreated SPY paired imbal > threshold (12B, 13B, 15B, 17B, 18B, 18.9B, 19B, 21B, 23B, 25B) | `custom_test_factors.py` |
+| `factor_350_imbal_greater_than_1p35b` | 350pm imbal > 1.35B | `custom_test_factors.py` |
+| `factor_350_imbal_less_than_minus_0p6b` | 350pm imbal < -0.6B | `custom_test_factors.py` |
+| `factor_350_imbal_500m_to_1b` | 350pm imbal in [500M, 1B] | `custom_test_factors.py` |
+| `factor_350_imbal_minus_1b_to_minus_500m` | 350pm imbal in [-1B, -500M] | `custom_test_factors.py` |
+| `factor_imbal_gt_neg_500M` | 350pm imbal > -500M (helper for IMBAL_VS_MOVE call triggers) | `custom_test_factors.py` |
+| `factor_imbal_lt_500M` | 350pm imbal < 500M (helper for IMBAL_VS_MOVE put triggers) | `custom_test_factors.py` |
+| `factor_market_move_from_low` | `(spy_350 - day_low) / (spy_350 * rolling_std) > 1.0` — SPY at 3:50 is >1 std above intraday low (call trigger) | `custom_test_factors.py` |
+| `factor_market_move_from_high` | `(day_high - spy_350) / (spy_350 * rolling_std) > 1.0` — SPY at 3:50 is >1 std below intraday high (put trigger) | `custom_test_factors.py` |
+| `factor_market_move_from_low_p5` | Same as above with 0.5 std cutoff | `custom_test_factors.py` |
+| `factor_market_move_from_high_p5` | Same as above with 0.5 std cutoff | `custom_test_factors.py` |
+| `factor_spy_chg_1540_1550_gt_7` | `(spy_price @ 15:50:01 - spy_price @ 15:40:00) / spy_price @ 15:40:00 * 10000 > 7` — SPY ran UP > 7bps between 15:40 and 15:50 (contrarian vs a 350 sell-imbal thesis) | `combine_timestamps()` (backtest) / `350PM_script.py` (prod via BBG snap) |
+| `factor_realized_change_gte_8` | Binned 3M realized-vol change >= bin 8 (above 80th percentile). Drives puts-only `put_size_multiplier_factors` 0.5x rules on SHRINKS/BASE/GROWS_SML/VS_MOVE_NO_MKT/HIGH_PAIRED (8/7/26) | `combine_timestamps()` (backtest) / `350pm_script.py` (prod) |
+| `factor_spy_chg_1540_1550_lt_neg7` | Same as above but < -7 bps (SPY ran DOWN; contrarian vs a 350 buy-imbal thesis) | `combine_timestamps()` (backtest) / `350PM_script.py` (prod via BBG snap) |
+
+**QQQ imbalance aliases** — For NDXP, `350pm_imbal` IS the QQQ imbalance. These aliases make NDX configs self-documenting:
+
+| Alias | Maps to |
+|-------|---------|
+| `factor_qqq_imbal_greater_than_1b` | `factor_350_imbal_greater_than_1b` |
+| `factor_qqq_imbal_greater_than_800m` | `factor_350_imbal_greater_than_800m` |
+| `factor_qqq_imbal_greater_than_500m` | `factor_350_imbal_greater_than_500m` |
+| `factor_qqq_imbal_less_than_minus_1p5b` | `factor_350_imbal_less_than_minus_1p5b` |
+| `factor_qqq_imbal_less_than_minus_1b` | `factor_350_imbal_less_than_minus_1b` |
+| `factor_qqq_imbal_gt_0` | `factor_350_imbal_gt_0` |
+
+Custom factors can be added via `custom_test_factors.py` — any `factor_*` column in the combined DataFrame is automatically passed through by `build_factors_from_row()`.
+
+### Recreated SPY Paired Imbalance
+
+The dollar value of shares matched in the SPX closing auction, computed as `SUM(auction_volume × trade_price)` across all ~500 SPX constituents. Typical values range from ~10B to ~30B.
+
+The canonical source is `auctionResearch.t_report_consolidated_imbalances.spy_paired_imbalance`, but that table is backfilled t+1 by `ConsolidatedImbalancesOutputLambda`. The **recreated** version uses `EODStrategies.t_strat_FuturesStrategyCKSmash1550_Detail.lastExchVolumeTheoValue` (same formula: `iceRealtime.auctionVol × iceRealtime.price`), which is written by the CKSmash strategy at ~3:50pm and available same-day.
+
+The `HAVING COUNT(*) > 400 AND COUNT(*) < 510` filter guards against partial Detail writes — the Summary and Detail inserts in the CKSmash strategy are **not transactional** (separate `ExecuteSQLWithParams` calls), so detail rows are not 100% guaranteed on every run.
+
+**Backtest pipeline:** `update_data.py` step 0b → `spy_paired_recreated_*.csv` → `create_backtests.py` merges as `spy_paired_imbal_recreated` → `custom_test_factors.py` creates threshold factors.
+
+**Production:** `350pm_script.py` calls `get_recreated_paired_imbal()` (in `helpers.py`) with a 1-second `read_timeout`. On failure, returns `None` and paired factors default to 0.
+
+## Config Schema
+
+Each strategy config is a `.py` file with a `config` dict. Keys:
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `name` | str | yes | Unique strategy name (must match filename without `.py`) |
+| `symbol` | str | yes | `"SPXW"` or `"NDXP"` |
+| `direction` | str | yes | `"Sell"` or `"Buy"` |
+| `account` | str | yes | Account label (e.g. `"PROD"`, `"TEST_ACCOUNT"`) |
+| **Sizing** | | | |
+| `dollar_target` | int/False | \* | Dollar notional per trade. Size = `ceil(dollar_target / (net_entry * 100))`. Mutually exclusive with `size_target` |
+| `size_target` | int/False | \* | Fixed contract count. Set to `False` to use `dollar_target` |
+| `call_put_ratio` | float | no | Multiplier on call size relative to put size (default 1) |
+| `min_price` | float/False | no | Skip trade if `abs(net_entry) < min_price` |
+| `max_price` | float/False | no | Skip trade if `abs(net_entry) > max_price` |
+| `max_size` | int/False | no | Cap position size at this many contracts |
+| `min_size` | int/False | no | Floor position size (rounds up to this) |
+| **Strike selection: distance-based (preferred)** | | | |
+| `short_put_distance` | float | \*\* | Min $ distance below index for short put |
+| `long_put_distance` | float | \*\* | Min $ distance below index for long put |
+| `short_call_distance` | float | \*\* | Min $ distance above index for short call |
+| `long_call_distance` | float | \*\* | Min $ distance above index for long call |
+| **Strike selection: index-based (legacy)** | | | |
+| `short_put_strikes` | list[int] | \*\* | Index into sorted OTM puts (0=closest) |
+| `long_put_strikes` | list[int] | \*\* | Index for long put leg |
+| `short_call_strikes` | list[int] | \*\* | Index into sorted OTM calls |
+| `long_call_strikes` | list[int] | \*\* | Index for long call leg |
+| `min_strike_distance` | float | \*\* | Shift strike index outward if within this $ of index (legacy mode only) |
+| **Factor conditions** | | | |
+| `put_trade_factors` | list | yes | Trade triggers. List of tuples of any length: `((factor_a, val), (factor_b, val), ...)`. OR across tuples, AND within each tuple. Evaluated by `get_size_test()` |
+| `call_trade_factors` | list | yes | Same format for calls |
+| `put_dont_trade_factors` | list | no | Veto rules — skip if ANY tuple matches. Checked before trade factors |
+| `call_dont_trade_factors` | list | no | Same for calls |
+| `put_small_trade_factors` | list | no | Half-size conditions |
+| `call_small_trade_factors` | list | no | Same for calls |
+| **Other** | | | |
+| `size_multiplier_factors` | list | no | `[(factor_tuple, mult), ...]` -- first match scales dollar_target/size_target (both sides). Mults < 1.0 also scale `max_size` down (8/7/26) |
+| `put_size_multiplier_factors` / `call_size_multiplier_factors` | list | no | Side-specific version of the above; composes multiplicatively with `size_multiplier_factors` (8/7/26). Used for the puts-only 0.5x high-realized-vol-change rules |
+| `explanation_name` | str | no | Label suffix for trade explanations (e.g. `" Spread"`) |
+
+\* One of `dollar_target` or `size_target` must be set (the other `False`).
+\*\* Use either distance-based or index-based keys. Auto-detected: if `short_put_distance` or `short_call_distance` exists, distance mode is used.
+
+**Auto-set:** `month_end_only` is set to `True` if the config filename contains `_ME` or `_ME_`.
+
+## Strategy Configs
+Located in `d:/PycharmProjects/scratch/algos/configs/`. Each config defines:
+- Factor conditions for triggering trades (calls/puts) — N-factor AND tuples via `get_size_test()`
+- Dollar targets, size limits, price filters
+
+**Production scripts** that consume these configs live in `d:/PycharmProjects/scratch/algos/`:
+- `350pm_script.py` — live trading script that runs at 3:50 PM, loads configs matching "350PM", evaluates factors against live market data, and executes orders via SpiderRock. Includes `get_recreated_paired_imbal()` which queries CKSmash Detail with a 1-second pymysql `read_timeout` — if the query fails/times out, paired factors default to 0 and paired-dependent strategies silently don't trigger
+- `340pm_script.py` — same for 3:40 PM strategies
+- `ALGO_42_350PM_SPREAD_SALES_SPX_HIGH_PAIRED` — sells SPX spreads when 350pm MOC imbalance is large AND recreated paired imbalance is high (account: `EOD10_C42`). **Known caveats (8/27/26, acknowledged and accepted):** (1) the strategy only really shows positive performance since the start of 2025 — essentially all of its backtest PnL is 2025-2026 (2022: +$3.4k, 2023: +$5, 2024: +$40.5k vs 2025: +$222k, 2026: +$169k); (2) the paired cutoff (recreated > $21B) is a STATIC number that does not account for the regime change in paired imbalances, which have grown ~3x since 2021 (regular-day median $9.9B -> $32B) — by 2026 ~97% of regular days pass the gate, so it no longer meaningfully filters. A rolling-percentile gate was prototyped (`test_configs/TEST_350PM_SPREAD_SALES_SPX_HIGH_PAIRED_ROLL90.py`) but backtested worse and was not deployed. The user is aware of both issues and is still choosing to trade the strategy because the backtest looks promising; risk was trimmed instead (sized down 10% and NDX confirmation veto tightened to 50%, see `prod_change_logs/8_27_2026.md`).
+- `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MOVE_NO_MKT` — sells SPX spreads when SPY at 3:50 has moved far (>1 std) from its intraday high/low, with imbal-direction confirmation. "NO_MKT" variant uses `factor_market_type` in `dont_trade_factors` to avoid overlap with IMBAL_VS_MARKET. Account: `EOD17_C42`, `dollar_target: 4000`, `max_size: 30`
+- `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_EXTRA_CALLS` — call-only sister of IMBAL_GROWS. Narrows the parent's call trigger to the highest-Sharpe subregime: `350 < -$2B AND 340 in (-$1B, -$500M]` (340 was already a meaningful sell before 350 confirmed). Stacks on top of parent IMBAL_GROWS call exposure on triggering days. Put side disabled via `put_trade_factors = []`. Account: `EOD22_C42`, `dollar_target: 12000`, `max_size: 36`. See `prod_change_logs/4_21_2026.md`.
+- `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_EXTRA_PUTS` — put-only sister of IMBAL_GROWS. Inherits the parent's full put trigger (`350 > +$1B AND |340| < $500M`), adds stacked put exposure on every triggering day. Call side disabled via `call_trade_factors = []`. Max_size-20 cap bounds the tail (parent max loss was -$35k; child max loss -$5.9k in backtest). Account: `EOD23_C42`, `dollar_target: 8000`, `max_size: 20`. See `prod_change_logs/4_21_2026.md`.
+- `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_SML2` — half-size contrarian-regime sister of IMBAL_GROWS. Fires only on days where SPY ran opposite the MOC imbal direction by >7 bps in the 15:40 → 15:50 window. Parent IMBAL_GROWS has `dont_trade_factors` that zero out these same days, so zero double-counting. Sized at exactly 50% of parent (`dollar_target: 20000`, `max_size: 60`). Depends on the two new `factor_spy_chg_1540_1550_*` factors (see Factor Reference) which are computed live in `350PM_script.py` via a Bloomberg snap at 3:40 and 3:50. Account: `EOD24_C42`. See `prod_change_logs/4_21_2026.md` addendum.
+
+This `eod_option_algos` directory is the backtesting/analysis counterpart: `create_backtests.py` and `test_new_versions.py` validate strategy configs against historical data before they're deployed to the live scripts above.
+
+## Conventions
+
+**Common variable names** — All interactive scripts in this directory must use the same variable names for shared data so that objects are interchangeable across notebooks in the same IPython session:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `combined_data_dict` | `dict[str, DataFrame]` | Keyed by symbol (`"SPXW"`, `"NDXP"`). Each value is the combined DataFrame from `build_combined_data()`. Shared across `test_new_versions.py`, `limit_spread_backtest.py`, `ndx_exploration.py`, etc. |
+| `configs` | `list[dict]` | Loaded strategy configs (from `load_configs()` or `ensure_data()`) |
+
+Cache pattern:
+```python
+if 'combined_data_dict' not in dir():
+    combined_data_dict = {}
+if SYMBOL not in combined_data_dict or combined_data_dict[SYMBOL] is None:
+    combined_data_dict[SYMBOL], _ = build_combined_data(SYMBOL)
+```
+
+This ensures that running one notebook doesn't force a rebuild when switching to another — the data is shared in IPython's global namespace.
+
+**Prod sleep log lines** -- any deliberate sleep in a prod script must print a timestamped line stating its duration as `sleeping Ns ...` or `(Ns wait ...)` (e.g. `Phase 3: sleeping 3s for SR to work orders`); `algo_daily_review/build_review_pack.py` reads the number from that line to classify the gap as a designed wait, so a sleep without it shows up as UNEXPLAINED slowness in the daily review.
+
+## Strike Bump Analysis
+
+### `test_bump_strikes()` in `test_new_versions.py`
+
+Tests what happens if we move both short and long strikes 1 index closer to ATM on days where the original spread was cheap (hit `min_size` floor or price below `min_price`). Closer strikes produce higher premiums, allowing larger position sizes.
+
+**How it works:**
+1. Runs original config to find 1-lot days (size floored to `min_size`)
+2. Creates a bumped config: each strike index decremented by 1, `min_strike_distance` reduced by $5 (SPXW) or $25 (NDXP) to prevent `calc_strike_shifts` from re-shifting back to the original strikes
+3. Runs bumped config with custom `dollar_target` and `max_size` overrides
+4. Filters results to only the 1-lot days and prints summary stats
+
+**Usage:**
+```python
+test_bump_strikes("ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS", dollar_target=10000, max_size=50)
+test_bump_strikes("ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS", dollar_target=10000, max_size=50, narrow_spread=True)
+```
+
+`narrow_spread=True` sets the long leg to 1 strike away from the short (tightest possible spread).
+
+### Conclusion (April 2026)
+
+Tested bumped strikes for IMBAL_GROWS and IMBAL_VS_MARKET on days where the regular spread price was below `min_price`. Since ~2024 both strategies looked decent with an `atmVol < 0.14` filter and $15-wide spreads. Pre-2024 results are less attractive. Deployed to prod in April 2026 — see Prod Bumped Spread Strategy section.
+
+### GROWS_SML Bumped Test (7/22/26)
+
+Tested a bumped version of `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_SML` ($10k/30 sizing, $5 bump, $15-wide, atmVol < 0.14). Full-sample PnL flat (-$1.7k over 51 fires, Sharpe -0.01); 76% WR eaten by call-side tail losses (worst -$25.6k, 6/11/24) concentrated in the marginal 350-just-past--1B regime. 2024 -$45k / 2025 -$10k / 2026 +$35k (9-for-9, incl. +$7.2k on 7/15/26). NOT deploying -- unlike GROWS/SHRINKS bumped, even 2024-25 were net losers. Revisit if 2026 keeps printing positively (more OOS data).
+
+### Limit Order Test (April 2026)
+
+Tested offering a $0.50 limit order (120 lots) on 1-lot days for IMBAL_GROWS and IMBAL_VS_MARKET, scanning second-by-second OPRA quotes from 15:50:07 to 15:54:59. Overall negative PnL -- very few days actually fill at $0.50, and there appears to be adverse selection on the days that do fill (the spread bid only reaches $0.50 when the market is moving against the position). Not viable for prod.
+
+### Limit-Fill 1-Lot Rescue Test (May 2026)
+
+Broader re-run of the limit-order idea across ALL 350PM spread-sale algos (not just GROWS/VS_MARKET). Script: `adhoc/limit_fill_1lot_spread_sales.py`.
+
+**What was tested:** From a fresh EOD backtest Excel, found every day a 350PM spread-sale algo got floored to 1 lot by `min_price` (credit < $0.30). For each such day, queried `t_opra_quotes` second-by-second over 15:50:10-15:54:59 and checked whether the spread's market bid (short_bid - long_ask) ever reached the limit price. If it did, assumed we instead sold the algo's `max_size` at the limit and measured incremental PnL vs the actual 1-lot trade (hypothetical replaces the 1-lot; expiry PnL at SPX settle). NDX excluded (different symbol/strike grid, OPRA not cached). Tested limits $0.30 and $0.40, and cutoff times 15:52:59 / 15:54:59 / 15:59:59.
+
+**Results ($0.30, 15:54:59 cutoff):** Net NEGATIVE across the book (~ -$240k over 500 one-lot legs, 147 fills). Driven almost entirely by IMBAL_VS_MARKET (-$317k) -- classic adverse selection: 88% fill-win-rate but a handful of catastrophic days (one -$216k single day) sink it, because you fill max_size into a position the market is running through. Only IMBAL_GROWS was meaningfully positive (+$98k, 96% win, 1 losing day in 5+ years, every calendar year positive, robust to a $1 adverse close shift). Raising the limit to $0.40 made the aggregate WORSE (-$309k) -- fewer fills but each more adversely selected. Cutoff sensitivity is monotone: earlier cutoff = less adverse selection (15:52:59 ~ -$40k > 15:54:59 ~ -$240k > 15:59:59), because a bid that only reaches $0.30 late in the window is climbing precisely because the underlying is moving toward the short.
+
+**Decision (not deployed):** Decided NOT to add this to prod. Only IMBAL_GROWS looked meaningfully profitable, and since all 350PM spread-sale strategies were tested at once, that single standout is plausibly just noise from multiple comparisons (researcher degrees of freedom) rather than a real, isolated edge. Not worth deploying on that basis.
+
+### Alternative Entry Time Test (April 2026)
+
+Tested alternative trade entry times for `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS` (15:50:02, 15:50:07, 15:50:10, 15:50:15, 15:50:20, 15:50:25) by rebuilding `combined_dfs` with each primary OPRA fill time. Earlier entry times do not backtest better -- 15:50:02 produced ~$291k less PnL than 15:50:07 over 232 trade days. Sanity checks (same-strike credit reconciliation, 02->07 SPX drift test, outlier concentration) showed the 07 advantage is fully explained by market-maker quote tightening in the 5 seconds after the 15:50:00 imbalance print (i.e. quotes are wide at 15:50:02), not by signal quality or favorable directional drift. For now there is no strong evidence for changing the trade time away from 15:50:07. Scratchpad: `fast_version_test.py`, build scripts: `_build_time_variants.py`, `_build_regular.py`.
+
+### Exit Triggers + First-Tick Veto Research (June 2026, 6/8/26)
+
+Triggered by a sharp single-day loss on 6/5/26 -- explored whether two intuitive "skip / exit early" rules would have helped IMBAL_VS_MARKET and IMBAL_GROWS broadly, or whether 6/5/26 was an outlier.
+
+**Q1: Should I automate an exit of IMBAL_VS_MARKET or IMBAL_GROWS when there is a big 355pm imbal flip?** Tested early-exit (buy back short at ask, sell long at bid -- treating NaN long-bids as $0/abandoned) at 15:55:03 across days where the 355PM imbal moved against the traded side. Tried thresholds of +/-$1B / +/-$2B / +/-$3B against the trade direction. **Answer: No.** Outside of 6/5/26 (where this would have been very helpful), broadly the data supports holding to close -- early-exit sums net out near-zero or slightly negative once the few days where the 355 imbal reverses but the close doesn't follow are included. The rule looks like noise across the full sample.
+
+**Q2: Should I make first_tick a "no-trade" factor for either IMBAL_VS_MARKET or IMBAL_GROWS?** (i.e. require that the first tick agrees with the trade direction before firing.) Tested with both the binned `factor_first_tick` (+/-5 bps deadband) and the raw `first_tick_bps` (any nonzero sign). **Answer: No.** Same conclusion -- 6/5/26 would have benefited, but the broad sample does not support it. The first-tick sign is too noisy a signal to use as a hard veto on these algos at this sample size.
+
+**Takeaway:** 6/5/26 was a salient single-day loss that pattern-matched to two plausible "skip" rules, but neither rule shows broad statistical support. Keep IMBAL_VS_MARKET and IMBAL_GROWS firing on the existing parent-config triggers without 355-imbal-reversal or first-tick vetoes.
+
+**Q3 (added 2026-07-01): Should we hack CLOSER 350pm algos if there is an imbal flip such that at 355pm imbal is >$1B in the wrong-sign direction?** Re-ran the same 355-flip hack test but now on the CLOSER variants of IMBAL_VS_MARKET and IMBAL_GROWS using `hacking_355_backtest.py`. There are very few instances of this. Prior to 6/29/26, the answer was NO. Inclusive of 6/29/26, the answer would be YES. **For now, I am not automating the hack** given that I don't want to fit to what could just be a one-off situation. Revisit if more flip-day CLOSER outcomes accumulate.
+
+**Note on CLOSER vs parent asymmetry:** The case for automating a CLOSER-specific hack looks structurally stronger than the parent case even at the same flip trigger. CLOSER trades $5-wide spreads while the $15-wide parents (`short_put_strikes:[1]`, `long_put_strikes:[4]`) have 3x the max-loss ceiling, so the spread's value at 355 does not blow up as large on CLOSER when the market has moved against the position -- hack-exit cost is capped much lower. Same signal, cheaper exit, better risk/reward on the hack for the CLOSER side.
+
+## TESTED IDEAS
+
+Dated log of ideas tested and their verdicts (deployed or rejected). Add new entries here.
+
+### Exploratory questions after the 8/27/26 large loss (9/9/26)
+
+Five questions on the 8/27/26 IMBAL_VS_MARKET_CLOSER loss (levered-rebal effects, similar-day analysis, retracement) are answered one-sentence-each in [exploratory_questions_8_27_26.md](exploratory_questions_8_27_26.md). Net outcome: one prod change -- IMBAL_GROWS CLOSER + BUMP get a no-trade rule when the 3:55pm projected levered-ETF rebal is adverse to the sold side (analysis threshold $5B; **implemented 9/9/26 at a 4.5B prod buffer**, `algos/rebal_veto.py`, see `prod_change_logs/9_9_2026.md`); everything else concluded no rule change.
+
+### "Likely-to-be-CLOSER" First-Tick Test (7/24/26)
+
+Tested a "likely to be" closer strat which looks at the first tick over the first 5 seconds post 3:50:00 and combines this with the price of the spread (parent credit <= $0.70, i.e. near the $0.50 CLOSER gate) to determine whether trading the closer variant instead of the parent for IMBAL_GROWS and IMBAL_VS_MARKET would be higher pnl. Inspired by 7/16/26. Ultimately, we determined this is not promising because the win rate of days that qualify under these conditions is empirically << ~90%, the empirical win rate of the parent strategies (incremental 0.50-0.70 bucket: CLOSER-instead 67% WR / -$45k vs parent 92% WR / +$102k over 12 legs). No change is best course of action (and we could revisit this idea if we observe more samples that would change the analysis).
+
+Also tested a "likely to be bumped" strategy (same concept: parent credit in (0.30, 0.50] just above the bumped 1-lot cutoff, side-matched first tick >= 2bps, atmVol < 0.14) and found that win rate looked worse than parents for VS_MARKET + GROWS (80% vs 96%, 25 legs) and looked the same for SHRINKS (90% vs 90%, 10 legs, but n is small, so dont have high confidence -- SHRINKS bumped-instead PnL was higher purely from premium capture at equal WR, with a 6x worse tail on the one shared loss day 7/22/26). As such, decided NOT to implement this.
+
+### IMBAL_VS_MOVE Threshold Test (7/28/26)
+
+Tested lowering `ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MOVE_NO_MKT`'s move-from-high/low trigger from 1.0 to 0.8 std (motivated by 7/27/26, which fired at 0.938 and would have won +$6.9k): the 41 incremental fires in the 0.8-1.0 band net -$47k at 80% WR (two blowups: 2/24/25 -$111k, 4/23/26 -$66.5k at vol 0.123, so a low-vol filter doesn't save it), dragging Sharpe 0.24 -> 0.09. NOT changing the config -- threshold stays at 1.0.
+
+## 350PM Debit BUY Exploration
+
+### Conclusion (April 2026)
+
+Tested 350pm buy algos using SPX paired imbal and NDX imbal as trigger signals. A disproportionate amount of the days that win at 350pm also make money in the 355pm version of the algo (which uses a simple `|355 imbal| > 1.5B` cutoff and is already in prod). Not implementing any 350 buy algo at this point.
+
+## Gotchas
+
+**NDXP `factor_market_type` is actually SPX market type.** The `factor_market_type` column in NDXP combined data is computed from SPY market ratio, not QQQ. On all valid rows the values are identical to SPX's `factor_market_type`. Use `factor_qqq_market_type` if you need QQQ-based market direction.
+
+**Cross-asset data not in NDXP by default.** SPX-specific columns (SPX atmVol, SPX 340pm imbal, SPX market_type) are not merged into NDXP combined data. To add them as a hotfix without rebuilding:
+```python
+# SPX atmVol
+spx_vol = combined_data_dict["SPXW"][["trade_date", "atmVol 350PM"]].rename(
+    columns={"atmVol 350PM": "atmVol_spx 350PM"})
+combined_data_dict["NDXP"] = combined_data_dict["NDXP"].merge(spx_vol, on="trade_date", how="left")
+
+# SPX 340pm imbal
+spx_340 = combined_data_dict["SPXW"][["trade_date", "340pm_imbal 350PM"]].rename(
+    columns={"340pm_imbal 350PM": "spx_340pm_imbal"})
+combined_data_dict["NDXP"] = combined_data_dict["NDXP"].merge(spx_340, on="trade_date", how="left")
+```
+Watch for `_x`/`_y` suffixes if you merge the same column twice — drop duplicates first.
+
+**Credit spread net_entry floor at $0.05.** For sell-direction configs, `apply_config` floors spread net_entry at $0.05 for both CROSS and MID_PLUS_COST pricing. This prevents a zero-bid short leg from producing negative net_entry, which would blow up dollar_target sizing (e.g. the -4000 size bug where `ceil(20000 / (-0.05 * 100)) = -4000` bypassed max_size because `size > 0` was False).
+
+**`min_price` / `max_price` comparisons must use `price_compare` helpers to avoid IEEE 754 drift.** A nominally-0.20 credit computed as `0.30 - 0.10` is actually `0.19999999999999998` in float, so a strict `<` against `min_price=0.20` evaluates True and silently kills the trade. `apply_config` now uses `a_lt_b` / `a_gt_b` from `D:/PycharmProjects/utils/price_compare.py` for these checks. **Always call these helpers with keyword args** — `a_lt_b(a=put_price, b=config["min_price"])` — so the comparison direction is unambiguous at the call site. **If you add new price-vs-threshold comparisons in this codebase, never use raw `<`, `<=`, `>`, `>=`, `==` on a computed price against a config-driven threshold — use the helpers.** The same fix has not yet been applied to live prod (`scratch/algos/helpers.py` `prep_trades` and `spdr_rock_order_functions.py`); track that separately.
+
+**`min_size` overrides `min_price` rejection.** In both prod and backtest, the size limit checks run sequentially inside a single `if put_size > 0` block: min_price → max_size → max_price → min_size. If min_price sets size to 0, the min_size check still runs and floors it back to 1. This means configs with `min_size: 1` will **always trade at least 1 lot** when factors trigger, even if `price < min_price`. There are no "price-rejected, zero-trade" days — they become 1-lot days instead.
+
+**`apply_config` skips month-end and Fed days.** Regular configs skip rows where `is_month_end = True` or `is_fed = True` (lines 1527-1530). To test a strategy on month-ends, override with `{**cfg, "month_end_only": True}` and run against full combined data. See Quick Reference for the snippet.
+
+**Backtest spread width is determined by parent config indices, not `STRIKE_STEP`.** In `bumped_spread_backtest.py`, the parent configs (IMBAL_GROWS, IMBAL_VS_MARKET) have `short_put_strikes: [1]` and `long_put_strikes: [4]` — that's 3 indices = $15 wide. The `SPREAD_WIDTH` parameter controls how the long leg index is set relative to the bumped short. Changing `SPREAD_WIDTH` from 15 to 5 sets the long to `bumped_short + 1` instead of `bumped_short + 3`.
+
+**CLOSER and bumped trades both inject after `apply_size_limits` runs.** In `350PM_script.py`, the size-limit check happens between `prep_trades()` and the CLOSER/bumped layer calls. CLOSER and bumped append new trade entries to `trade_dict` *after* size limits have been enforced on the parent trades — so account-level aggregate limit sizes don't bind on them.
+
+**`configs` gets wiped on `importlib.reload`.** After reloading `test_new_versions`, the `configs` variable is reset to None. Always re-run after reload:
+```python
+import importlib
+import test_new_versions
+importlib.reload(test_new_versions)
+from test_new_versions import *
+configs = load_configs(PROD_CONFIGS_DIR) + load_configs(TEST_CONFIGS_DIR)
+```
+
+**Step 5b freshness check skips timestamp backfill.** The "already have it" check in `update_opra_panel()` ([update_data.py:855](update_data.py)) keys on `trade_date` only, not `(trade_date, timestamp)`:
+```python
+missing_dates = sorted(expected_dates - existing_panel_dates)
+```
+If you add a new target time to `TRADE_TIMES` (e.g. 15:50:02), any date already in `{symbol}_0DTE_opra_panel.csv` is skipped wholesale — the new timestamp only populates for genuinely new dates going forward. The panel CSV ends up with near-full coverage for legacy timestamps and near-zero coverage for the new one. **Fix:** delete `{symbol}_0DTE_opra_panel.csv` (and the NDXP one if relevant) and run `python update_data.py SPXW --full --steps 5b` to rebuild from scratch. The per-date SQL pull already returns all timestamps, so the extra cost of rebuilding is near-zero per date.
+
+**Step 5b can silently match a quote up to +20s late.** The nearest-row loop in `update_opra_panel()` tries the exact target second first, then walks forward 0 → +20s until it finds a valid bid. For a target of 15:50:02 on a thin-quote day, the row written to the panel may actually be a 15:50:22 quote. The `timestamp` column in the CSV reflects the realized quote time (`best_row["timestmp"]`), so you can check for late matches by filtering rows where `timestamp != target_time`. Relevant when doing tight-timing execution studies — a "15:50:02" backtest may effectively be 15:50:07+ on exactly the days where timing matters most.
+
+**`dont_trade_factors` tuple arity must match `trade_factors`.** If `put_trade_factors` entries are 2-tuples like `(("factor_a", 1), ("factor_b", 1))`, then `put_dont_trade_factors` entries must also be 2-tuples — the evaluator does not auto-broadcast. For a single-condition veto, duplicate the condition as a no-op:
+```python
+"put_dont_trade_factors": [
+    (("factor_market_type", 1), ("factor_market_type", 1)),  # veto on Up market
+]
+```
+Failing to match arity silently skips the veto (rule never fires). Pattern used in all `_NO_MKT` variants of IMBAL_VS_MOVE.
+
+**Backtest index print vs prod SR uPrc can straddle the $1 min-distance boundary.** Since the 8/5/26 migration, `idx_price350pm` is the ThetaData index print at 15:50:06 -- but prod selects strikes off the SR-surface uPrc at ~15:50:02-05, and the two routinely differ by $1-2 (8/4/26: ThetaData 7751.45 vs uPrc 7753.57; both landed on the same side of the 7750 bar that day, but the index crossed the eligibility boundary between :06 and :07). When SPX sits within ~$2 of a strike at 3:50, expect residual one-strike selection differences vs prod in reconciliations -- a data-source reality, not a bug. (Pre-migration the divergence was much worse: the cross-ratio estimate on 8/4 was 7750.40, a full strike off prod.)
+
+**Every factor used by a prod config must exist in `create_backtests.py`'s canonical pipeline — not only in `custom_test_factors.py` or `350PM_script.py`.** Three separate instances this year where a deployed config referenced a factor that existed only in prod's live script (or only in `custom_test_factors.py`) but not in `combine_timestamps()` — breaking the CLI `python create_backtests.py` run. The interactive / `test_new_versions` path masked the bug because `ensure_data()` / `add_custom_factors()` fills in the missing columns; the CLI path does not.
+
+Before deploying any config:
+1. Grep every factor name in `put_trade_factors` / `call_trade_factors` / `put_dont_trade_factors` / `call_dont_trade_factors` / `put_small_trade_factors` / `call_small_trade_factors` against `create_backtests.py`.
+2. If a factor appears only in `custom_test_factors.py` or `350PM_script.py`, mirror the computation into `combine_timestamps()` and register the name in `extra_350_cols` (see next Gotcha for mechanics).
+3. Confirm by running `python create_backtests.py` from the repo root — the new config should appear in the backtest summary, not a `SKIPPED {name}` warning from `run_backtest`.
+
+`run_backtest` catches `KeyError` from `apply_config` and logs a `SKIPPED {name}: references a factor not in combined data` warning rather than crashing. If you see one, a factor is missing from the pipeline — don't ignore it. Untreated, the config trades live without ever being backtested.
+
+**New 350PM-only factors must be registered in `extra_350_cols` inside `combine_timestamps()`.** Adding a `factor_*` column to `panel_350` inside `combine_timestamps()` is **not enough** — it will be silently dropped before the combined DataFrame is returned. Two guards must be updated in the same function ([create_backtests.py:999-1029](create_backtests.py), roughly):
+
+1. Add the column name to the `extra_350_cols` list. Line 1032 filters to `common_cols + extra_350_cols`, so unlisted columns are dropped.
+2. Because `extra_350_cols` is also the `skip_suffix` set (line 1041), listed columns flow through **unsuffixed** into combined. Any downstream code (backtest configs, `build_factors_from_row()`, live `350PM_script.py`) should reference the factor by its bare name, not `factor_foo 350PM`.
+
+Symptom if you forget: a freshly-rebuilt `combined_data` is missing your new factor, and `apply_config()` raises `KeyError: "Factor 'factor_foo' not found in combined data"` on the first config that references it. The fix is a one-line edit to `extra_350_cols` — no need to rebuild upstream panels.
+
+Also update `350PM_script.py` (`factor_dict[...]`) and, if the factor comes from the imbalance CSV / a new raw column, whatever loader produces it — so backtest and prod share identical factor semantics.
+
+## Prod Bumped Spread Strategy
+
+Deployed April 2026. On 1-lot days (where parent spread strategies hit `min_size` floor due to cheap spread prices), sells a "bumped" spread — short strike 1 index ($5) closer to ATM, $15-wide — through the standard `send_complex_two_waves` pipeline.
+
+**Prod files (in `D:/PycharmProjects/scratch/algos/`):**
+- `bumped_spread_trader.py` — `get_bumped_spread_trades()` builds trade entries and appends them to `trade_dict` before the send loop. No custom order-sending logic; trades flow through the same async pipeline as all other spreads.
+- `configs_bumped_spreads/bumped_spread_config.py` — per-strategy config with account, sizing, and spread parameters.
+
+**How it triggers:**
+1. `350PM_script.py` calls `get_bumped_spread_trades()` before the send loop
+2. Function iterates `trade_dict`, finds parent complex trades with `size == 1`
+3. Checks `today_vol < 0.14` (vol filter)
+4. Bumps short strike $5 closer to ATM, places long leg $15 further OTM
+5. Computes size from `dollar_target / (spread_fair * 100)`, capped at `max_size`
+6. Appends trade entries to `trade_dict` → sent via `send_complex_two_waves`
+
+**Config (as of 9/11/2026; values are LITERAL in `bumped_spread_config.py` -- the bumped layer no longer goes through `scaled()` / `SIZE_KNOB`. Pre-9/11 entries in the notes are base amounts that were multiplied by the 2.6 knob at import, e.g. $22k/44 ran as $57.2k/114):**
+| Parent strategy | Account | Dollar target | Max size | Notes |
+|-----------------|---------|---------------|----------|-------|
+| IMBAL_GROWS | EOD20_C42 | $11,000 | 22 | -50% on 9/11/26 (was $22k/44); +10% on 5/27/26 (was $20k/40); adverse levered-rebal veto since 9/9/26 |
+| IMBAL_VS_MARKET | EOD28_C42 | $2,750 | 7 | -50% on 9/11/26 (was $5.5k/13); re-added 5/6/26 at quarter size as a standalone-PnL probe (retired 4/23/26); +10% 5/27, max 11 -> 13 on 6/4 |
+| IMBAL_SHRINKS | EOD25_C42 | $8,250 | 16 | -50% on 9/11/26 (was $16.5k/33); added 4/23/26; +10% on 5/27/26 (was $15k/30) |
+
+| Setting | Value |
+|---------|-------|
+| Spread width | $15 |
+| Vol filter | atmVol < 0.14 (`MAX_ATM_VOL`, enforced at the top of `get_bumped_spread_trades`) |
+| Edge targets | Inherited from parent (VIX-adjusted) |
+| Adverse levered-rebal veto (9/9/26) | IMBAL_GROWS only -- see change history and the Prod CLOSER settings row |
+
+**Change history:**
+- 4/23/2026: IMBAL_VS_MARKET retired from bumped layer (parent config unchanged); replaced by IMBAL_SHRINKS in EOD25_C42. IMBAL_GROWS upsized from $10k/20 to $15k/30. See `prod_change_logs/4_23_2026.md`.
+- 9/9/2026: **Adverse levered-rebal veto** (IMBAL_GROWS only): the bumped layer does not fire a side when the projected 3:55pm levered-ETF rebal is > 4.5B adverse to the sold side (Calls if rebal > +4.5B, Puts if < -4.5B; backtest modeled 5.0B). Number comes from `algos/levered_rebal_355_daily.csv`, written by `btic_and_imbal_script.py` at ~15:49:03 and read via `rebal_veto.py`; unreadable -> loud banner, bumped trades as before (fail-open). See `prod_change_logs/9_9_2026.md`.
+- 9/11/2026: **All three sized down and removed from `scaled()`/`SIZE_KNOB`** -- effective v7 sizing GROWS $57.2k/114 -> $11k/22, VS_MARKET $14.3k/33 -> $2.75k/7, SHRINKS $42.9k/85 -> $8.25k/16 (config values are now literal) after fixing the backtest's double-bump strike-selection bug (see `bumped_spread_backtest.py` section). Fixed backtests: without the retroactive rebal veto, the worst day for GROWS and VS_MARKET exceeds lifetime PnL; SHRINKS' worst day is ~38% of lifetime. Kept running as still believed net positive, with less conviction. Future option (not done): capture the near-ATM premium the buggy backtest was modeling via the CLOSER layer instead -- loosen `well_within` thresholds and add an IMBAL_SHRINKS CLOSER. See `prod_change_logs/9_11_2026.md`.
+
+**Deployment gate: overlap analysis, not just in-sample Sharpe.**
+Before adding or retiring a strategy in `BUMPED_PARENT_CONFIGS`, run pairwise overlap analysis (via `strategy_overlap()` in `test_new_versions.py`, or the bumped variant used in the 4/23/2026 analysis). The decisive metric is **unique-day Sharpe** (PnL on days only that strategy fires), not aggregate in-sample Sharpe. The 4/23 retirement of IMBAL_VS_MARKET demonstrates why: its bumped 1.01 full-sample Sharpe looked healthy, but its 2-way unique Sharpe vs IMBAL_GROWS was **−0.01** — its entire contribution was earned on overlap days where IMBAL_GROWS was already stacking the same bet. In-sample Sharpe flatters strategies whose P&L is redundant with what's already deployed; unique-day Sharpe exposes them. Checklist before deploying:
+1. Run 4-way (or N-way) overlap against all currently deployed bumped strategies — what fraction of days are unique?
+2. Run 2-way overlap against each existing bumped strategy pairwise — is the candidate consistently orthogonal, or correlated with one in particular?
+3. Compute unique-day PnL and Sharpe for the candidate. If unique Sharpe ≤ 0 or PnL is near zero, the strategy is a correlated stacker and should not be added (or the correlated counterparty should be reviewed for retirement).
+4. Run the same check on the full set *after* the change to confirm the post-deployment book still has healthy per-strategy unique-day Sharpes.
+
+**Testing:** Set `FORCE_BUMPED_TEST = True` at the top of `350PM_script.py` (near `TEST_350PM_IMBAL`) to trigger on any parent fire regardless of size. Run with `IS_TEST=True, SEND_TRADES=False` to verify output without sending orders.
+
+**Error isolation:** Three layers of try/except -- per-trade inside the function, the whole function call in 350PM_script.py, and `safe_send` wrapping each async order. A failure in bumped spread code cannot take down the main script.
+
+## Prod CLOSER Strategy
+
+Deployed May 2026. On parent 350PM spread-sale fire days that pass a "well-within" signal gate AND have parent spread credit <= $0.50, sells a $5-wide credit spread with the short strike chosen as the closest-to-uPrc option in the [-$1 ITM, +$4.5 OTM] range; long leg $5 further OTM. The parent's size is decremented by the closer's size (floored at the parent's own `min_size`) and a `closer_applied` flag is set on the parent trade so the bumped layer skips it (CLOSER takes precedence over bumped on the same day).
+
+**Prod files (in `D:/PycharmProjects/scratch/algos/`):**
+- `closer_spread_trader.py` -- `get_closer_spread_trades()` mutates `trade_dict` in place: decrements parent size, appends `{parent}_CLOSER` trade. Wrapped in try/except/finally with deep-copy rollback inside `350PM_script.py`.
+- `configs_closer_strikes/closer_strike_config.py` -- per-parent config with account, `ratio_to_parent`, and well-within lambda rules. Sizing derived at runtime: `closer_dollar_target = parent_dollar_target * ratio_to_parent`, `closer_max_size = ceil(parent_max_size * ratio_to_parent)`, `closer_min_size = parent_min_size` (inherited, not scaled).
+
+**Config (as of 9/3/2026):**
+| Parent strategy | Account | ratio_to_parent | Effective sizing |
+|-----------------|---------|-----------------|------------------|
+| IMBAL_VS_MARKET | EOD31_C42 | 1.4 (140% of parent; was 1.0, up to 1.4 on 6/16, temporarily 1.25 on 9/1 after 8/27 loss, restored to 1.4 on 9/3 -- overfit check passed, see prod_change_logs/9_3_2026.md) | scales off parent's $T / max_size |
+| IMBAL_GROWS | EOD32_C42 | 0.7 (70% of parent; was 0.5, changed 6/16) | scales off parent's $T / max_size |
+
+| Setting | Value |
+|---------|-------|
+| Spread width | $5 (vs bumped's $15) |
+| Strike range | short in [-$1 ITM, +$4.5 OTM] (closest-to-uPrc within range) |
+| Price gate | parent credit <= $0.50 |
+| Float-precision epsilon | $0.0001 (boundary safety on $1 ITM cap) |
+| Cheap-price guard (9/3/26) | wave-1 limit (sprc fair - max_edge1, clamped up to parent `min_price`) <= `CHEAP_PRICE_THRESHOLD` ($0.30) -> closer capped at `CHEAP_PRICE_MAX_SIZE` (20 lots) and parent forced to `min_size` with a loud VERIFY DATA warning (parent > min with a <= $0.30 closer implies bad sprc data). Orchestrator re-checks the post-refresh wave-2 limit and caps the wave-2 remainder the same way. |
+| Adverse levered-rebal veto (9/9/26) | IMBAL_GROWS only: no CLOSER on a side when the projected 3:55pm levered-ETF rebal is > `REBAL_VETO_THRESHOLD_B` (4.5B prod; backtest 5.0B) adverse to it (Calls if rebal > +4.5B, Puts if < -4.5B). Applied after the cheap-price guard (its parent force-to-min still runs); on veto the closer is never built, the parent is NOT decremented, `closer_applied` stays unset. Source: `algos/levered_rebal_355_daily.csv` via `rebal_veto.py`; unreadable -> loud banner, trades as before (fail-open). Test runs use the prior day's row, or `--test-rebal-355-b <B>` (`REBAL_355_B` in `test_run_algos.sh`). |
+| Master kill switch | `CLOSER_ENABLED = True` in config |
+| Test flag | `TEST_CLOSER = True` (with `IS_TEST = True`) bypasses both gates |
+| Test flag (cheap guard, W1) | `TEST_CLOSER_AT_MIN_SIZE = True` (with `IS_TEST = True`) forces the decision-time cheap-price branch regardless of the wave-1 limit; inert in prod |
+| Test flag (cheap guard, W2) | `TEST_CLOSER_W2_CHEAP = True` (with `IS_TEST = True`) makes the orchestrator treat tagged wave-2 limits as at the floor, exercising the otherwise-unreachable wave-2 cap; inert in prod |
+
+**Change history:**
+- 6/1/2026: Observed a winning fire on both IMBAL_VS_MARKET CLOSER and IMBAL_GROWS CLOSER on 6/1/26. Considered sizing both up beyond the rest of the 350PM spread-sale book to capitalize on observed edge. Re-ran the Bernoulli spread analysis on the latest backtest with a counterfactual "+1 win" added to IMBAL_GROWS CLOSER (N=33 -> N=34, 84.85% -> 85.29% WR): Bonferroni-corrected p-values dropped only marginally (Strict 0.69 -> 0.63; Relaxed same), still nowhere near the 0.05 significance bar. Decision: **NOT sizing up at this point** -- one additional win does not meaningfully change the statistical evidence, and the avg-loss-per-share (~$3.35) is ~3.4x the avg-win-per-share (~$1.00), leaving a thin 5pp margin above the break-even rate. Wait for more positive data (sustained wins or fewer losses) before treating CLOSER as a candidate for above-baseline sizing.
+  - **Next review trigger:** after 2-3 more realized wins in these CLOSER strategies, revisit the sizing question and likely scale up. The 6/1 sensitivity run showed one win moves Bonferroni only ~0.06; another 2-3 wins (with no new losses) plus the favorable change to Avg-loss/Avg-win ratio should push the Bonferroni meaningfully closer to (or below) 0.05, at which point above-baseline sizing is statistically defensible.
+- 9/3/2026: Cheap-price guard deployed (see settings table above) and IMBAL_VS_MARKET ratio restored 1.25 -> 1.4 (the 9/1 cut after the 8/27 loss, worst day in strategy history at -$207.9k, was temporary pending an overfit check -- passed: loss clustering makes the recent 3-losses-in-6 streak unremarkable, and CLOSER's 56-day counterfactual advantage over parent+bumped is +$959k). Full detail: `prod_change_logs/9_3_2026.md`.
+- 9/9/2026: **Adverse levered-rebal veto** deployed for IMBAL_GROWS CLOSER (and BUMPED) -- see the settings row above. Basis: `exploratory_questions_8_27_26.md` #2 (veto at 5.0B cut 19 legs, net +$35.4k: BUMP -$89.0k removed, CLOSER +$53.7k given up; tail control on low-contribution layers). Full detail: `prod_change_logs/9_9_2026.md`.
+
+**Deployment gate:** Same overlap-analysis discipline as bumped applies. Before adding a new parent to `CLOSER_PARENT_CONFIGS`, run pairwise and N-way overlap vs the existing CLOSER deployment plus the bumped layer. CLOSER takes precedence over bumped via the `closer_applied` flag, so a new CLOSER parent effectively retires that parent from bumped on well-within + cheap-credit days.
+
+**Testing:** Set `TEST_CLOSER = True` at the top of `350PM_script.py` to bypass both gates and force a fire on every eligible parent. Run with `IS_TEST = True, SEND_TRADES = False` to verify output.
+
+**Error isolation:** Three layers of try/except -- per-trade inside the function, the whole function call in `350PM_script.py` (with deep-copy rollback of `trade_dict`), and `safe_send` wrapping each async order. A failure in CLOSER code cannot take down the main script.
+
+## Prod Change Logs
+
+The `prod_change_logs/` directory contains dated markdown files documenting sizing and config changes to production algos. Each entry records what changed, the before/after values, and the rationale (backtest + realized performance at the time). Consult these logs before sizing algos up or down to understand prior decisions and avoid reverting intentional changes.
+
+- **8/27/26 -- 350PM sizing changes:** IMBAL_VS_MARKET +20% ($114.4k/356 -> $137.3k/426; best strategy in suite, was undersized -- its CLOSER inherits the increase via ratio_to_parent), HIGH_PAIRED -10% ($17.2k/85 -> $15.4k/78; only profitable since 2025 with three bad 2026 days, and its static 21B paired gate now passes ~97% of days as paired imbal grew ~3x since 2021 -- rolling-gate redesign prototyped in `test_configs/TEST_350PM_SPREAD_SALES_SPX_HIGH_PAIRED_ROLL90.py`, not deployed), GROWS_SML2 ratio-to-parent 0.5 -> 0.3 ($52k/156 -> $31.2k/93; tiny n, peg to parent had let it grow to 4th largest in suite). Full detail: `prod_change_logs/8_27_2026.md`.
+- **8/27/26 -- HIGH_PAIRED NDX confirmation veto tightened 10% -> 50%:** new `factor_ndx_lt_50pct_spx` / `factor_ndx_gt_50pct_spx` (computed in both prod scripts, `combine_timestamps()`, and `custom_test_factors.py`) replace the 10% factors in HIGH_PAIRED's dont_trade rules. Motivated by 8/26/26 (puts sold with NDX imbal only 31% of SPX's, -$34k). Backtest: removes 27/155 legs, -$24.4k net, incl. all three 2026 losers; Sharpe 0.31 -> 0.51. Threshold fit on 3 losers, not statistically significant -- logic-level filter. Detail + caveats: `prod_change_logs/8_27_2026.md`.
+- **9/3/26 -- CLOSER cheap-price guard + order-chunking change + IMBAL_VS_MARKET CLOSER back to 1.4:** (1) cheap-price guard: a closer whose clamped wave-1 limit sits at the $0.30 `min_price` floor is capped at 20 lots (was full max_size, e.g. 533 offered at $0.30 when the spread was worth ~$0.20) with a wave-2 recheck in the orchestrator and a parent-forced-to-min data-issue check; two IS_TEST-gated test flags added. (2) `trade_complex` order splitting: the 4-chunk cap (SR rejects >4 identical repeat orders) now extends to 8 chunks by decrementing chunks 5-8 by 1/2/3/4 lots to break the identical-order run; only 9+ chunks are dropped (fixes the 8/27-style "564/791 sent, 227 DROPPED" underfill). (3) ratio_to_parent restored 1.25 -> 1.4 after the overfit check. Full detail: `prod_change_logs/9_3_2026.md`.
+- **9/9/26 -- IMBAL_GROWS CLOSER/BUMPED adverse levered-rebal veto:** neither layer fires a side when the projected 3:55pm levered-ETF rebal is > 4.5B adverse to it (Calls if > +4.5B, Puts if < -4.5B; analysis threshold 5.0B, prod buffer 4.5B). New `algos/rebal_veto.py` + daily `algos/levered_rebal_355_daily.csv` written by `btic_and_imbal_script.py`'s existing 15:49 poll; fail-open with a loud banner; constituency-file staleness warning (> 30 trading days) with the refresh command; backtests mirror it. Full detail: `prod_change_logs/9_9_2026.md`.
+- **9/11/26 -- Bumped layer sized down 50% after backtest double-bump fix:** the bumped backtest had been selling two strikes closer than prod on ~25% of legs (it lowered `min_strike_distance` AND decremented the index); fixed, and the fixed history is materially weaker (combined 343k -> 190k; GROWS/VS_MARKET worst day exceeds lifetime PnL without the retroactive rebal veto). Config also removed from `scaled()`/`SIZE_KNOB` (values now literal): effective v7 sizing GROWS $57.2k/114 -> $11k/22, VS_MARKET $14.3k/33 -> $2.75k/7, SHRINKS $42.9k/85 -> $8.25k/16. Future option noted, not done: loosen CLOSER `well_within` tolerances and add an IMBAL_SHRINKS CLOSER to capture near-ATM premium deliberately. Full detail: `prod_change_logs/9_11_2026.md`.
+
+- **7/29/26 -- Fed days (FOMC): `350PM_script.py` is NOT run.** The script has no Fed guard (only month-end, `350PM_script.py:78`) and the backtest excludes Fed days by default (`INCLUDE_FEDS = False`, skipped for all configs in `apply_config`), so the exclusion is operational -- we just don't launch it. Note all 20 active 340/350 configs were therefore tuned on a Fed-free sample.
+  Arguably it *should* run: backtest counterfactual at current sizes (`--include-feds`, 44 Fed days, 198 algo-day fires) is net **+$296.7k**, far better than the 355 family's -$320k, on much larger N. Holding off until more OOS because the aggregate is 3 days -- ex-top-3 the whole complex made only **+$21.8k over 40 Fed days**, portfolio Sharpe drops **0.23 -> 0.15**, losing days **16% -> 27.5%**, and the two largest per-algo Fed samples degrade hardest (340PM_OUTRIGHT_SALES 88% -> 60% on N=25; 340PM_SPREAD_SALES 84% -> 61% on N=18). Also correlated: 8-10 algos fire the same Fed day, so it's one bet, not 20.
+  Fed-day exposure instead comes from running `350PM_stock_script_fast.py`, which covers the two most attractive signals (IMBAL_GROWS, IMBAL_VS_MARKET). Revisit `350PM_script.py` on Fed days once OOS Fed data accumulates. Companion decision for the 355 family: `eod_355_option_algos/README.md`, same date.
+  **OOS Fed day 7/29/26 (script NOT run, hypothetical):** with `INCLUDE_FEDS = True`, 4 algos would have fired -- all call spreads, all winners, total **+$38,020**: `340PM_SPREAD_SALES_SPX` 1x 7350/7360 @ $2.90 = +$340 (entry 7342.80); `350PM_SPREAD_IMBAL_AND_TICK` 19x 7345/7360 @ $2.40 = +$4,560; `350PM_SPREAD_SALES_SPX_HIGH_PAIRED` 61x same @ $2.40 = +$14,640; `350PM_SPREAD_SALES_SPX_IMBAL_GROWS_SML` 77x same @ $2.40 = +$18,480 (350PM entries at 7337.37). SPX settled 7316.15, so every short call finished 29-44 points OTM; imbal was aligned with the move (340: +$0.54B -> 350: -$1.86B, market sold into the close). The 355 family also fired that day for +$19,890 (see its README), making the same-day cross-project total **+$57,910**. This is an additional argument for eventually running these on Fed days at partial / reduced size -- but it is one favorable day and does not change the decision on its own.
+
+## TODOs
+
+- **DONE 8/5/26 -- migrated index price to ThetaData (SPXW only).** `idx_price350pm` now uses the actual ThetaData index print at **15:50:06** (1s before the 15:50:07 OPRA fill) from `t_index_snaps_td` via `load_index_snaps_350()` (new update_data step 6 caches full days); missing ticks walk forward to at most 15:50:09, else fall back to the old cross-ratio estimate (kept as `idx_price350pm_xratio`, with `idx_price_source` flagging per row). Motivated by 8/4/26: cross-ratio 7750.40 vs actual 7751.45 straddled the 7750 strike's $1 min-distance bar, so the backtest sold 7740/7730 puts while prod (uPrc 7753.57) sold 7745/7735 -- backtest -$2.83/lot vs prod -$7.13/lot on identical sizes. **NDXP still uses cross-ratio** (no NDX history in `t_index_snaps_td` yet; the loader falls back automatically -- backfill NDX via `python update_data.py NDXP --full --steps 6` to migrate it too). History impact (validated 8/5/26 vs the same-day pre-migration build): most strategies moved +-1-3%; largest were VS_MARKET +$119k and GROWS_SML -$90k (-25%), each driven by 2-3 one-strike knife-edge days (sub-$1 to $2.40 index revisions crossing a $5 boundary); 8/1/24 is a coverage gain (cross-ratio had no index that day, day was skipped -- now a +$77k VS_MARKET win); the 340 family is unchanged (no OPRA re-selection). Unit test re-baselined: 11/21/25 ALL_DAYS case 6617/-2.44 -> 6621/-3.83; 64/64 passing. 8/4/26 now reproduces prod's 7745/7735 strikes and ~-$7.1/lot on both LOW_VIX and the base spread sale.
+
+- **Backtesting of 355PM algos is not yet supported.** `create_backtests.py` currently filters out any config with `"355PM"` in the name at load time (see the `skipped_355` filter in `__main__`). Reasons:
+  - `combine_timestamps()` only merges `panel_340` and `panel_350` — there is no `panel_355` strike/price data, so 355PM configs would price trades using 350PM quotes (~5-minute stale).
+  - Several 355PM-specific factors (`factor_market_type350`, `factor_355_imbal_*` family, `factor_350_imbal_less_than_neg_1b`) are only computed live in `D:\PycharmProjects\scratch\algos\355pm_script.py` and have no backtest equivalent.
+  - To enable: build a `panel_355` in `process_panel_data()` (using 355PM strike panel + OPRA at 15:55:07), add the 355PM factor computations to `combine_timestamps()` (mirror `355pm_script.py:134, 197, 229-236`), add their names to `extra_350_cols` (or introduce `extra_355_cols`), and remove the `skipped_355` filter. 355PM configs currently in prod: `ALGO_42_355PM_SPREAD_SALES_SPX_IMBAL_VS_MKT_NO_350` (and any sibling `ALGO_42_355PM_*` files).
+
+- **sprc-vs-cross divergence as a wave-1 fill signal.** At wave-1 send there are two prices off the SAME chain pull: the preview `price` = cross-the-spread credit (`short_leg.obid - long_leg.oask`, `helpers.py:1345-1350`) and the actual wave-1 limit = surface fair minus max_edge (`short_leg.sprc - long_leg.sprc - max_edge1`, `spdr_rock_order_functions.py:150-156`). Both derive from the single `msgoptionimpliedquote` pull at `355pm_script.py:297-298` (no `refresh_legs()` runs before wave-1; first refresh is Phase 5). On 7/17/26 the 355PM algo saw a large divergence (surface fair ~1.26 vs cross ~0.60 -> surface-pegged 1.18 limit never filled, run went 0-for-556; the manual rerun ~55s later repriced to ~0.44 once the surface caught down and filled everything). Hypothesis: when this sprc-vs-cross diff is very large, treat it as a sign wave-1 is unlikely to fill and make the wave-1 target price more aggressive. To evaluate we need to scan many old script log files. Those logs currently live on the old PC's D drive (being recovered). If recovered, run the analysis then; otherwise wait ~1 month and run it on a fresh month of logs.

@@ -1,0 +1,1979 @@
+import datetime as dt
+import pandas as pd
+import numpy as np
+import io
+from contextlib import redirect_stdout
+import time
+
+import os
+import importlib.util
+from xbbg import blp
+import sys
+from sqlalchemy import create_engine, sql
+sys.path.insert(1, "D:/PycharmProjects/utils")
+# Module-level (not deferred) so an unimportable or outdated calendar_utils fails loudly
+# the moment ANY script imports helpers, rather than at the call site during a live run.
+# The from-import also catches a MISSING NAME at import time (e.g. an older utils checkout
+# without is_quarter_end) -- `import calendar_utils` alone would not.
+# is_quarter_end defaults its date arg to today, so prod calls it bare: is_quarter_end().
+from calendar_utils import (getNowEst, last_trade_day, x_days_ago, x_days_ahead, trading_range,
+							is_quarter_end)
+# Calendar DATA (FEDS/SERIALS/QUARTERLIES) is read through this module handle rather than
+# from-imported, so an importlib.reload(calendar_utils) after editing those lists is picked
+# up here. A from-import would pin the old list objects.
+import calendar_utils as _cal
+from spdr_rock_functions import getSpyEquivalents
+from price_compare import a_lt_b, a_gt_b
+today = dt.date.today()
+
+from math import ceil # changed floor usage to ceil on 12/22/2025
+
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
+from algo_globals import *   # SIZE_KNOB, scaled, LAST_HOUR
+
+VBAM_HOSTNAME = "alpine-vbam-prod.c7wvpkbyvjzb.us-east-1.rds.amazonaws.com"
+VBAM_DATABASE = 'EODStrategies'
+VBAM_USERNAME = 'VBAM_Read'
+VBAM_PASSWORD = 'read-VBAM-^6'
+
+NO_IMBAL_VAL = -987e20
+
+# userName filter for VBAM imbalance snapshot tables
+IMBAL_USERNAME = "VBAMSRVR\\mcourter"
+
+LOOKBACK = 90
+
+# Centralized log timestamping: every script and position_logging_helper imports these from here.
+TIME_FORMAT = '%I:%M:%S.%f %p'
+pretty_time = lambda: (s := getNowEst().strftime(TIME_FORMAT))[:-6] + s[-3:]
+
+TEST_ACCOUNTS = {
+	"A.340.SO_C42": "T.AGM",
+	"A.340.BS_C42": "T.AGM1",
+	"A.340.SS_C42": "T.AGM2",
+	"A.350.SO_C42": "T.AGM1",
+	"A.350.SO2_C42": "T.AGM",
+	"A.350.SO3_C42": "T.AGM1",
+	"A.350.SO4_C42": "T.AGM2",
+	"A.350.SO5_C42": "T.AGM",
+	"A.350.BS_C42": "T.AGM3",
+	"A.355.BO_C42": "T.AGM",
+	"EEE_C42": "T.AGM",
+	"A.350.SS1_C42": "T.AGM3",
+	"A.350.SS_C42": "T.AGM",
+	"EOD26_C42":    "T.AGM",
+	"XXX_C04": "T.AGM",
+	"WWW_C04": "T.AGM1",
+	"ZZZ_C04": "T.AGM",
+	"ZZZ_C01": "T.AGM1",
+	"DDD_C42": "T.AGM",  # VXX Buy account
+	"AAA_C42": "T.AGM4",  # VXX Sell account
+	"BBB_C42": "T.AGM",  # EQUITY_ALGO_42_350PM_MEGA (SPY)
+	"CCC_C42": "T.AGM",  # EQUITY_ALGO_42_355PM_IMBAL_VS_MARKET (SPY)
+	"EOD1_C42": "T.AGM2",
+	"EOD2_C42": "T.AGM3",
+	"EOD3_C42": "T.AGM",
+	"EOD4_C42": "T.AGM1",
+	"EOD5_C42": "T.AGM2",
+	"EOD6_C42": "T.AGM",
+	"EOD7_C42": "T.AGM3",
+	"EOD8_C42": "T.AGM",
+	"EOD9_C42": "T.AGM4",
+	"EOD10_C42": "T.AGM",
+	"EOD11_C42": "T.AGM",
+	"EOD12_C42": "T.AGM",
+	"EOD13_C42": "T.AGM",
+	"EOD14_C42": "T.AGM",
+	"EOD15_C42": "T.AGM",
+	"EOD16_C42": "T.AGM",
+	"EOD17_C42": "T.AGM",
+	"EOD18_C42": "T.AGM",
+	"EOD19_C42": "T.AGM",
+	"EOD20_C42": "T.AGM",
+	"EOD21_C42": "T.AGM",
+	"EOD22_C42": "T.AGM",
+	"EOD23_C42": "T.AGM",
+	"EOD24_C42": "T.AGM",
+	"EOD25_C42": "T.AGM",
+	"EOD26_C42": "T.AGM",
+	"EOD27_C42": "T.AGM",
+	"EOD28_C42": "T.AGM",
+	"EOD29_C42": "T.AGM",
+	"EOD30_C42": "T.AGM",
+	"EOD31_C42": "T.AGM",
+	"EOD32_C42": "T.AGM",
+	"EOD33_C42": "T.AGM",
+	"EOD34_C42": "T.AGM",
+	"EOD35_C42": "T.AGM",
+	"EOD36_C42": "T.AGM",
+	"EOD37_C42": "T.AGM",
+	"EOD38_C42": "T.AGM",
+	"EOD39_C42": "T.AGM",
+	"EOD40_C42": "T.AGM",
+}
+
+# for four legged structures, how much edge to give up vs srPrc (edge_target) and how far away limit price is from srPrc (max_edge)
+EDGE_TARGET_4_LEGGED_1, MAX_EDGE_4_LEGGED_1, EDGE_TARGET_4_LEGGED_2, MAX_EDGE_4_LEGGED_2 = .06, .1, .11, .15 # used by 4p_script_v3
+
+# same but for two legged structures
+EDGE_TARGET_2_LEGGED_1, MAX_EDGE_2_LEGGED_1, EDGE_TARGET_2_LEGGED_2, MAX_EDGE_2_LEGGED_2 = .03, .1, .06, .12 # bumped up MAX_EDGE_2_LEGGED_1 bc i fear it can be stale in fast moving markets
+# EDGE_TARGET = Number used to define offset to spiderrock surface price. Positive number flows through as a positive number
+# in takesurfPrcoffset/makesurfPriceoffset and means that you will be more aggressive than the surface price (no matter buying or selling)
+# MAX_EDGE = used to define the limit price on the structure (overrides surface price if it is less aggressive).
+
+EDGE_OFFSET_OUTRIGHT = .06 # 0.1 is likely too big for normal days but more likely to get fills on extreme days
+
+# NDX edge multiplier - NDXP spreads are wider/less liquid than SPXW
+NDX_EDGE_MULT = 4
+
+def get_vix_edge_multiplier(vix, base=20, floor=0.85, cap=3.0): # increased floor from .7 to .85
+	"""Scale edge values with VIX. 1x at VIX=20, +1x per 7 above, -0.5x per 7 below.
+	LEGACY -- retained for EDGE_OFFSET_OUTRIGHT scaling and any callers not yet migrated
+	to compute_edge_mult. New 350PM/355PM path uses compute_edge_mult below."""
+	if vix >= base:
+		mult = 1 + (vix - base) / 7
+	else:
+		mult = 1 - (base - vix) / 7
+	return round(max(floor, min(cap, mult)), 2)
+
+# ==================== NEW: regime-aware edge config (350PM + 355PM only) ====================
+# Hardcoded factor stats. Manually refresh as regime drifts.
+VIX_STATS           = {"mean": 20.0,   "std": 7.0}     # set 2026-06-10
+ATM_VOL_STATS       = {"mean": 0.16,   "std": 0.05}    # set 2026-06-10
+ABS_IMBAL_STATS     = {"mean": 1.5e9,  "std": 1.0e9}   # set 2026-06-10
+ABS_CHG_IMBAL_STATS = {"mean": 2.0e9,  "std": 1.8e9}   # DEFAULT abs-imbal-change stats.
+# This is the empirical distribution of the abs imbal change (measured ~2.0-2.2B mean / ~1.85-1.9B
+# std over the trailing year as of 2026-07; the 340->350 and 350->355 windows are ~the same). It is
+# the default used by compute_edge_mult_factor for the change-in-imbal factor -- 350PM takes it implicitly.
+# Callers can override by passing abs_chg_stats=... (see 355PM below).
+ABS_CHG_IMBAL_STATS_355PM = {"mean": 1.0e9,  "std": 1.0e9}   # set 2026-07-09; passed explicitly by 355PM.
+# NOTE: 355PM's mean/std is INTENTIONALLY set well below the empirical distribution above. This is
+# deliberate, NOT a miscalibration: the low mean/std biases z_chg positive so the change-in-imbal
+# factor tilts 355PM edges MORE aggressive
+
+# 2-legged edge configs (NEW dict form). Consumed inside prep_trades when the
+# 350PM/355PM scripts pass vix + atm_vol + abs_imbal. Old scalars above remain
+# in place for legacy callers (340pm, ME, btic, 4PM, 355PM_old).
+EDGE_TARGET_2_LEGGED_1_NEW = {
+	"target":           0.05,
+	"min_dollar_value": 0.03,
+	"max_dollar_value": 0.25,
+	"min_pct_of_sprc":  4,
+	"max_pct_of_sprc":  10,
+}
+MAX_EDGE_2_LEGGED_1_NEW = {
+	"target":           0.07,
+	"min_dollar_value": 0.05,
+	"max_dollar_value": 0.40,
+	"min_pct_of_sprc":  7,
+	"max_pct_of_sprc":  14,
+}
+EDGE_TARGET_2_LEGGED_2_NEW = {
+	"target":           0.08,
+	"min_dollar_value": 0.04,
+	"max_dollar_value": 0.50,
+	"min_pct_of_sprc":  7,
+	"max_pct_of_sprc":  16,
+}
+MAX_EDGE_2_LEGGED_2_NEW = {
+	"target":           0.13,
+	"min_dollar_value": 0.05,
+	"max_dollar_value": 0.80,
+	"min_pct_of_sprc":  10,
+	"max_pct_of_sprc":  20,
+}
+
+
+# --- Fill-aggressiveness add-ons (2026-07-24) -------------------------------------------------
+# Two additive dollar offsets layered ON TOP of the regime edges (ET1/ME1/ET2/ME2) to reduce
+# missed fills. Positive = more aggressive (matches takesurfPrcoffset semantics). Each add-on is
+# capped independently at ADDON_PCT_CAP * sprc, so on wave-2 both can stack (up to 6% of sprc).
+# Applied centrally in orchestrate_batched_send off FINAL (post-loss-cap) sizes; 2-legged credit
+# spreads only (complex + price > 0).
+EDGE_MULTIPLIER       = 100      # SPX/NDX contract multiplier (mirrors spdr_rock_order_functions.MULTIPLIER)
+ADDON_PCT_CAP         = 0.03     # neither add-on exceeds 3% of the spread's sprc
+# Add-on #1 (premium): bigger per-ORDER premium -> more aggressive so big-dollar orders don't miss.
+PREM_ADDON_LO_PREMIUM = 9_000   # below this ($ premium): no add-on
+PREM_ADDON_HI_PREMIUM = 20_000   # at/above this: add-on flat at PREM_ADDON_HI_ADD
+PREM_ADDON_LO_ADD     = 0.01     # add-on at LO_PREMIUM
+PREM_ADDON_HI_ADD     = 0.07     # add-on at/above HI_PREMIUM
+# Add-on #2 (wave-1 underfill): if W1 filled < this fraction of total sent FOR THAT OPTION TYPE
+# (Call vs Put, bucketed in orchestrate_batched_send), bump that type's WAVE-2 edges by
+# W1_UNDERFILL_ADD (flat, no ramp).
+W1_UNDERFILL_RATIO    = 0.10
+W1_UNDERFILL_ADD      = 0.07
+
+
+def compute_premium_add_on(size, sprc):
+	"""Add-on #1: dollar edge bump scaling with total ORDER premium (size * sprc * multiplier)
+	so large-dollar orders are worked more aggressively and don't miss. Linear from
+	PREM_ADDON_LO_PREMIUM->HI_PREMIUM (LO_ADD->HI_ADD), zero below, flat above; capped at
+	ADDON_PCT_CAP * sprc.
+	Args:
+		size -- final (post-loss-cap) number of spreads being sent
+		sprc -- surface price (net credit) of the 2-legged spread
+	"""
+	if size <= 0 or sprc <= 0:
+		return 0.0
+	premium = size * sprc * EDGE_MULTIPLIER
+	if premium < PREM_ADDON_LO_PREMIUM:
+		raw = 0.0
+	elif premium >= PREM_ADDON_HI_PREMIUM:
+		raw = PREM_ADDON_HI_ADD
+	else:
+		raw = PREM_ADDON_LO_ADD + (PREM_ADDON_HI_ADD - PREM_ADDON_LO_ADD) * \
+			(premium - PREM_ADDON_LO_PREMIUM) / (PREM_ADDON_HI_PREMIUM - PREM_ADDON_LO_PREMIUM)
+	return round(min(raw, ADDON_PCT_CAP * sprc), 3)
+
+
+def compute_wave1_underfill_add_on(total_w1_sent, total_w1_filled, sprc):
+	"""Add-on #2: flat dollar edge bump applied to WAVE-2 edges when wave-1 filled less than
+	W1_UNDERFILL_RATIO of the wave-1 quantity sent (a near-total W1 miss). Caller buckets sent/filled
+	by option type (Call vs Put) in orchestrate_batched_send and passes the per-type totals here, so
+	a fully filled book of one type doesn't mask a total miss of the other. No ramp; capped at
+	ADDON_PCT_CAP * sprc.
+	Args:
+		total_w1_sent   -- wave-1 qty sent for this option-type bucket
+		total_w1_filled -- wave-1 fills for this option-type bucket
+		sprc            -- surface price (net credit) of the spread being bumped
+	"""
+	if total_w1_sent <= 0 or sprc <= 0:
+		return 0.0
+	if (total_w1_filled / total_w1_sent) < W1_UNDERFILL_RATIO:
+		return round(min(W1_UNDERFILL_ADD, ADDON_PCT_CAP * sprc), 3)
+	return 0.0
+
+
+def compute_edge_mult_factor(vix_level, atm_vol_0dte, abs_imbal, abs_chg_imbal=None, abs_chg_stats=None):
+	"""Composite edge multiplier = mean of three (default) or four (if abs_chg_imbal given)
+	per-factor multipliers. No clipping on per-factor or composite values; the dict [lo, hi]
+	window in compute_edge_mult below is the only bound on the final output.
+
+	abs_chg_imbal is opt-in: the change-in-imbal factor (350PM: 3:40->3:50; 355PM: 3:50->3:55).
+	Callers that omit it stay a 3-factor mean, byte-identical to prior behavior.
+	abs_chg_stats: which {mean,std} to z-score abs_chg_imbal against; defaults to
+	ABS_CHG_IMBAL_STATS (the empirical set used by 350PM/FAST). 355PM overrides with its
+	intentionally-low ABS_CHG_IMBAL_STATS_355PM.
+	"""
+	z_vix   = (vix_level    - VIX_STATS["mean"])       / VIX_STATS["std"]
+	z_vol   = (atm_vol_0dte - ATM_VOL_STATS["mean"])   / ATM_VOL_STATS["std"]
+	z_imbal = (abs_imbal    - ABS_IMBAL_STATS["mean"]) / ABS_IMBAL_STATS["std"]
+	if abs_chg_imbal is None:
+		return ((1 + z_vix) + (1 + z_vol) + (1 + z_imbal)) / 3.0
+	stats = abs_chg_stats if abs_chg_stats is not None else ABS_CHG_IMBAL_STATS
+	z_chg = (abs_chg_imbal - stats["mean"]) / stats["std"]
+	return ((1 + z_vix) + (1 + z_vol) + (1 + z_imbal) + (1 + z_chg)) / 4.0
+
+
+def compute_edge_mult(vix_level, atm_vol_0dte, abs_imbal, srprc, edge_config, abs_chg_imbal=None, abs_chg_stats=None):
+	"""Return the final $ edge for a 2-legged credit-spread trade, rounded to the nearest cent.
+
+	edge_config keys: target, min_dollar_value, max_dollar_value, min_pct_of_sprc, max_pct_of_sprc.
+	Pipeline:
+	  raw_edge = target * compute_edge_mult_factor(...)
+	  lo       = max(min_dollar_value, min_pct_of_sprc/100 * srprc)
+	  hi       = min(max_dollar_value, max_pct_of_sprc/100 * srprc)
+	  final    = clip(raw_edge, lo, hi).
+	Inverted window (lo > hi) -> return hi (tighter cap wins).
+	abs_chg_stats forwarded to compute_edge_mult_factor (see there).
+	"""
+	edge_mult = compute_edge_mult_factor(vix_level, atm_vol_0dte, abs_imbal, abs_chg_imbal=abs_chg_imbal, abs_chg_stats=abs_chg_stats)
+	raw_edge  = edge_config["target"] * edge_mult
+
+	lo_dollar = edge_config["min_dollar_value"]
+	hi_dollar = edge_config["max_dollar_value"]
+	lo_pct    = edge_config["min_pct_of_sprc"] / 100.0 * srprc
+	hi_pct    = edge_config["max_pct_of_sprc"] / 100.0 * srprc
+
+	lo = max(lo_dollar, lo_pct)
+	hi = min(hi_dollar, hi_pct)
+	if lo > hi:
+		return round(hi, 2)
+	return round(max(lo, min(hi, raw_edge)), 2)
+
+
+def print_algo_traded_banner(trade):
+	"""Loud one-block banner printed when a complex credit-spread trade dict is built.
+	Single source of truth used by prep_trades(), closer_spread_trader, and bumped_spread_trader
+	so all three emit an identical-format line in the script log."""
+	name      = trade.get("name", "?")
+	structure = trade.get("structure", "?")
+	et1       = trade.get("edge_target1", 0) or 0
+	me1       = trade.get("max_edge1",    0) or 0
+	et2       = trade.get("edge_target2", 0) or 0
+	me2       = trade.get("max_edge2",    0) or 0
+	price     = trade.get("price", 0)
+	size      = trade.get("size",  0)
+	print("~" * 90)
+	print(f"~~~~~~~~~~~~~~~~~ {name} {structure} ALGO TRADED ~~~~~~~~~~~~~~~~~")
+	print(f"ET1 = {et1:.3f}  ME1 = {me1:.3f}  ET2 = {et2:.3f}  ME2 = {me2:.3f}  (price={price}, size={size})")
+	print("~" * 90)
+
+
+def insert_before_parent(trade_dict, new_trade, new_trade_type, parent_trade):
+	"""Insert `new_trade` (a CLOSER or bumped derivative) into trade_dict IMMEDIATELY BEFORE
+	its parent trade so it (a) inherits the parent's send-order priority and (b) fires ahead
+	of the parent -- the derivative typically carries the bulk of the size while the parent
+	is decremented to min_size, so the bigger order goes to SR first.
+
+	Uses identity lookup (`t is parent_trade`) so subsequent inserts that shifted the parent's
+	index still resolve correctly. Falls back to append if the parent isn't found (defensive;
+	shouldn't happen with identity-safe iteration in the caller)."""
+	for j, t in enumerate(trade_dict["trades"]):
+		if t is parent_trade:
+			trade_dict["trades"].insert(j, new_trade)
+			trade_dict["trade_types"].insert(j, new_trade_type)
+			return
+	# Fallback -- parent not found in trade_dict.
+	trade_dict["trades"].append(new_trade)
+	trade_dict["trade_types"].append(new_trade_type)
+
+
+def compute_trade_edges(vix_level, atm_vol_0dte, abs_imbal, srprc, abs_chg_imbal=None, abs_chg_stats=None):
+	"""Return the 4-tuple (edge_target1, max_edge1, edge_target2, max_edge2) for a 2-legged
+	credit-spread trade at the given regime inputs + structure srprc. Single source of truth
+	used by prep_trades(), closer_spread_trader, and bumped_spread_trader -- so all three
+	produce identical edges for the same (regime, srprc) inputs.
+
+	abs_chg_imbal is opt-in (350PM: 3:40->3:50; 355PM: 3:50->3:55). When None, 3-factor formula
+	is used. abs_chg_stats selects the z-score {mean,std} for abs_chg_imbal (default
+	ABS_CHG_IMBAL_STATS; 355PM passes ABS_CHG_IMBAL_STATS_355PM)."""
+	return (
+		compute_edge_mult(vix_level, atm_vol_0dte, abs_imbal, srprc, EDGE_TARGET_2_LEGGED_1_NEW, abs_chg_imbal=abs_chg_imbal, abs_chg_stats=abs_chg_stats),
+		compute_edge_mult(vix_level, atm_vol_0dte, abs_imbal, srprc, MAX_EDGE_2_LEGGED_1_NEW,    abs_chg_imbal=abs_chg_imbal, abs_chg_stats=abs_chg_stats),
+		compute_edge_mult(vix_level, atm_vol_0dte, abs_imbal, srprc, EDGE_TARGET_2_LEGGED_2_NEW, abs_chg_imbal=abs_chg_imbal, abs_chg_stats=abs_chg_stats),
+		compute_edge_mult(vix_level, atm_vol_0dte, abs_imbal, srprc, MAX_EDGE_2_LEGGED_2_NEW,    abs_chg_imbal=abs_chg_imbal, abs_chg_stats=abs_chg_stats),
+	)
+
+
+equivalents_cache = {}
+def myGetSpyEquivalent(strike):
+	if strike in equivalents_cache:
+		return equivalents_cache[strike]
+
+	# get the equivalent SPY strike
+	equivalent = getSpyEquivalents([strike])[0]
+	equivalents_cache[strike] = equivalent
+	return equivalent
+
+def is_month_end():
+	today = dt.date.today()
+	tomorrow = x_days_ahead(1)
+	return not (today.month == tomorrow.month)
+
+def is_fed_day(date=None):
+	"""Check if a given date (or today) is a Fed announcement day."""
+	if date is None:
+		date = dt.date.today()
+	return date in _cal.FEDS
+
+def likely_stale_calendars():
+	"""Warn if SERIALS, FEDS, or QUARTERLIES calendars look stale. Returns warning string or empty string.
+	Reads the lists off the calendar_utils module handle (_cal) so a reload is honored."""
+	warnings = []
+
+	if _cal.SERIALS:
+		max_serial = max(_cal.SERIALS)
+		if max_serial < x_days_ago(15):
+			warnings.append(f"SERIALS may be stale (max={max_serial})")
+
+	if _cal.FEDS:
+		max_fed = max(_cal.FEDS)
+		if max_fed < x_days_ago(22):
+			warnings.append(f"FEDS may be stale (max={max_fed})")
+
+	if _cal.QUARTERLIES:
+		# Quarterlies are ~90 days apart; warn if forward coverage is under 30 days.
+		# The BTIC ticker resolver needs at least ROLL_DAYS_BEFORE_EXPIRY (3) trading
+		# days of lookahead, so 30 calendar days is a comfortable buffer.
+		max_q = max(_cal.QUARTERLIES)
+		if max_q < x_days_ahead(30):
+			warnings.append(f"QUARTERLIES may be stale (max={max_q})")
+
+	return "\nWARNING: ".join([""] + warnings).strip() if warnings else ""
+
+def create_counter(seed=0):
+    """Return a thread-safe monotonic counter. Wraps itertools.count(...).__next__ which is
+    implemented in C and atomic under the GIL -- safe to call concurrently from asyncio.to_thread
+    workers (required now that spdr_rock_order_functions parallelizes SR INSERTs across threads).
+    Returns seed, seed+1, seed+2, ... on successive calls (matches the original closure semantics)."""
+    import itertools
+    return itertools.count(seed).__next__
+
+def get_engine(username, password, host, db_name, driver='mysql+pymysql'):
+    return create_engine(f'{driver}://{username}:{password}@{host}/{db_name}')
+
+def to_percentile_string(x, n=5):
+	if n == 5:
+		mult = 20
+	elif n == 10:
+		mult = 10
+	else:
+		raise AssertionError("Invalid argument for to_percentile_string.")
+
+	percentile = (x + 1) * mult
+	if percentile < 51:
+		return f"<{percentile:.0f}th %"
+	return f">{(percentile - mult):.0f}th %"
+
+# Added checkForIconStrikes logic on 9/5/2025
+def checkForIconStrikes(date=dt.date.today()):
+	file = "D:/exceldocs/IRON CONDOR TRACKING.xlsx"
+
+	# Read just columns exp, strikes and size from the sheet
+	try:
+		df = pd.read_excel(file, sheet_name="Data", usecols=["exp", "strikes", "size", "extra_magnets"]).dropna()
+		df.exp = df.exp.apply(lambda x: x.to_pydatetime().date() if isinstance(x, pd.Timestamp) else x)
+		if df.empty:
+			print("WARNING: No data found in IRON CONDOR TRACKING sheet.")
+			return [], []
+	except Exception as e:
+		print(f"WARNING: Failed to read IRON CONDOR TRACKING sheet: {e}")
+		return [], []
+
+	df = df.loc[df.exp == date].copy().reset_index(drop=True)
+	if df.empty:
+		print(f"No iron condors found for today, {date.strftime('%m/%d/%Y')}.")
+		return [], []
+	else:
+		strikes = df.iloc[0]["strikes"].split("/")
+		strikes = [float(x) for x in strikes]
+
+		if df.iloc[0]["extra_magnets"]:
+			extra_magnets = df.iloc[0]["extra_magnets"].split("/")
+			extra_magnets = filter(lambda x: len(x)>0, extra_magnets)
+			extra_magnets = [float(x) for x in extra_magnets]
+
+		print(f"Found iron condors for today, {date.strftime('%m/%d/%Y')}: {strikes} with size {df.iloc[0]['size']}.")
+		if extra_magnets:
+			print(f"Also found extra magnets: {extra_magnets}.")
+
+		return strikes, extra_magnets
+
+
+
+SNAP_TIMES_340 = ("15:39:59", "15:40:00", "15:40:01", "15:40:02", "15:40:03")
+
+def get_340_imbal(is_test=False, test_imbal=-.6e9, max_attempts=7, sleep_between=1.0):
+	"""Pull 3:40pm SPX imbalance, trying two sources per attempt (mirrors get_350_imbal).
+
+	Per attempt:
+	  1. imbalanceSnapshots.t_imbal_BasketSnapshots (.SPX, totalNetImbalance, 15:40:00-15:40:50)
+	  2. EODStrategies.t_Monitor_ImbalanceMonitorSnaps (Close / offset 20, SNAP_TIMES_340) [fallback]
+	Both filtered to userName = IMBAL_USERNAME; zero/null is treated as no-data. If both miss,
+	sleeps sleep_between and retries (up to max_attempts). Each query has a 0.5s timeout. Returns
+	scalar or NO_IMBAL_VAL.
+
+	is_test=True, test_imbal=<num>  -> returns <num> immediately, no DB call.
+	is_test=True, test_imbal=None   -> runs real queries against x_days_ago(1) (last trade day).
+	"""
+	if is_test and test_imbal is not None:
+		return test_imbal
+
+	run_date = (x_days_ago(1) if is_test else dt.date.today()).strftime("%Y-%m-%d")
+
+	basket_engine = create_engine(
+		f'mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/imbalanceSnapshots',
+		connect_args={"read_timeout": 0.5, "write_timeout": 0.5, "connect_timeout": 0.5},
+	)
+	basket_sql = sql.text("""
+		SELECT totalNetImbalance
+		FROM   imbalanceSnapshots.t_imbal_BasketSnapshots
+		WHERE  runDate = :run_date
+		  AND  userName = :user_name
+		  AND  basket = '.SPX'
+		  AND  snapTimestamp BETWEEN '15:40:00' AND '15:40:50'
+		  AND  totalNetImbalance <> 0.0
+		ORDER BY snapTimestamp ASC
+		LIMIT 1
+	""")
+
+	monitor_engine = create_engine(
+		f'mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/{VBAM_DATABASE}',
+		connect_args={"read_timeout": 0.5, "write_timeout": 0.5, "connect_timeout": 0.5},
+	)
+	monitor_sql = sql.text("""
+		SELECT netImbalance
+		FROM   EODStrategies.t_Monitor_ImbalanceMonitorSnaps
+		WHERE  runDate = :run_date
+		  AND  period = 'Close'
+		  AND  offset = 20
+		  AND  tsSnapTime IN :snap_times
+		  AND  userName = :user_name
+		ORDER BY tsSnapTime ASC
+		LIMIT 1
+	""").bindparams(sql.bindparam("snap_times", expanding=True))
+
+	def _try(engine, query, col, label, attempt, extra=None):
+		try:
+			params = {"run_date": run_date, "user_name": IMBAL_USERNAME}
+			if extra:
+				params.update(extra)
+			df = pd.read_sql_query(query, engine, params=params)
+			if not df.empty:
+				val = df.iloc[0][col]
+				if pd.notna(val) and val != 0:
+					return float(val)
+		except Exception as e:
+			print(f"get_340_imbal: attempt {attempt}/{max_attempts} {label} errored: {e}")
+		return None
+
+	try:
+		for attempt in range(1, max_attempts + 1):
+			val = _try(basket_engine, basket_sql, "totalNetImbalance", "BasketSnapshots", attempt)
+			if val is not None:
+				print(f"get_340_imbal: got value from BasketSnapshots on attempt {attempt}/{max_attempts} ({val/1e9:+.2f}B)")
+				return val
+			val = _try(monitor_engine, monitor_sql, "netImbalance", "MonitorSnaps", attempt,
+			           extra={"snap_times": list(SNAP_TIMES_340)})
+			if val is not None:
+				print(f"get_340_imbal: got value from MonitorSnaps (fallback) on attempt {attempt}/{max_attempts} ({val/1e9:+.2f}B)")
+				return val
+
+			if attempt < max_attempts:
+				print(f"get_340_imbal: both sources returned no data on attempt {attempt}/{max_attempts}. Retrying in {sleep_between}s.")
+				time.sleep(sleep_between)
+
+		print("WARNING: get_340_imbal exhausted all retries. Returning NO_IMBAL_VAL.")
+		return NO_IMBAL_VAL
+	finally:
+		basket_engine.dispose()
+		monitor_engine.dispose()
+
+def get_350_imbal(is_test=False, test_imbal=.4e9, max_attempts=30, sleep_between=0.25,
+				  backup_start_attempt=9):
+	"""Pull 3:50pm SPX imbalance, trying two sources (backup only on later attempts).
+
+	Per attempt:
+	  1. imbalanceSnapshots.t_imbal_1550_BasketSnapshots (.SPX, seenPct > 0.90) -- PRIMARY
+	  2. EODStrategies.t_strat_FuturesStrategyCKSmash1550_Summary (Terminated or OrderSent,
+		 earliest currentSystemTime -- the ES instance's 15:50:01 snap, ahead of the NQ row at :02)
+		 -- BACKUP, only from backup_start_attempt onward (~2.4-2.8s in at 0.25s sleep).
+	If both null/zero, sleeps sleep_between and retries (up to max_attempts).
+	Each query has a 0.5s read/write/connect timeout. Returns scalar or NO_IMBAL_VAL.
+
+	is_test=True, test_imbal=<num>  -> returns <num> immediately, no DB call.
+	is_test=True, test_imbal=None   -> runs real queries against x_days_ago(1).
+
+	is_test               -- pull last trade day instead of today
+	test_imbal            -- canned value returned when is_test (None -> run real query)
+	max_attempts          -- polling attempts before returning NO_IMBAL_VAL
+	sleep_between         -- seconds slept between attempts
+	backup_start_attempt  -- first attempt on which the backup table is also queried
+	"""
+	if is_test and test_imbal is not None:
+		return test_imbal
+
+	run_date = (x_days_ago(1) if is_test else dt.date.today()).strftime("%Y-%m-%d")
+
+	basket_engine = create_engine(
+		f'mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/imbalanceSnapshots',
+		connect_args={"read_timeout": 0.5, "write_timeout": 0.5, "connect_timeout": 0.5},
+	)
+	basket_sql = sql.text("""
+		SELECT exchNetImbalTotal
+		FROM   t_imbal_1550_BasketSnapshots
+		WHERE  runDate = :run_date
+		  AND  basket = '.SPX'
+		  AND  TIME(snapTimestamp) >= '15:50:00'
+		  AND  seenPct > 0.90
+		  AND  userName = :user_name
+		ORDER BY snapTimestamp DESC
+		LIMIT 1
+	""")
+
+	smash_engine = create_engine(
+		f'mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/{VBAM_DATABASE}',
+		connect_args={"read_timeout": 0.5, "write_timeout": 0.5, "connect_timeout": 0.5},
+	)
+	smash_sql = sql.text("""
+		SELECT evalPeriod1Imbalance
+		FROM   EODStrategies.t_strat_FuturesStrategyCKSmash1550_Summary
+		WHERE  runDate = :run_date
+		  AND  userName = :user_name
+		  AND  strategyMode IN ('Terminated', 'OrderSent')
+		ORDER BY currentSystemTime ASC
+		LIMIT 1
+	""")
+
+	def _try(engine, query, col, label, attempt):
+		try:
+			df = pd.read_sql_query(query, engine, params={"run_date": run_date, "user_name": IMBAL_USERNAME})
+			if not df.empty:
+				val = df.iloc[0][col]
+				if pd.notna(val) and val != 0:
+					return float(val)
+		except Exception as e:
+			print(f"get_350_imbal: attempt {attempt}/{max_attempts} {label} errored: {e}")
+		return None
+
+	try:
+		for attempt in range(1, max_attempts + 1):
+			val = _try(basket_engine, basket_sql, "exchNetImbalTotal", "BasketSnapshots", attempt)
+			if val is not None:
+				print(f"get_350_imbal: got value from BasketSnapshots on attempt {attempt}/{max_attempts} ({val/1e9:+.2f}B)")
+				return val
+
+			if attempt >= backup_start_attempt:
+				if attempt == backup_start_attempt:
+					print(f"get_350_imbal: primary empty through attempt {attempt}/{max_attempts}, engaging SmashSummary backup")
+				val = _try(smash_engine, smash_sql, "evalPeriod1Imbalance", "SmashSummary", attempt)
+				if val is not None:
+					print(f"get_350_imbal: got value from SmashSummary (backup) on attempt {attempt}/{max_attempts} ({val/1e9:+.2f}B)")
+					return val
+
+			if attempt < max_attempts:
+				print(f"get_350_imbal: no data on attempt {attempt}/{max_attempts}. Retrying in {sleep_between}s.")
+				time.sleep(sleep_between)
+
+		print("WARNING: get_350_imbal exhausted all retries. Returning NO_IMBAL_VAL.")
+		return NO_IMBAL_VAL
+	finally:
+		basket_engine.dispose()
+		smash_engine.dispose()
+
+def get_recreated_paired_imbal(is_test=False):
+	"""Fetch today's SPY paired imbalance from BasketSnapshots. Returns value or None (1s timeout)."""
+	try:
+		engine_timed = create_engine(
+			f'mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/{VBAM_DATABASE}',
+			connect_args={"read_timeout": 1, "write_timeout": 1, "connect_timeout": 1}
+		)
+		date_str = "2026-03-13" if is_test else dt.date.today().strftime("%Y-%m-%d")
+		sql_obj = sql.text("""
+			SELECT exchPairedImbalTotal, seenPct, snapTimestamp
+			FROM   imbalanceSnapshots.t_imbal_1550_BasketSnapshots
+			WHERE  runDate = :run_date AND basket = '.SPX'
+			  AND  seenPct > 0.80 AND TIME(snapTimestamp) >= '15:50:00'
+			ORDER BY snapTimestamp ASC
+			LIMIT 1
+		""")
+		result = pd.read_sql_query(sql_obj, engine_timed, params={"run_date": date_str})
+		engine_timed.dispose()
+		if result.empty or pd.isna(result["exchPairedImbalTotal"].iloc[0]):
+			return None
+		return result["exchPairedImbalTotal"].iloc[0]
+	except Exception as e:
+		print(f"WARNING: Failed to get recreated paired imbal: {e}")
+		return None
+
+def get_qqq_net_imbal(is_test=False):
+	"""Fetch today's QQQ net imbalance from BasketSnapshots (.NDX basket). Returns value or None (1s timeout)."""
+	try:
+		engine_timed = create_engine(
+			f'mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/{VBAM_DATABASE}',
+			connect_args={"read_timeout": 1, "write_timeout": 1, "connect_timeout": 1}
+		)
+		date_str = "2026-03-16" if is_test else dt.date.today().strftime("%Y-%m-%d")
+		sql_obj = sql.text("""
+			SELECT exchNetImbalTotal, seenPct, snapTimestamp
+			FROM   imbalanceSnapshots.t_imbal_1550_BasketSnapshots
+			WHERE  runDate = :run_date AND basket = '.NDX'
+			  AND  seenPct > 0.80 AND TIME(snapTimestamp) >= '15:50:00'
+			ORDER BY snapTimestamp ASC
+			LIMIT 1
+		""")
+		result = pd.read_sql_query(sql_obj, engine_timed, params={"run_date": date_str})
+		engine_timed.dispose()
+		if result.empty or pd.isna(result["exchNetImbalTotal"].iloc[0]):
+			return None
+		return result["exchNetImbalTotal"].iloc[0]
+	except Exception as e:
+		print(f"WARNING: Failed to get QQQ net imbal: {e}")
+		return None
+
+def get_355_imbal(is_test=False, test_imbal=1.6e9, basket_name='.SPX', max_attempts=40, sleep_between=0.1,
+				  backup_start_attempt=14):
+	"""Pull 3:55pm basket imbalance, trying two sources (backup only on later attempts).
+
+	Per attempt:
+	  1. imbalanceSnapshots.t_imbal_1555_BasketSnapshots (seenPct > 0.95, userName filtered) -- PRIMARY
+	  2. auctionResearch.t_imbalance_basket_detail (15:55:00 < capture_time <= 15:55:10, seen_percentage > 0.95,
+		 no userName filter) -- BACKUP, only from backup_start_attempt onward. At the prod call profile
+		 (sleep_between=0.1, ~0.135s per failed cycle, polling starts ~15:55:01.0), backup_start_attempt=14
+		 means the backup first fires ~15:55:02.8.
+	If both null/zero, sleeps sleep_between and retries (up to max_attempts).
+	Each query has a 0.5s read/write/connect timeout. Returns scalar or NO_IMBAL_VAL.
+
+	is_test=True, test_imbal=<num>  -> returns <num> immediately, no DB call.
+	is_test=True, test_imbal=None   -> runs real queries against x_days_ago(1) (last trade day).
+
+	is_test               -- pull last trade day instead of today
+	test_imbal            -- canned value returned when is_test (None -> run real query)
+	basket_name           -- basket to pull, e.g. '.SPX' or '.NDX'
+	max_attempts          -- polling attempts before returning NO_IMBAL_VAL
+	sleep_between         -- seconds slept between attempts
+	backup_start_attempt  -- first attempt on which the backup table is also queried
+	"""
+	if is_test and test_imbal is not None:
+		return test_imbal
+
+	run_date = (x_days_ago(1) if is_test else dt.date.today()).strftime("%Y-%m-%d")
+
+	detail_engine = create_engine(
+		f'mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/{VBAM_DATABASE}',
+		connect_args={"read_timeout": 0.5, "write_timeout": 0.5, "connect_timeout": 0.5},
+	)
+	detail_sql = sql.text("""
+		SELECT exch_net_notional
+		FROM   auctionResearch.t_imbalance_basket_detail
+		WHERE  run_date = :run_date
+		  AND  basket_name = :basket
+		  AND  capture_time > '15:55:00'
+		  AND  capture_time <= '15:55:10'
+		  AND  seen_percentage > 0.95
+		ORDER BY capture_time ASC
+		LIMIT 1
+	""")
+
+	snap_engine = create_engine(
+		f'mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/imbalanceSnapshots',
+		connect_args={"read_timeout": 0.5, "write_timeout": 0.5, "connect_timeout": 0.5},
+	)
+	snap_sql = sql.text("""
+		SELECT exchNetImbalTotal
+		FROM   t_imbal_1555_BasketSnapshots
+		WHERE  runDate = :run_date
+		  AND  basket = :basket
+		  AND  userName = :user_name
+		  AND  TIME(snapTimestamp) >= '15:55:00'
+		  AND  seenPct > 0.95
+		ORDER BY snapTimestamp ASC
+		LIMIT 1
+	""")
+
+	detail_params = {"run_date": run_date, "basket": basket_name}
+	snap_params = {"run_date": run_date, "basket": basket_name, "user_name": IMBAL_USERNAME}
+
+	def _try(engine, query, col, label, attempt, params):
+		try:
+			df = pd.read_sql_query(query, engine, params=params)
+			if not df.empty:
+				val = df.iloc[0][col]
+				if pd.notna(val) and val != 0:
+					return float(val)
+		except Exception as e:
+			print(f"get_355_imbal({basket_name}): attempt {attempt}/{max_attempts} {label} errored: {e}")
+		return None
+
+	try:
+		for attempt in range(1, max_attempts + 1):
+			val = _try(snap_engine, snap_sql, "exchNetImbalTotal", "BasketSnapshots_1555", attempt, snap_params)
+			if val is not None:
+				if attempt > 1:
+					print(f"get_355_imbal({basket_name}): got value from BasketSnapshots_1555 (primary) on attempt {attempt}/{max_attempts} ({val/1e9:+.2f}B)")
+				return val
+
+			if attempt >= backup_start_attempt:
+				if attempt == backup_start_attempt:
+					print(f"get_355_imbal({basket_name}): primary empty through attempt {attempt}/{max_attempts}, engaging basket_detail backup")
+				val = _try(detail_engine, detail_sql, "exch_net_notional", "basket_detail", attempt, detail_params)
+				if val is not None:
+					print(f"get_355_imbal({basket_name}): got value from basket_detail (backup) on attempt {attempt}/{max_attempts} ({val/1e9:+.2f}B)")
+					return val
+
+			if attempt < max_attempts:
+				print(f"get_355_imbal({basket_name}): no data on attempt {attempt}/{max_attempts}. Retrying in {sleep_between}s.")
+				time.sleep(sleep_between)
+
+		print(f"WARNING: get_355_imbal({basket_name}) exhausted all retries. Returning NO_IMBAL_VAL.")
+		return NO_IMBAL_VAL
+	finally:
+		detail_engine.dispose()
+		snap_engine.dispose()
+
+
+def get_fast_imbal(is_test=False, test_imbal=-2e9, test_paired_imbal=25e9):
+	"""Poll imbalanceSnapshots for SPX imbalance. First try, then 0.5s wait, then 0.1s retries (10 attempts total).
+
+	Filtered to userName = IMBAL_USERNAME and seenPct > 0.80. Returns dict with keys: net_imbal,
+	paired_imbal, seen_pct, snap_timestamp. On failure, net_imbal = NO_IMBAL_VAL and others None.
+
+	is_test=True, test_imbal=<num> -> returns the test dict immediately, no DB call.
+	is_test=True, test_imbal=None  -> runs the real query against x_days_ago(1) (last trade day).
+	"""
+	if is_test and test_imbal is not None:
+		return {"net_imbal": test_imbal, "paired_imbal": test_paired_imbal, "seen_pct": None, "snap_timestamp": None}
+
+	engine = get_engine(VBAM_USERNAME, VBAM_PASSWORD, VBAM_HOSTNAME, "imbalanceSnapshots")
+	run_date = (x_days_ago(1) if is_test else dt.date.today()).strftime("%Y-%m-%d")
+	query = sql.text("""
+		SELECT exchNetImbalTotal, exchPairedImbalTotal, seenPct, snapTimestamp
+		FROM t_imbal_1550_BasketSnapshots
+		WHERE runDate = :run_date AND basket = '.SPX'
+		  AND seenPct > 0.80 AND userName = :user_name
+		ORDER BY snapTimestamp DESC LIMIT 1
+	""")
+
+	# First try, then 0.5s wait, then 0.1s intervals until deadline
+	wait_times = [0.5, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]   # 10 attempts total (first try + 9 retries)
+	for attempt in range(len(wait_times) + 1):
+		try:
+			with engine.connect() as conn:
+				df = pd.read_sql_query(query, conn, params={"run_date": run_date, "user_name": IMBAL_USERNAME})
+			if not df.empty:
+				engine.dispose()
+				row = df.iloc[0]
+				return {
+					"net_imbal": row["exchNetImbalTotal"],
+					"paired_imbal": row["exchPairedImbalTotal"],
+					"seen_pct": row["seenPct"],
+					"snap_timestamp": row["snapTimestamp"],
+				}
+		except Exception as e:
+			print(f"  get_fast_imbal attempt {attempt + 1} error: {e}")
+		if attempt < len(wait_times):
+			time.sleep(wait_times[attempt])
+
+	engine.dispose()
+	print("get_fast_imbal: failed all 7 attempts")
+	return {"net_imbal": NO_IMBAL_VAL, "paired_imbal": None, "seen_pct": None, "snap_timestamp": None}
+
+def get_late_triggers(is_test=False):
+	db_research = get_engine(VBAM_USERNAME, VBAM_PASSWORD, VBAM_HOSTNAME, VBAM_DATABASE)
+	date = dt.date.today()
+	if is_test:
+		date = dt.date(2025,5,5)
+	try:
+		sql_obj = sql.text(f"""SELECT 
+				runDate,
+				event,
+				strategyName,
+				refBasketName,
+				tsSnapReference,
+				snapRefrenceImbalance,
+				deltaImbalance,
+				exchBuyImbalTotal,
+				exchSellImbalTotal,
+				exchNetImbalTotal,
+				evalPeriod1Imbalance,
+				evalPeriod1ImbalanceDirection,
+				orderSentTime,
+				currentSystemTime,
+				terminationReason
+			FROM 
+				EODStrategies.t_strat_FuturesStrategySupImbFlip_Summary
+			WHERE runDate = "{date.strftime("%Y-%m-%d")}" and strategyName = "FuturesStrategySmashNDXFlipNDX" and event = "Terminated";""")
+		df = pd.read_sql_query(sql_obj, db_research)
+	except:
+		print("WARNING!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!: No late trigger entries found in DB.")
+		df = pd.DataFrame()
+
+	return df
+
+
+def warm_up_bloomberg_connection(verbose=True):
+	"""Open this process's xbbg/blpapi session up front so the first REAL Bloomberg
+	call does not pay the session-start cost inside a time-critical window.
+	Returns elapsed ms (None if Bloomberg was unreachable). Never raises.
+
+	WHY (observed 9/11/26 and 9/14/26): a process's first xbbg call pays
+	blpapi.Session.start() once. Normally ~10-200ms, but on both days it was 16.3s
+	for EVERY fresh process -- save_spy_prices.py's 15:49:58 SPY snap took 16464ms,
+	340PM_script's get_market_measurements took 16.5s (0.3s the day before), and
+	350pm_stock_script's get_change_in_realized ran past its 15:50:03 gate. The
+	blpapi TRACE log puts the 16s between "blpapidapisup dll loaded" and "bbcomm
+	started": blpapi's Desktop API layer tries to launch/handshake its own
+	bbcomm.exe before falling back to the one already listening on 127.0.0.1:8194.
+
+	ROOT CAUSE (proven 9/14/26): bbcomm.exe was running in Windows Session 0. The
+	UpdateDataEOD scheduled task (07:16, logon type Password = non-interactive) was
+	the first Bloomberg client of the day because no interactive bbcomm existed --
+	the Bloomberg Updater ran the evening of 9/10, and the PC rebooted 9/11 17:28.
+	Its blpapi spawned bbcomm in Session 0, and every Session-1 client then stalled
+	16s on start. Killing that bbcomm (needs an elevated Stop-Process; plain
+	taskkill is Access Denied) let the next call spawn a Session-1 bbcomm and
+	Session.start dropped to 12ms. Days with a live Session-1 bbcomm at 07:16
+	(9/3-9/10) never showed the lag. Check: powershell
+	"Get-Process bbcomm | select Id,SessionId" -> SessionId should be 1.
+
+	Call this ~30-50s BEFORE the script's first real Bloomberg call, right after a
+	wait_until to a fixed clock time, so the cost lands in idle time but the session
+	is fresh for the fire. Scripts that share a first-call time stagger their
+	warm-ups 3s apart (3:40 cluster: 15:39:15 355pm, :18 355pm_v8, :21 340PM,
+	:24 350PM, :27 350PM_fast, :30 350pm_v8; then 15:47:16 350pm_ss, 15:49:05
+	350pm_stock, 15:49:08 save_spy_prices, 15:49:11 355pm_stock) so bbcomm never
+	sees simultaneous session starts. It only helps in-process blp.* callers (all
+	prod algos); bloomberg_helpers.my_bdh/my_bdp spawn a child process per call
+	and each child pays its own Session.start().
+	Repro / timing script: D:/agent_projects/adhoc/spy_price_first_call_lag_test.py"""
+	t0 = time.perf_counter()
+	try:
+		from xbbg.core import conn
+		conn.bbg_session()
+		conn.bbg_service("//blp/refdata")
+		blp.bdp("SPY US Equity", "PX_LAST")   # dummy call: exercises the full request path
+	except Exception as e:
+		print(f"{pretty_time()} -- WARNING: warm_up_bloomberg_connection failed "
+			  f"({type(e).__name__}: {e}); first real Bloomberg call will connect instead.", flush=True)
+		return None
+	ms = (time.perf_counter() - t0) * 1000
+	if verbose:
+		print(f"{pretty_time()} -- Bloomberg connection warm in {ms:.0f}ms", flush=True)
+	if ms > 5000:
+		print(f"{pretty_time()} -- NOTE: >5s warm-up usually means bbcomm.exe is in Session 0 "
+			  f"(spawned by a pre-logon scheduled task). Check: powershell "
+			  f"\"Get-Process bbcomm | select Id,SessionId\"; kill it from an elevated shell.", flush=True)
+	return ms
+
+
+def get_market_measurements(return_spy_price=False):
+	"""Compute market type / today's return / rolling std from SPY historicals.
+
+	return_spy_price=True returns a 4-tuple (market, today_ret, std, spy_price_now) so
+	callers can skip a separate blp.bdp SPY snap -- the bdh with end_date=today already
+	includes today's live PX_LAST at position -1. Default False preserves the legacy
+	3-tuple return for existing callers.
+	"""
+	start = x_days_ago(LOOKBACK + 1)
+	close = blp.bdh(tickers=[x + " US EQUITY" for x in ["SPY"]], flds=['px_last'], start_date=start,
+					end_date=dt.date.today(), adjust="all")
+	rets = close.pct_change().dropna()
+	std = rets.iloc[:-1].std()
+
+	today_move = (rets.iloc[-1] / std.mul(.5)).values[0]
+
+	if today_move > 1:
+		market = "UP"
+	elif today_move < -1:
+		market = "DOWN"
+	else:
+		market = "FLAT"
+
+	if return_spy_price:
+		return market, rets.iloc[-1].values[0], std.values[0], close.iloc[-1, 0]
+	return market, rets.iloc[-1].values[0], std.values[0]
+
+def get_market_measurements_qqq():
+	"""Get QQQ market ratio for NDX factor evaluation.
+
+	Returns qqq_market_ratio as ret / rolling_std (NOT divided by 2).
+	This matches the backtest formula in update_data.py:396 where
+	market_ratio = ret / rolling_std.
+
+	Note: SPY's get_market_measurements() returns ret / (std * 0.5) which
+	is 2x the backtest scale, but its thresholds (1.0 for UP/DOWN) are also
+	2x the backtest thresholds (0.5), so SPY's UP/DOWN/FLAT classification
+	matches the backtest exactly.
+	For QQQ, we return on the backtest scale directly because config thresholds
+	(e.g. 0.8) were calibrated on that scale.
+	"""
+	start = x_days_ago(LOOKBACK + 1)
+	close = blp.bdh(tickers=["QQQ US EQUITY"], flds=['px_last'],
+					start_date=start, end_date=dt.date.today(), adjust="all")
+	rets = close.pct_change().dropna()
+	std = rets.iloc[:-1].std().values[0]
+	today_return = rets.iloc[-1].values[0]
+	qqq_market_ratio = today_return / std  # backtest scale, no 0.5 multiplier
+	return qqq_market_ratio, today_return, std
+
+
+def get_change_in_realized(n=3 * 22):
+	end = last_trade_day()
+	start = x_days_ago(n + 2)
+	closes = blp.bdh(tickers=["SPY US EQUITY"], flds=['px_last'], start_date=start, end_date=end, adjust="all")
+	log_rets = (np.log(closes.shift(-1)) - np.log(closes)).shift(1).dropna()
+
+	def calc_realized(x):
+		return (x.tail(n).sum() * 252 / n) ** .5
+
+	diff = calc_realized(log_rets.pow(2).tail(n)) - calc_realized(log_rets.pow(2).head(n))
+	return diff.iloc[0]
+
+def get_change_in_realized_biz_day_method(days=90):
+	end = last_trade_day()
+	start = dt.date.today() - dt.timedelta(days=days)
+	if start not in trading_range(x_days_ago(1, start), x_days_ahead(1, start)):
+		start = x_days_ago(1, start)
+	start = x_days_ago(2, start)
+	closes = blp.bdh(tickers=["SPY US EQUITY"], flds=['px_last'], start_date=start, end_date=end, adjust="all")
+	log_rets = (np.log(closes.shift(-1)) - np.log(closes)).shift(1).dropna()
+	def calc_realized(x):
+		return (x.sum() * 252 / len(x)) ** .5
+
+	diff = calc_realized(log_rets.pow(2).iloc[1:]) - calc_realized(log_rets.pow(2).iloc[:-1])
+
+	return diff.iloc[0]
+
+def calculate_rsi(daily_returns):
+	ups = daily_returns[daily_returns > 0]
+	downs = abs(daily_returns[daily_returns < 0])
+	if len(downs) == 0:
+		RS = 9e9
+	elif len(ups) == 0:
+		RS = 0
+	else:
+		RS = np.average(ups) / np.average(downs)
+	return round(100 - (100 / (1 + RS)), 2)
+
+
+def get_rsi(today_ret):
+	# last 2 days of returns
+	close = blp.bdh("SPY US EQUITY", "px_last", start_date=x_days_ago(3), end_date=dt.date.today())
+	rets = close.pct_change().dropna().iloc[0:2][("SPY US EQUITY", "px_last")].to_list()
+	rets = np.array(rets + [float(today_ret)])
+	return calculate_rsi(rets)
+
+
+def bin_rsi(rsi):
+	# (24.764, 48.204, 67.336, 91.00800000000001)
+	if rsi < 24.764:
+		return 0
+	elif rsi < 48.204:
+		return 1
+	elif rsi < 67.336:
+		return 2
+	elif rsi < 91.008:
+		return 3
+	else:
+		return 4
+
+
+def get_high_low_old():
+	df = blp.bdib(ticker='SPY US EQUITY', dt=dt.date.today(), ref="IndexUS", interval=1)
+	high, low = df[("SPY US EQUITY", "high")].max(), df[("SPY US EQUITY", "low")].min()
+	hl_raw = (high - low) / low
+	return hl_raw
+
+def get_high_low():
+	high = blp.bdp("SPY US EQUITY", "PX_HIGH").iloc[0, 0]
+	low = blp.bdp("SPY US EQUITY", "PX_LOW").iloc[0, 0]
+	hl_raw = (high - low) / low
+	return hl_raw
+
+def get_high_low_with_prices():
+	"""Return (hl_raw, high, low) for SPY intraday range + raw prices."""
+	high = blp.bdp("SPY US EQUITY", "PX_HIGH").iloc[0, 0]
+	low = blp.bdp("SPY US EQUITY", "PX_LOW").iloc[0, 0]
+	hl_raw = (high - low) / low
+	return hl_raw, high, low
+
+def bin_high_low(hl):
+	# (0.6505837716234122, 0.8582749676972167, 1.0988050815684745, 1.469060796808302)
+	if hl < 0.65058:
+		return 0
+	elif hl < 0.85827:
+		return 1
+	elif hl < 1.09880:
+		return 2
+	elif hl < 1.46906:
+		return 3
+	else:
+		return 4
+
+
+def bin_realized_change(change):
+	"""'-0.00272, -0.00123, -0.00055, -0.00016, -0.00001, 0.00011, 0.00043, 0.00108, 0.00248'"""
+	if change < -0.00272:
+		return 0
+	elif change < -0.00123:
+		return 1
+	elif change < -0.00055:
+		return 2
+	elif change < -0.00016:
+		return 3
+	elif change < -0.00001:
+		return 4
+	elif change < 0.00011:
+		return 5
+	elif change < 0.00043:
+		return 6
+	elif change < 0.00108:
+		return 7
+	elif change < 0.00248:
+		return 8
+	else:
+		return 9
+
+
+def get_imbal_mag(imbal):
+	if abs(imbal) > 1e9:
+		return "LARGE"
+	elif abs(imbal) > .5e9:
+		return "MEDIUM"
+	else:
+		return "SMALL"
+
+
+def bin_imbal_mag(imbal_mag):
+	if imbal_mag == "LARGE":
+		return 2
+	elif imbal_mag == "MEDIUM":
+		return 1
+	else:
+		return 0
+
+
+def get_imbal_signed(imbal):
+	if imbal > 1e9:
+		return "BUY"
+	elif imbal < -1e9:
+		return "SELL"
+	else:
+		return "NONE"
+
+
+def bin_imbal_signed(imbal_signed):
+	if imbal_signed == "BUY":
+		return 1
+	elif imbal_signed == "SELL":
+		return -1
+	else:
+		return 0
+
+
+def get_vix():
+	return blp.bdp("VIX Index", "PX_LAST").iloc[0, 0]
+
+
+def bin_vix(vix):
+	# cutoffs (14.24, 16.97, 19.784000000000002, 23.586)
+	if vix < 14.24:
+		return 0
+	elif vix < 16.97:
+		return 1
+	elif vix < 19.784:
+		return 2
+	elif vix < 23.586:
+		return 3
+	else:
+		return 4
+
+
+def bin_today_vol(today_vol):
+	# cutoffs (0.09737000000000001, 0.1237328, 0.1579, 0.21151)
+	if today_vol < 0.09737:
+		return 0
+	elif today_vol < 0.1237328:
+		return 1
+	elif today_vol < 0.1579:
+		return 2
+	elif today_vol < 0.21151:
+		return 3
+	else:
+		return 4
+
+
+def bin_factor(factor, name):
+	if name == "factor_imbal_mag":
+		return bin_imbal_mag(factor)
+	elif name == "factor_imbal_signed":
+		return bin_imbal_signed(factor)
+	elif name == "factor_vol":
+		return bin_today_vol(factor)
+	elif name == "factor_vix":
+		return bin_vix(factor)
+	elif name == "factor_rsi":
+		return bin_rsi(factor)
+	elif name == "factor_high_low":
+		return bin_high_low(factor)
+	elif name == "factor_realized_change":
+		return bin_realized_change(factor)
+	else:
+		raise AssertionError("Invalid argument for bin_factor.")
+
+
+def apply_closer_resize(trade_dict, log_fn=None):
+	"""355PM-specific: when a CLOSER variant trades, decrement its parent's
+	traded size by the CLOSER's size so combined exposure stays consistent
+	with the parent's original target. Parent floors at 1 lot if it was
+	originally trading. Mutates trade_dict in place. Returns nothing.
+
+	Single source of truth: both 355pm_script.py and simulate_prod.py call
+	this function so behavior cannot drift.
+
+	`log_fn` is an optional callable for log lines (e.g. print). If None,
+	the function runs silently.
+
+	Detection: a CLOSER is "triggering" iff it appears in trade_dict["trades"]
+	with size > 0 (prep_trades only appends size>0 trades, but apply_size_limits
+	may have knocked a trade down to 0 -- so we re-check size here).
+	"""
+	any_closer_triggering = any(
+		t["name"].endswith("_CLOSER") and t["size"] > 0
+		for t in trade_dict["trades"]
+	)
+	if not any_closer_triggering:
+		return
+	if log_fn:
+		log_fn("Starting Resize Trades (CLOSER offsets)")
+	for closer_trade in trade_dict["trades"]:
+		if not closer_trade["name"].endswith("_CLOSER"):
+			continue
+		closer_size = closer_trade["size"]
+		if closer_size <= 0:
+			continue
+		parent_name = closer_trade["name"][:-len("_CLOSER")]
+		# Match the CLOSER's side (Put vs Call) to the parent's same side.
+		side = "Put" if "Put" in closer_trade["structure"] else "Call"
+		for parent_trade in trade_dict["trades"]:
+			if parent_trade["name"] != parent_name:
+				continue
+			if side not in parent_trade["structure"]:
+				continue
+			old_size = parent_trade["size"]
+			if old_size <= 0:
+				continue  # parent didn't trade -- nothing to offset
+			new_size = max(1, old_size - closer_size)
+			if new_size != old_size:
+				if log_fn:
+					log_fn(f"Resize: {parent_name} {side} {old_size} -> {new_size} (offset by CLOSER size {closer_size})")
+				parent_trade["size"] = new_size
+			break  # only reached on the matching parent; stop searching
+	if log_fn:
+		log_fn("Finished Resize Trades")
+
+
+def load_configs_from_directory(directory, time, priority_algos=None):
+    """Load config modules whose filename matches `time`. Returns the enabled/active configs.
+    priority_algos: optional list of algo names. Configs whose 'name' matches go to the front
+                    of the returned list, in priority-list order; non-priority configs keep
+                    their existing (filename-alpha) order. Names in priority_algos that don't
+                    match any loaded config are printed as a warning so typos surface early.
+    """
+    configs = []
+
+    for filename in os.listdir(directory):
+        if filename.endswith(".py") and (time in filename):
+            filepath = os.path.join(directory, filename)
+
+            # Load module from file
+            spec = importlib.util.spec_from_file_location("module.name", filepath)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            # Extract config if it exists
+            if hasattr(module, "config"):
+                configs.append(module.config)
+
+    # pare down configs to only ones that are active and enabled
+    active = [cfg for cfg in configs if (cfg.get("size_target", False) or (cfg.get("dollar_target", 0) != 0)) and cfg.get("enabled", True)]
+
+    if priority_algos:
+        prio_idx = {name: i for i, name in enumerate(priority_algos)}
+        # Stable sort: priority (tier 0, sorted by priority index) then non-priority (tier 1, preserve order).
+        active.sort(key=lambda c: (0, prio_idx[c["name"]]) if c.get("name") in prio_idx else (1, 0))
+        loaded_names = {c.get("name") for c in active}
+        unmatched = [name for name in priority_algos if name not in loaded_names]
+        if unmatched:
+            print(f"{pretty_time()} -- [load_configs] WARNING: priority_algos contains {len(unmatched)} name(s) with no matching config: {unmatched}")
+    return active
+
+
+def load_configs_from_directory_for_stock(directory, time, is_month_end=False, is_fed_day=False, is_serial=False, fast_only=False):
+	"""Load stock strategy configs from directory, filtering based on special day flags.
+
+	Args:
+		directory: path to directory containing config files
+		time: time string to filter config filenames (e.g. "350PM")
+		is_month_end: bool, if True only load configs with allowed_on_month_end=True
+		is_fed_day: bool, if True only load configs with allowed_on_fed=True
+		is_serial: bool, if True only load configs with allowed_on_serial=True
+		fast_only: if True only load fast configs; if False skip fast configs
+	"""
+	configs = []
+
+	for filename in os.listdir(directory):
+		if filename.endswith(".py") and (time in filename):
+			filepath = os.path.join(directory, filename)
+
+			# Load module from file
+			spec = importlib.util.spec_from_file_location("module.name", filepath)
+			module = importlib.util.module_from_spec(spec)
+			spec.loader.exec_module(module)
+
+			# Extract config if it exists
+			if hasattr(module, "config"):
+				# On month ends, only load configs that are allowed on month ends
+				if is_month_end and not module.config.get("allowed_on_month_end", False):
+					continue
+				# On fed days, only load configs that are allowed on fed days
+				if is_fed_day and not module.config.get("allowed_on_fed", False):
+					continue
+				# On serial expiry days, only load configs that are allowed on serials
+				if is_serial and not module.config.get("allowed_on_serial", True):
+					continue
+				configs.append(module.config)
+
+	# Filter fast vs non-fast configs
+	if fast_only:
+		configs = [c for c in configs if c.get("fast", False)]
+	else:
+		configs = [c for c in configs if not c.get("fast", False)]
+
+	# pare down configs to only ones that are active and enabled
+	return [cfg for cfg in configs if (cfg.get("size_target", False) or (cfg.get("dollar_target", 0) != 0)) and cfg.get("enabled", True)]
+
+def _get_size(row,
+		 cp_type="P",
+		 call_dont_trade_factors=[],
+		 call_trade_factors=[None],
+		 call_small_trade_factors=[],
+		 put_dont_trade_factors=[],
+		 put_trade_factors=[None],
+		 put_small_trade_factors=[],
+		explanation_name=""
+	):
+	if cp_type == "C":
+		for col, val in call_dont_trade_factors:
+			if row[col] == val:
+				explanation = f"*Don't trade Call{explanation_name}* because {col} = {val}.\n"
+				size = 0
+				return size, explanation
+		for col, val in call_trade_factors:
+			if row[col] == val:
+				explanation = f"*Trade Call{explanation_name}* because {col} = {val}.\n"
+				size = 1
+				return size, explanation
+		for col, val in call_small_trade_factors:
+			if row[col] == val:
+				explanation = f"*Trade Call{explanation_name}* half size because {col} = {val}.\n"
+				size = .5
+				return size, explanation
+		return 0, f"No conditions met for Call{explanation_name}.\n"
+	if cp_type == "P":
+		for col, val in put_dont_trade_factors:
+			if row[col] == val:
+				explanation = f"*Don't trade Put{explanation_name}* because {col} = {val}.\n"
+				size = 0
+				return size, explanation
+		for col, val in put_trade_factors:
+			if row[col] == val:
+				explanation = f"*Trade Put{explanation_name}* because {col} = {val}.\n"
+				size = 1
+				return size, explanation
+		for col, val in put_small_trade_factors:
+			if row[col] == val:
+				explanation = f"*Trade Put{explanation_name}* half size because {col} = {val}.\n"
+				size = .5
+				return size, explanation
+		return 0, f"No conditions met for Put{explanation_name}.\n"
+
+def _get_size_two_factors(row,
+		 cp_type="P",
+		 call_dont_trade_factors=[],
+		 call_trade_factors=[None],
+		 call_small_trade_factors=[],
+		 put_dont_trade_factors=[],
+		 put_trade_factors=[None],
+		 put_small_trade_factors=[],
+		explanation_name=""
+	):
+	if cp_type == "C":
+		for (col1, val1), (col2, val2) in call_dont_trade_factors:
+			if (row[col1] == val1) and (row[col2] == val2):
+				if col1 == col2:
+					explanation = f"*Don't trade Call{explanation_name}* because {col1} = {val1}.\n"
+				else:
+					explanation = f"*Don't trade Call{explanation_name}* because {col1} = {val1} and {col2} = {val2}.\n"
+				size = 0
+				return size, explanation
+		for (col1, val1), (col2, val2) in call_trade_factors:
+			if (row[col1] == val1) and (row[col2] == val2):
+				if col1 == col2:
+					explanation = f"*Trade Call{explanation_name}* because {col1} = {val1}.\n"
+				else:
+					explanation = f"*Trade Call{explanation_name}* because {col1} = {val1} and {col2} = {val2}.\n"
+				size = 1
+				return size, explanation
+		for (col1, val1), (col2, val2) in call_small_trade_factors:
+			if (row[col1] == val1) and (row[col2] == val2):
+				if col1 == col2:
+					explanation = f"*Trade Call{explanation_name}* half size because {col1} = {val1}.\n"
+				else:
+					explanation = f"*Trade Call{explanation_name}* half size because {col1} = {val1} and {col2} = {val2}.\n"
+				size = .5
+				return size, explanation
+		return 0, f"No conditions met for Call{explanation_name}.\n"
+	if cp_type == "P":
+		for (col1, val1), (col2, val2) in put_dont_trade_factors:
+			if (row[col1] == val1) and (row[col2] == val2):
+				if col1 == col2:
+					explanation = f"*Don't trade Put{explanation_name}* because {col1} = {val1}.\n"
+				else:
+					explanation = f"*Don't trade Put{explanation_name}* because {col1} = {val1} and {col2} = {val2}.\n"
+				size = 0
+				return size, explanation
+		for (col1, val1), (col2, val2) in put_trade_factors:
+			if (row[col1] == val1) and (row[col2] == val2):
+				if col1 == col2:
+					explanation = f"*Trade Put{explanation_name}* because {col1} = {val1}.\n"
+				else:
+					explanation = f"*Trade Put{explanation_name}* because {col1} = {val1} and {col2} = {val2}.\n"
+				size = 1
+				return size, explanation
+		for (col1, val1), (col2, val2) in put_small_trade_factors:
+			if (row[col1] == val1) and (row[col2] == val2):
+				if col1 == col2:
+					explanation = f"*Trade Put{explanation_name}* half size because {col1} = {val1}.\n"
+				else:
+					explanation = f"*Trade Put{explanation_name}* half size because {col1} = {val1} and {col2} = {val2}.\n"
+				size = .5
+				return size, explanation
+		return 0, f"No conditions met for Put{explanation_name}.\n"
+
+def resolve_size_multiplier(factor_dict, size_multiplier_factors):
+	"""Return the first matching multiplier from size_multiplier_factors, or 1.0 if no match.
+
+	size_multiplier_factors: list of (factor_tuple, multiplier) where factor_tuple is a
+	tuple of (col, val) pairs that must ALL hold simultaneously for the multiplier to apply.
+
+	Rules are evaluated in order; first match wins. Rules should be mutually exclusive by
+	construction -- typically each rule includes a side-specific imbal trigger (e.g.
+	factor_355_imbal_less_than_minus_1p5b for puts, factor_355_imbal_greater_than_1p5B for
+	calls), so put-rules cannot match on a day the call-rule is meant to catch.
+	"""
+	if not size_multiplier_factors:
+		return 1.0
+	for factor_tuple, mult in size_multiplier_factors:
+		if all(factor_dict.get(col) == val for col, val in factor_tuple):
+			return float(mult)
+	return 1.0
+
+
+def _get_size_n_factors(row, cp_type, dont_trade_factors, trade_factors,
+						small_trade_factors, explanation_name=""):
+	"""Evaluate factor tuples with any number of (factor, value) pairs per tuple."""
+	side = "Call" if cp_type == "C" else "Put"
+
+	for factor_tuple in dont_trade_factors:
+		if all(row[col] == val for col, val in factor_tuple):
+			parts = " and ".join(f"{col} = {val}" for col, val in factor_tuple)
+			return 0, f"*Don't trade {side}{explanation_name}* because {parts}.\n"
+
+	for factor_tuple in trade_factors:
+		if all(row[col] == val for col, val in factor_tuple):
+			parts = " and ".join(f"{col} = {val}" for col, val in factor_tuple)
+			return 1, f"*Trade {side}{explanation_name}* because {parts}.\n"
+
+	for factor_tuple in small_trade_factors:
+		if all(row[col] == val for col, val in factor_tuple):
+			parts = " and ".join(f"{col} = {val}" for col, val in factor_tuple)
+			return 0.5, f"*Trade {side}{explanation_name}* half size because {parts}.\n"
+
+	return 0, f"No conditions met for {side}{explanation_name}.\n"
+
+def get_size(row,
+		 cp_type="P",
+		 call_dont_trade_factors=[],
+		 call_trade_factors=[None],
+		 call_small_trade_factors=[],
+		 put_dont_trade_factors=[],
+		 put_trade_factors=[None],
+		 put_small_trade_factors=[],
+		explanation_name=""):
+	try:
+		# Detect max tuple length across all non-empty factor lists
+		max_tuple_len = 0
+		for flist in [call_trade_factors, put_trade_factors, call_dont_trade_factors,
+					  put_dont_trade_factors, call_small_trade_factors, put_small_trade_factors]:
+			if flist and flist[0] is not None and isinstance(flist[0], tuple) and isinstance(flist[0][0], tuple):
+				max_tuple_len = max(max_tuple_len, len(flist[0]))
+
+		if max_tuple_len >= 3:
+			# N-factor path: route pre-split lists to _get_size_n_factors
+			if cp_type == "C":
+				return _get_size_n_factors(row, cp_type, call_dont_trade_factors,
+					call_trade_factors, call_small_trade_factors, explanation_name)
+			else:
+				return _get_size_n_factors(row, cp_type, put_dont_trade_factors,
+					put_trade_factors, put_small_trade_factors, explanation_name)
+		elif (call_trade_factors and (len(call_trade_factors[0][0]) == 2)) or (put_trade_factors and (len(put_trade_factors[0][0]) == 2)):
+			return _get_size_two_factors(row, cp_type, call_dont_trade_factors, call_trade_factors, call_small_trade_factors,
+				put_dont_trade_factors, put_trade_factors, put_small_trade_factors, explanation_name)
+		else:
+			return _get_size(row, cp_type, call_dont_trade_factors, call_trade_factors, call_small_trade_factors,
+				put_dont_trade_factors, put_trade_factors, put_small_trade_factors, explanation_name)
+	except KeyError as e:
+		available = sorted([k for k in row.keys() if k.startswith("factor_")])
+		raise KeyError(
+			f"\n\nFactor {e} not found in combined data.\n"
+			f"If this is a custom factor from custom_test_factors.py, make sure to run:\n\n"
+			f"    from custom_test_factors import add_custom_factors\n"
+			f"    combined = add_custom_factors(combined)\n"
+			f"    test_strategy('CONFIG_NAME', combined=combined)\n\n"
+			f"Available factor columns: {available}"
+		) from None
+
+
+def prep_trades(configs,
+				factor_dict,
+				option_chains,
+				today,
+				trigger_all,
+				trigger_all_size,
+				magnets=[],
+				vix=None,
+				atm_vol_0dte=None,
+				abs_imbal=None,
+				abs_chg_imbal=None,
+				abs_chg_stats=None,
+				is_test=False,
+				puts_size_mult=1.0,
+				calls_size_mult=1.0):
+	"""Build trade dicts from configs. New regime-aware edge sizing for 2-legged credit
+	spreads activates if at least 2 of (vix, atm_vol_0dte, abs_imbal) are provided -- the
+	missing one(s) default to their VIX_STATS/ATM_VOL_STATS/ABS_IMBAL_STATS mean. The
+	new path is skipped for outrights (separate code branch) and for debit spreads
+	(price < 0); both fall back to the legacy EDGE_TARGET_2_LEGGED_* scalars.
+	"""
+	# Decide whether to use regime-aware edge sizing for 2-legged credit spreads.
+	_provided = sum(x is not None for x in (vix, atm_vol_0dte, abs_imbal))
+	use_regime_edges = (_provided >= 2)
+	if use_regime_edges:
+		# Fill any missing input with its mean so the math still produces a sensible mult.
+		if vix          is None: vix          = VIX_STATS["mean"]
+		if atm_vol_0dte is None: atm_vol_0dte = ATM_VOL_STATS["mean"]
+		if abs_imbal    is None: abs_imbal    = ABS_IMBAL_STATS["mean"]
+
+	trade_dict = {"trades": [], "explanations": [], "trade_types": []}
+	explanations_dict = {}
+	MIN_MAGNET_DISTANCE = 29  # don't sell options within this many points of a magnet
+
+	for config in configs:
+		# Route each config to its symbol's option chain
+		symbol = config.get("symbol", "SPXW")
+		chain = option_chains[symbol]
+		puts = chain["puts"]
+		calls = chain["calls"]
+		spx = chain["underlying"]
+		edge_mult = NDX_EDGE_MULT if symbol == "NDXP" else 1
+
+		call_size, put_size = 0, 0  # set to 0 to start as safeguard
+
+		put_mult, put_explanation = get_size(factor_dict,
+											 "P",
+											 call_dont_trade_factors=config["call_dont_trade_factors"],
+											 call_trade_factors=config["call_trade_factors"],
+											 call_small_trade_factors=config["call_small_trade_factors"],
+											 put_dont_trade_factors=config["put_dont_trade_factors"],
+											 put_trade_factors=config["put_trade_factors"],
+											 put_small_trade_factors=config["put_small_trade_factors"],
+											 explanation_name=config["explanation_name"])
+		call_mult, call_explanation = get_size(factor_dict,
+											   "C",
+											   call_dont_trade_factors=config["call_dont_trade_factors"],
+											   call_trade_factors=config["call_trade_factors"],
+											   call_small_trade_factors=config["call_small_trade_factors"],
+											   put_dont_trade_factors=config["put_dont_trade_factors"],
+											   put_trade_factors=config["put_trade_factors"],
+											   put_small_trade_factors=config["put_small_trade_factors"],
+											   explanation_name=config["explanation_name"])
+
+		# Bucket-based size multiplier -- scales dollar_target/size_target per trade based on
+		# which factor tuple currently matches. 1.0x if config has no size_multiplier_factors
+		# or no rule matches.
+		size_mult = resolve_size_multiplier(factor_dict, config.get("size_multiplier_factors", []))
+		# Side-specific bucket multipliers (opt-in keys; absent -> 1.0 -> no behavior change).
+		# Compose multiplicatively with the side-agnostic size_mult. Added 8/7/26 so a rule can
+		# scale ONE side (e.g. 0.5x puts on high realized-vol-change days) without touching calls.
+		put_bucket_mult  = size_mult * resolve_size_multiplier(factor_dict, config.get("put_size_multiplier_factors", []))
+		call_bucket_mult = size_mult * resolve_size_multiplier(factor_dict, config.get("call_size_multiplier_factors", []))
+
+		# Per-side spread-sale mult from the caller (script-level SIZE_MULT_XXX_PUTS/CALLS). Only
+		# applies to 2-legged credit spreads (Sell direction with BOTH short + long legs present).
+		# Outright shorts + debit spreads (Buy) pass through unchanged. Scales dollar_target,
+		# size_target, AND max_size in the block below.
+		_is_sell = config["direction"] == "Sell"
+		_puts_extra_mult  = puts_size_mult  if (_is_sell and config.get("short_put_strikes")  and config.get("long_put_strikes"))  else 1.0
+		_calls_extra_mult = calls_size_mult if (_is_sell and config.get("short_call_strikes") and config.get("long_call_strikes")) else 1.0
+
+		# PUTS
+
+		puts_cp = puts.copy()
+		# Drop put strikes closer than min_strike_distance dollars from spot.
+		# Literal-dollar semantics; negative msd allows up to |msd| ITM.
+		msd = config["min_strike_distance"]
+		puts_cp = puts_cp[(spx - puts_cp.okey_xx) >= msd].copy()
+
+		price = 0
+		for strike in config["short_put_strikes"]:
+			price += puts_cp.iloc[strike].obid
+		for strike in config["long_put_strikes"]:
+			price -= puts_cp.iloc[strike].oask
+		price = price.round(2)
+		# FIX: floor sell credit spread net entry at $0.05 to prevent negative/tiny price from blowing up sizing
+		if config["direction"].lower() == "sell" and len(config["short_put_strikes"]) > 0 and len(config["long_put_strikes"]) > 0 and a_lt_b(a=price, b=0.05):
+			price = 0.05
+		# print(f"Debug: Price is {price} for puts.")
+
+		if config["dollar_target"]:
+			# Use abs() on both dollar_target and price so Buy (debit) configs with negative
+			# dollar_target / negative price still produce positive size.
+			put_size = 0 if price==0 else put_mult * ceil(abs(config["dollar_target"] * put_bucket_mult * _puts_extra_mult) / (abs(price) * 100))
+		if config["size_target"]:
+			put_size = put_mult * config["size_target"] * put_bucket_mult * _puts_extra_mult
+		put_size = ceil(put_size)
+		if put_bucket_mult != 1.0 and put_size > 0:
+			put_explanation += f"*Put{config['explanation_name']} size multiplier* {put_bucket_mult}x applied.\n"
+		if _puts_extra_mult != 1.0 and put_size > 0:
+			put_explanation += f"*Put{config['explanation_name']} side mult* {_puts_extra_mult}x applied.\n"
+
+		if put_size > 0:
+			if config["min_price"] and a_lt_b(a=abs(price), b=config["min_price"]):
+				put_size = 0
+				put_explanation += f"*Don't trade Put{config['explanation_name']}* because price = {price} < min price {config['min_price']}.\n"
+			# Opt-in: when allow_scale_up_of_max_size=True, the size_multiplier_factors
+			# value scales max_size too (not just dollar_target). Legacy configs lack
+			# the flag and see identical pre-existing behavior (effective_max = max_size).
+			# size_mult < 1.0 ALWAYS scales max_size down (no flag needed -- strictly
+			# risk-reducing; without it a sub-1.0 mult is a no-op on cap-bound days).
+			# EDGE (known + accepted 8/7/26): on a FLAGGED config, if the agnostic size_mult
+			# is > 1.0 while a side bucket mult is < 1.0, the scale-UP branch wins and the
+			# side-down is ignored for the cap. No config can hit this today (BTIC is the
+			# only flagged config and has no side rules) -- revisit if that ever changes.
+			if config.get("allow_scale_up_of_max_size", False) and size_mult > 1.0:
+				effective_max = int(ceil(config["max_size"] * size_mult)) if config["max_size"] else 0
+			elif config["max_size"] and put_bucket_mult < 1.0:
+				effective_max = int(config["max_size"] * put_bucket_mult)  # truncate: errs conservative
+			else:
+				effective_max = config["max_size"]
+			# Also apply per-side mult to max_size (int truncation -- errs conservative on caps).
+			if effective_max and _puts_extra_mult != 1.0:
+				effective_max = int(effective_max * _puts_extra_mult)
+			if effective_max and put_size > effective_max:
+				put_size = effective_max
+				_reason = "config max size" if effective_max == config["max_size"] else "unmapped reason"
+				put_explanation += f"*Put{config['explanation_name']} sized down* to {put_size} due to {_reason}.\n"
+			if config["max_price"] and a_gt_b(a=abs(price), b=config["max_price"]):
+				put_size = 0
+				put_explanation += f"*Don't trade Put{config['explanation_name']}* because price = {price} > max price {config['max_price']}.\n"
+			if config["min_size"] and put_size < config["min_size"]:
+				put_size = config["min_size"]
+				put_explanation += f"*Put{config['explanation_name']} sized up* to {put_size}."
+
+			if price == 0:
+				put_size = 0
+				put_explanation += f"*Don't trade Put{config['explanation_name']}* because price = {price}.\n"
+
+			# check to make sure you are not selling puts near a magnet (SPX only)
+			if magnets and config["direction"] != "Buy" and symbol == "SPXW":
+				for i in config["short_put_strikes"]:
+					strike = puts_cp.iloc[i].okey_xx
+					too_close_to_magnet = any([
+						(strike >= magnet and strike - magnet <= MIN_MAGNET_DISTANCE) or
+						(strike < magnet and magnet - strike < 7)
+						for magnet in magnets
+					])
+					if too_close_to_magnet:
+						put_size = 0
+						put_explanation += f"*Don't trade Put{config['explanation_name']}* because short strike {strike} is too close to a magnet.\n"
+						break
+
+		if trigger_all and (put_size == 0):
+			put_size = trigger_all_size
+			put_explanation += f"*Trade Put{config['explanation_name']}* because trigger_all is set.\n"
+			if magnets and config["direction"] != "Buy" and symbol == "SPXW":
+				for i in config["short_put_strikes"]:
+					strike = puts_cp.iloc[i].okey_xx
+					too_close_to_magnet = any([
+						(strike >= magnet and strike - magnet <= MIN_MAGNET_DISTANCE) or
+						(strike < magnet and magnet - strike < 7)
+						for magnet in magnets
+					])
+					if too_close_to_magnet:
+						put_size = 0
+						put_explanation += f"*Don't trade Put{config['explanation_name']}* because short strike {strike} is too close to a magnet.\n"
+						break
+
+		trade, trade_type = {}, ""
+		if config["short_put_strikes"] and config["long_put_strikes"] and put_size > 0:
+			# Regime-aware edges for credit spreads only; debit spreads (price < 0) and
+			# legacy callers (use_regime_edges=False) fall back to old scalars.
+			if use_regime_edges and price > 0:
+				_et1, _me1, _et2, _me2 = compute_trade_edges(vix, atm_vol_0dte, abs_imbal, price, abs_chg_imbal=abs_chg_imbal, abs_chg_stats=abs_chg_stats)
+			else:
+				_et1, _me1 = EDGE_TARGET_2_LEGGED_1, MAX_EDGE_2_LEGGED_1
+				_et2, _me2 = EDGE_TARGET_2_LEGGED_2, MAX_EDGE_2_LEGGED_2
+			trade = {
+				"name": config["name"],
+				"symbol": config["symbol"],
+				"size": put_size,
+				"short_legs": [puts_cp.iloc[x] for x in config["short_put_strikes"]],
+				"long_legs": [puts_cp.iloc[x] for x in config["long_put_strikes"]],
+				"exp": today,
+				"account": config["account"],
+				"direction": config["direction"],
+				"edge_target1": _et1 * edge_mult,
+				"max_edge1": _me1 * edge_mult,
+				"edge_target2": _et2 * edge_mult,
+				"max_edge2": _me2 * edge_mult,
+				"is_sale": config["direction"] == "Sell",
+				"structure": f"Put{config['explanation_name']}",
+				"price": price,
+				"min_price": config["min_price"]
+			}
+			trade_type = "complex"
+			print_algo_traded_banner(trade)
+		elif (config["short_put_strikes"] or config["long_put_strikes"]) and put_size > 0:
+			trade = {
+				"name": config["name"],
+				"symbol": config["symbol"],
+				"cp": "Put",
+				"option": puts_cp.iloc[config["short_put_strikes"][0]] if config["short_put_strikes"] else puts_cp.iloc[
+					config["long_put_strikes"][0]],
+				"size": put_size,
+				"account": config["account"],
+				"direction": config["direction"],
+				"offset": EDGE_OFFSET_OUTRIGHT,
+				"structure": f"Put{config['explanation_name']}",
+				"price": price,
+				"min_price": config["min_price"]
+			}
+			trade_type = "outright"
+
+		if trade_type:
+			trade_dict["trades"].append(trade)
+			trade_dict["explanations"].append(put_explanation)
+			trade_dict["trade_types"].append(trade_type)
+
+		# CALLS
+
+		calls_cp = calls.copy()
+		# Drop call strikes closer than min_strike_distance dollars from spot.
+		# Literal-dollar semantics; negative msd allows up to |msd| ITM.
+		msd = config["min_strike_distance"]
+		calls_cp = calls_cp[(calls_cp.okey_xx - spx) >= msd].copy()
+
+		price = 0
+		for strike in config["short_call_strikes"]:
+			price += calls_cp.iloc[strike].obid
+		for strike in config["long_call_strikes"]:
+			price -= calls_cp.iloc[strike].oask
+		price = price.round(2)
+		# FIX: floor sell credit spread net entry at $0.05 to prevent negative/tiny price from blowing up sizing
+		if config["direction"].lower() == "sell" and len(config["short_call_strikes"]) > 0 and len(config["long_call_strikes"]) > 0 and a_lt_b(a=price, b=0.05):
+			price = 0.05
+		# print(f"Debug: Price is {price} for calls.")
+
+		if config["dollar_target"]:
+			# Use abs() on both dollar_target and price so Buy (debit) configs with negative
+			# dollar_target / negative price still produce positive size.
+			call_size = 0 if price==0 else call_mult * config["call_put_ratio"] * ceil(abs(config["dollar_target"] * call_bucket_mult * _calls_extra_mult) / (abs(price) * 100))
+		if config["size_target"]:
+			call_size = call_mult * config["call_put_ratio"] * config["size_target"] * call_bucket_mult * _calls_extra_mult
+		call_size = ceil(call_size)
+		if call_bucket_mult != 1.0 and call_size > 0:
+			call_explanation += f"*Call{config['explanation_name']} size multiplier* {call_bucket_mult}x applied.\n"
+		if _calls_extra_mult != 1.0 and call_size > 0:
+			call_explanation += f"*Call{config['explanation_name']} side mult* {_calls_extra_mult}x applied.\n"
+
+		if call_size > 0:
+			if config["min_price"] and a_lt_b(a=abs(price), b=config["min_price"]):
+				call_size = 0
+				call_explanation += f"*Don't trade Call{config['explanation_name']}* because price = {price} < min price {config['min_price']}.\n"
+			# See put-side comment above re allow_scale_up_of_max_size opt-in flag
+			# (and re bucket_mult < 1.0 always scaling max_size down).
+			if config.get("allow_scale_up_of_max_size", False) and size_mult > 1.0:
+				effective_max = int(ceil(config["max_size"] * size_mult)) if config["max_size"] else 0
+			elif config["max_size"] and call_bucket_mult < 1.0:
+				effective_max = int(config["max_size"] * call_bucket_mult)  # truncate: errs conservative
+			else:
+				effective_max = config["max_size"]
+			# Also apply per-side mult to max_size (int truncation -- errs conservative on caps).
+			if effective_max and _calls_extra_mult != 1.0:
+				effective_max = int(effective_max * _calls_extra_mult)
+			if effective_max and call_size > effective_max:
+				call_size = effective_max
+				_reason = "config max size" if effective_max == config["max_size"] else "unmapped reason"
+				call_explanation += f"*Call{config['explanation_name']} sized down* to {call_size} due to {_reason}.\n"
+			if config["max_price"] and a_gt_b(a=abs(price), b=config["max_price"]):
+				call_size = 0
+				call_explanation += f"*Don't trade Call{config['explanation_name']}* because price = {price} > max price {config['max_price']}.\n"
+			if config["min_size"] and call_size < config["min_size"]:
+				call_size = config["min_size"]
+				call_explanation += f"*Call{config['explanation_name']} sized up* to {call_size}."
+
+			if price == 0:
+				# price must equal 0
+				call_size = 0
+				call_explanation += f"*Don't trade Call{config['explanation_name']}* because price = {price}.\n"
+
+			# check to make sure you are not selling calls near a magnet (SPX only)
+			if magnets and config["direction"] != "Buy" and symbol == "SPXW":
+				for i in config["short_call_strikes"]:
+					strike = calls_cp.iloc[i].okey_xx
+					too_close_to_magnet = any([
+						(strike <= magnet and magnet - strike <= MIN_MAGNET_DISTANCE) or
+						(strike > magnet and strike - magnet < 7)
+						for magnet in magnets
+					])
+					if too_close_to_magnet:
+						call_size = 0
+						call_explanation += f"*Don't trade Call{config['explanation_name']}* because short strike {strike} is too close to a magnet.\n"
+						break
+
+		if trigger_all and (call_size == 0):
+			call_size = trigger_all_size
+			call_explanation += f"*Trade Call{config['explanation_name']}* because trigger_all is set.\n"
+			if magnets and config["direction"] != "Buy" and symbol == "SPXW":
+				for i in config["short_call_strikes"]:
+					strike = calls_cp.iloc[i].okey_xx
+					too_close_to_magnet = any([
+						(strike <= magnet and magnet - strike <= MIN_MAGNET_DISTANCE) or
+						(strike > magnet and strike - magnet < 7)
+						for magnet in magnets
+					])
+					if too_close_to_magnet:
+						call_size = 0
+						call_explanation += f"*Don't trade Call{config['explanation_name']}* because short strike {strike} is too close to a magnet.\n"
+						break
+
+
+		trade, trade_type = {}, ""
+		if config["short_call_strikes"] and config["long_call_strikes"] and call_size > 0:
+			# Regime-aware edges for credit spreads only; debit spreads (price < 0) and
+			# legacy callers (use_regime_edges=False) fall back to old scalars.
+			if use_regime_edges and price > 0:
+				_et1, _me1, _et2, _me2 = compute_trade_edges(vix, atm_vol_0dte, abs_imbal, price, abs_chg_imbal=abs_chg_imbal, abs_chg_stats=abs_chg_stats)
+			else:
+				_et1, _me1 = EDGE_TARGET_2_LEGGED_1, MAX_EDGE_2_LEGGED_1
+				_et2, _me2 = EDGE_TARGET_2_LEGGED_2, MAX_EDGE_2_LEGGED_2
+			trade = {
+				"name": config["name"],
+				"symbol": config["symbol"],
+				"size": call_size,
+				"short_legs": [calls_cp.iloc[x] for x in config["short_call_strikes"]],
+				"long_legs": [calls_cp.iloc[x] for x in config["long_call_strikes"]],
+				"exp": today,
+				"account": config["account"],
+				"direction": config["direction"],
+				"edge_target1": _et1 * edge_mult,
+				"max_edge1": _me1 * edge_mult,
+				"edge_target2": _et2 * edge_mult,
+				"max_edge2": _me2 * edge_mult,
+				"is_sale": config["direction"] == "Sell",
+				"structure": f"Call{config['explanation_name']}",
+				"price": price,
+				"min_price": config["min_price"]
+			}
+			trade_type = "complex"
+			print_algo_traded_banner(trade)
+		elif (config["short_call_strikes"] or config["long_call_strikes"]) and call_size > 0:
+			trade = {
+				"name": config["name"],
+				"symbol": config["symbol"],
+				"cp": "Call",
+				"option": calls_cp.iloc[config["short_call_strikes"][0]] if config["short_call_strikes"] else
+				calls_cp.iloc[config["long_call_strikes"][0]],
+				"size": call_size,
+				"account": config["account"],
+				"direction": config["direction"],
+				"offset": EDGE_OFFSET_OUTRIGHT,
+				"structure": f"Call{config['explanation_name']}",
+				"price": price,
+				"min_price": config["min_price"]
+			}
+			trade_type = "outright"
+
+		if trade_type:
+			trade_dict["trades"].append(trade)
+			trade_dict["explanations"].append(call_explanation)
+			trade_dict["trade_types"].append(trade_type)
+
+		explanations_dict[config["name"]] = {'put': put_explanation, 'call': call_explanation}
+
+	return trade_dict, explanations_dict
+
+def read_spy_data(file_path="spy_data.csv"):
+	"""Read SPY price data from CSV (written by save_spy_prices.py)."""
+	try:
+		return pd.read_csv(file_path, parse_dates=["label", "request_ts", "return_ts"])
+	except Exception as e:
+		print(f"Failed to read SPY data file: {e}")
+		return pd.DataFrame()
+
+def getFirstTick(IS_TEST=False, window_seconds=5, retries=5, wait_between_retries=0.1, test_tick_bps=None):
+	"""Get first tick in raw decimal (multiply by 100*100 for bps).
+
+	Uses the labeled SPY samples bracketing the imbalance print at 15:50:00.
+	(SPY last trade since 9/1/26; previously the SPX calculated index, whose ~1/sec
+	recalculation lagged the tape and read pre-imbalance at the 1-second anchor.)
+	The label-15:50:00 sample is the LAST pre-imbalance snap (fired ~300ms early),
+	so it counts as the pre anchor:
+	    1-sec mode: (first SPY label >= 15:50:01) - (last SPY label <= 15:50:00)
+	    5-sec mode: (first SPY label >= 15:50:05) - (last SPY label <= 15:50:00)
+
+	If the result is NaN (data not yet present), waits wait_between_retries
+	seconds and retries up to `retries` times before giving up.
+
+	Args:
+		IS_TEST: test mode; gates the test_tick_bps override (otherwise unused)
+		window_seconds: 5 = anchor end at 15:50:05 (default), 1 = anchor end at 15:50:01 (fast)
+		retries: max number of retries when result is NaN (default 5)
+		wait_between_retries: seconds to sleep between retries (default 0.1)
+		test_tick_bps: test-mode first-tick override in BPS, None = read the CSV
+	"""
+	# Test-mode override, mirroring get_340_imbal / get_350_imbal's (is_test, test_imbal) pattern.
+	# Taken in BPS because that is the unit every caller works in, then converted to the raw
+	# decimal this function contracts to return -- callers' own *100*100 recovers the bps exactly.
+	# Needed because spy_data.csv is written by save_spy_prices.py, which test runs do not launch.
+	if IS_TEST and test_tick_bps is not None:
+		return test_tick_bps / 1e4
+
+	start_boundary = dt.time(LAST_HOUR, 50, 0)
+	end_boundary = dt.time(LAST_HOUR, 50, 1) if window_seconds == 1 else dt.time(LAST_HOUR, 50, 5)
+
+	file_path = "spy_data.csv"
+
+	def _compute():
+		for _ in range(3):
+			df = read_spy_data(file_path)
+			if not df.empty:
+				break
+			print("Empty data found while reading SPY data, sleeping for .1 seconds and retrying...")
+			time.sleep(0.1)
+
+		if df.empty:
+			print("No data available.")
+			return np.nan
+
+		# Start anchor: last label at or before 15:50:00 (the pre-imbalance snap)
+		pre_df = df[df['label'].dt.time <= start_boundary]
+		if pre_df.empty:
+			print(f"No pre-{start_boundary} SPY label available.")
+			return np.nan
+		start_row = pre_df.iloc[-1]
+
+		# End anchor: first label at/after the end boundary
+		post_df = df[df['label'].dt.time >= end_boundary]
+		if post_df.empty:
+			print(f"No post-{end_boundary} SPY label available.")
+			return np.nan
+		end_row = post_df.iloc[0]
+
+		return (end_row.SPY - start_row.SPY) / start_row.SPY
+
+	for attempt in range(retries + 1):
+		result = _compute()
+		if not pd.isna(result):
+			return result
+		if attempt < retries:
+			print(f"getFirstTick got NaN on attempt {attempt + 1}/{retries + 1}, sleeping {wait_between_retries}s and retrying...")
+			time.sleep(wait_between_retries)
+
+	return np.nan
+
+
+if __name__ == "__main__":
+	# print(f"340: {get_340_imbal(is_test=True, test_imbal=None)}")
+	# print(f"350: {get_350_imbal(is_test=True, test_imbal=None)}")
+	# print(f"355: {get_355_imbal(is_test=True, test_imbal=None)}")
+	# print(f"fast: {get_fast_imbal(is_test=True, test_imbal=None)}")
+	# print(get_355_imbal(is_test=True, test_imbal=None))
+	# exit()
+	# mtype, today_move, std = get_market_measurements()
+	# print(f"Market type: {mtype}, Today move: {today_move:.5f}, Std: {std:.5f}") # Trade on fed days if we enter UP or DOWN market post 10 am, pre 2pm
+	# exit()
+	print(f"Realized change: {get_change_in_realized()}")
+	print(f"Realized change (business day method): {get_change_in_realized_biz_day_method()}")
+	print(f"Binned realized change: {bin_realized_change(get_change_in_realized()):d}")
+	exit()
+	for i in range(0, 20):
+		print(f"{x_days_ahead(i, dt.date.today())}: Realized change {get_change_in_realized(n=3*22-i):.3f}, Binned: {bin_realized_change(get_change_in_realized(n=3*22-i))}")
+	#
+	# print("\n\n______________________________________")
+	# for i in range(0, 20):
+	# 	print(f"{x_days_ahead(i, dt.date.today())}: Realized change business day method {get_change_in_realized_biz_day_method(days=90-i):.3f}")
+
+

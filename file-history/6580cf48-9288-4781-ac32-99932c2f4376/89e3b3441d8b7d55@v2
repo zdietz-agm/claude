@@ -1,0 +1,103 @@
+"""Open market type (Up / Flat / Down) vs pre-open SPY imbalance, regular days only.
+
+Market type: overnight return (adjusted Open_t / adjusted PX_LAST_t-1 - 1) divided by
+the std of the trailing 90 close-to-close returns ending t-1 (same shift(1) /
+min_periods=90 logic as eod_option_algos _build_etf_daily_moves). Up > 0.5,
+Down < -0.5, Flat otherwise. Bloomberg adjust='all' for this leg only.
+
+Open -> 9:40 return in bps uses the UNADJUSTED legs from open_imbal_vs_open_to_940
+(raw Bloomberg Open, median 09:39:38..09:40:02 trade print).
+
+Run:  python D:/agent_projects/sod_option_algos/adhoc/open_market_type_vs_imbal.py
+"""
+import sys
+
+sys.path.insert(0, "D:/agent_projects/sod_option_algos/adhoc")
+sys.path.insert(0, "D:/vbam-data-oracle/src")
+sys.path.insert(0, "D:/PycharmProjects/utils")
+
+import numpy as np
+import pandas as pd
+
+import bloomberg_helpers as bbg
+import calendar_utils as cu
+from vbam_utilities import vbam_db
+import open_imbal_vs_open_to_940 as base
+
+pd.set_option("display.width", 250)
+pd.set_option("display.max_columns", 40)
+
+BBG_START = "2020-06-01"  # extra history so the 90d std is populated by 2021-01-04
+UP, DOWN = 0.5, -0.5
+
+
+def load_market_type(start, end):
+    """Adjusted SPY close/open -> overnight ret, rolling 90d c2c std, market_ratio, market_type."""
+    df = bbg.my_bdh("SPY US Equity", ["PX_LAST", "Open"], start, end, adjust="all",
+                    timeout=90, verbose=True)
+    df.columns = ["adj_close", "adj_open"]
+    df.index = pd.to_datetime(df.index).date
+    df["yest_adj_close"] = df["adj_close"].shift(1)
+    c2c = df["adj_close"].pct_change()
+    df["rolling_std"] = c2c.shift(1).rolling(90, min_periods=90).std()  # known as of t-1
+    df["overnight_ret"] = df["adj_open"] / df["yest_adj_close"] - 1
+    df["market_ratio"] = df["overnight_ret"] / df["rolling_std"]
+    df["market_type"] = np.select([df.market_ratio > UP, df.market_ratio < DOWN],
+                                  ["Up", "Down"], default="Flat")
+    df.loc[df.market_ratio.isna(), "market_type"] = np.nan
+    return df
+
+
+def stats_tbl(df, by):
+    """N / mean / median / hit-rate of ret_bps grouped by `by`."""
+    return df.groupby(by, observed=True)["ret_bps"].agg(
+        n="size", mean="mean", median="median", hit_rate=lambda s: (s > 0).mean()).round(2)
+
+
+if __name__ == "__main__":
+    base.SERIALS = set(pd.to_datetime(list(cu.SERIALS)).date)
+    base.FEDS = set(pd.to_datetime(list(cu.FEDS)).date)
+
+    eng = vbam_db.get_prod_engine()
+    data = base.load_imbal(eng).join(base.load_px_940(eng), how="inner")
+    data.index = pd.to_datetime(data.index).date
+    data = data.join(base.load_bbg_open(str(min(data.index)), str(max(data.index))), how="inner")
+    data = data[(data.bbg_open > 0) & (data.imbal_092802 != 0) & (data.imbal_092931 != 0)]
+    data["ret_bps"] = (data.px_940 / data.bbg_open - 1) * 1e4  # unadjusted legs
+    data["day_type"] = [base.day_type(d) for d in data.index]
+
+    mt = load_market_type(BBG_START, str(max(data.index)))
+    data = data.join(mt[["overnight_ret", "rolling_std", "market_ratio", "market_type"]], how="inner")
+    reg = data[(data.day_type == "Regular") & data.market_type.notna()].copy()
+    order = pd.CategoricalDtype(["Up", "Flat", "Down"], ordered=True)
+    reg["market_type"] = reg.market_type.astype(order)
+
+    print(f"Regular days: {len(reg)}   {min(reg.index)} -> {max(reg.index)}")
+    print(f"overnight_ret bps: mean {reg.overnight_ret.mean()*1e4:+.1f}  std {reg.overnight_ret.std()*1e4:.1f}"
+          f"   rolling_std (daily, bps) median {reg.rolling_std.median()*1e4:.0f}")
+
+    print("\n=== 1. Open market type counts (regular days) ===")
+    cnt = reg.market_type.value_counts().reindex(["Up", "Flat", "Down"])
+    print(pd.DataFrame({"n": cnt, "pct": (cnt / cnt.sum() * 100).round(1),
+                        "avg_overnight_bps": reg.groupby("market_type", observed=True).overnight_ret.mean() * 1e4}).round(1).to_string())
+
+    print("\n=== 2. Open -> 9:40 return (bps) by market type ===")
+    print(stats_tbl(reg, "market_type").to_string())
+
+    print("\n=== 3. Contrarian vs aligned imbalance, by market type ===")
+    for col in ["imbal_092802", "imbal_092931"]:
+        sgn = np.sign(reg[col])
+        rel = np.where(reg.market_type == "Flat", "n/a (flat)",
+              np.where(((reg.market_type == "Up") & (sgn < 0)) | ((reg.market_type == "Down") & (sgn > 0)),
+                       "contrarian", "aligned"))
+        reg["relation"] = rel
+        print(f"\n--- {col} ---")
+        print(stats_tbl(reg[reg.market_type != "Flat"], ["market_type", "relation"]).to_string())
+        print("pooled Up+Down:")
+        print(stats_tbl(reg[reg.market_type != "Flat"], "relation").to_string())
+
+    print("\n=== Contrarian at BOTH snaps ===")
+    s1, s2 = np.sign(reg.imbal_092802), np.sign(reg.imbal_092931)
+    both = (((reg.market_type == "Up") & (s1 < 0) & (s2 < 0)) |
+            ((reg.market_type == "Down") & (s1 > 0) & (s2 > 0)))
+    print(stats_tbl(reg[both], "market_type").to_string())

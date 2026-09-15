@@ -1,0 +1,2021 @@
+# Assistant Notes -- Claude-maintained tracker. Zach edits todo*.txt; Claude edits this.
+# One entry per todo item, kept forever (even after the item leaves todo.txt).
+# Fields: NAME (unique id), STATUS (active/completed/sidelined), START DATE,
+# END DATE, DAY LOG (dates Zach worked on it), TAKEAWAYS (<200 words, current state).
+
+Last synced: 2026-09-11
+
+------------------------------------------------------------------------------------------
+NAME: assistant project 8_14_2026
+STATUS: completed
+START DATE: 2026-08-14
+END DATE: 2026-08-17
+DAY LOG: 2026-08-14, 2026-08-16, 2026-08-17, 2026-08-18
+TAKEAWAYS:
+CONCLUSION (accepted 8/17): chief-of-staff system built and operational in
+D:/agent_projects/assistant. Zach writes freeform blurbs in todo.txt; Claude maintains this
+notes file, learns from assistant_notes_corrections.txt, and writes weekday 7am morning
+briefs (format approved 8/17, gchat formatting 8/18). Desktop shortcut to todo.txt
+delivered. Read agent_projects/assistant for more.
+------------------------------------------------------------------------------------------
+NAME: 355pm imbal backup 8_16_2026
+STATUS: completed
+START DATE: 2026-08-16
+END DATE: 2026-08-20
+DAY LOG: 2026-08-18, 2026-08-20
+TAKEAWAYS:
+CONCLUSION (Zach moved to completed 8/20): SHIPPED TO PROD. get_355_imbal in
+scratch/algos/helpers.py rewritten with the backup fallback; backup query bound to
+TIME(snapTimestamp) >= '15:55:00' to match the 1550 pull (returns -3.4767B for 8/19, 8/8
+tests pass). Committed 795299d + e6f1bff, pushed, and pulled onto the EC2 box, so the 11:25
+cron now runs all six imbal sources. Known limit: the 15:55:00 floor excludes late backfill
+rows (8/11 23:23) but NOT an 8/12-style 15:55:00 pre-publication row -- tighten to 15:55:01
+if that recurs. Details: chat "355pm back up imbal" + its chat_recap. Prod code path.
+------------------------------------------------------------------------------------------
+NAME: 355pm spy equity algo 8_10_2026
+STATUS: completed
+START DATE: ~2026-08-10
+END DATE: 2026-08-18
+DAY LOG: 2026-08-11, 2026-08-12, 2026-08-18
+TAKEAWAYS:
+CONCLUSION (Zach, 8/18): LIVE IN PROD -- wired into run_algos.sh. Two SPY 3:55 strategies
+(COUNTERTREND + IMBAL_GROWS, ~$66k combined 2021-2026 when 1M notion fire/trigger, ~60% win
+each, near-zero overlap). DECISION 8/18: COUNTERTREND keeps the 3:50 market type, not 3:55
+($42,187 / $194 per trade / 61.3% win vs $28,784 / $142 / 59.1%) -- logged in
+eod_equity_algos/README.md. Note the countertrend config still lives only in the kernel, not
+in test_configs/ or configs_stock/. Full specs: chat "EOD equity algos backtest". Prod
+review scheduled post-9/1 -- see [355pm spy equity algo review 8_19_2026].
+------------------------------------------------------------------------------------------
+NAME: 355pm spy equity algo review 8_19_2026
+STATUS: active
+START DATE: 2026-09-08
+END DATE: -
+DAY LOG: 2026-09-08, 2026-09-09
+TAKEAWAYS:
+DELIBERATELY PARKED UNTIL 10/1/26 -- DO NOT NAG THIS ITEM AGAIN BEFORE THEN. Zach rewrote the todo line
+on 9/9 to "AFTER 10/1/26" and recorded his own read on it: since 8/18 IMBAL_GROWS has 5 prod fires and
+IMBAL_VS_MARKET has 1, "both look like losers OOS", and the question he wants answered next month is
+whether they look better with more data or whether the backtest was simply overfit. Written up as
+NOTE 9/9/2026 in eod_equity_algos/README.md, which is careful that these are the two 3:55 EQUITY
+strategies (355PM_IMBAL_GROWS, 355PM_IMBAL_VS_MARKET), not the 350PM suite and not the similarly named
+355 options algos. ONE NEW OVERFIT SUSPECT NAMED THAT DAY, worth carrying into the 10/1 review: the
+GROWS 12 bps SPY-move veto looks fitted -- $12,395 with the veto against $8,010 without, with the whole
+benefit concentrated in a few clipped losers. Everything from the 9/8 reconciliation still stands
+(prod matches backtest, the streak is cost-sized, edge near zero rather than inverted) -- see below.
+Prior state below.
+WORKED 9/8 AND QUESTION ONE IS ANSWERED: PROD MATCHES BACKTEST, BUT THE ALGO IS 0-FOR-5 SINCE GOING
+LIVE. Reconciled all 14 prod-log days (8/18-8/28, 9/1-9/4, 9/8): both sides traded on the same five
+days, no one-sided days, no sign disagreements, and every gap is the same mechanism -- identical
+direction, 500 shares, same MOC exit, with prod's entry filling 2-9 cents/share worse than the
+backtest's 15:55:03 snap. On sub-$100 days that fill difference is nearly the whole gap; the one
+economically real day (9/1, IMBAL_GROWS) reconciles within 3% (prod -$326.94 vs backtest -$336.50).
+So execution is not the problem and the backtest is trustworthy. THE STREAK IS REAL BUT SMALL:
+in-sample (fire days before 8/18) 108 obs, 73-35, so P(5 straight losses) = 0.36% iid, 0.45%
+posterior-predictive, about 1 in 220 -- and zero of 104 in-sample 5-day windows were all-loss, with
+losses anti-clustering (lag-1 autocorr -0.23). Four of the five losses are -$1.5 to -$51.5 on 500
+shares, i.e. cost-sized, so the read is EDGE NEAR ZERO, not signal inverted; selection effect also
+applies (~4% chance some strategy of nine opens 0-for-5). SMALLEST STEP: make the size call, which is
+Zach's own question 2 -- the evidence says hold size, and the decisive data is the next few
+LARGE-imbalance days, not the next few days. Note the 9/1 first-tick source switch (SPX -> SPY) is
+inside this window -- see [imbal source swap + spy first tick 9_1_2026]. Details: chat
+"eod_equity_algos backtest". Prior state below.
+THE GATE DATE HAS PASSED (9/1) WITH NO WORK LOGGED AND THE ITEM IS NOW OPENABLE -- the algo has been
+live since 8/18, so roughly 11 trading sessions of prod fills exist. The two questions are Zach's own:
+has prod behavior matched backtest, and does he want to size up. Note the 9/1 first-tick source switch
+(SPX index -> SPY last trade) changes what the 5s equity strategies see going forward, so a
+prod-vs-backtest comparison spanning 9/1 straddles a definition change -- see [imbal source swap + spy
+first tick 9_1_2026]. SMALLEST STEP: pull the COUNTERTREND and IMBAL_GROWS fills since
+8/18 from algo_trade_log / the 355pm_stock_script logs and put them next to the backtest's expected
+per-trade PnL. One thing to watch that is already on record: the countertrend config still lives only in
+the kernel, not in test_configs/ or configs_stock/, so a backtest comparison has to be reconstructed
+rather than re-run from a file. Note 8/31 was a month end and 355pm_stock_script did not run.
+Depends on [355pm spy equity algo 8_10_2026] (live in prod 8/18).
+------------------------------------------------------------------------------------------
+NAME: btic futures backtest + options decom 8_16_2026
+STATUS: completed
+START DATE: 2026-08-16
+END DATE: 2026-08-26
+DAY LOG: 2026-08-13, 2026-08-21, 2026-08-24, 2026-08-26
+TAKEAWAYS:
+CONCLUSION (Zach moved to completed 8/26): the refresh is done and the winning variant is the
+355 levered-rebal fill filter, NOT the 8/24 imbal gate. REBAL_FILTER_5B vs baseline on ES+BTIC:
+$585,830 / 243 traded days / Sharpe 0.23 / worst day -$56,103, against baseline $532,188 / 302
+days / Sharpe 0.10 / worst -$223,445 -- more money on 59 fewer days and the 6/09/26 tail cut by
+75%. Exported to Downloads/backtest_btic_eod_cme_rebal_filter_20260826_1347.xlsx (7 sheets, plus
+a rebal_355 column so every blocked fill is auditable). Follow-on item: [btic present to matt
+8_26_2026]. TWO CAVEATS THAT SURVIVE THE CLOSE, both raised 8/26 and both unresolved: (1) this is
+post-hoc filtering of baseline fills, not a signal re-simulation; (2) ES_SLIPPAGE $0.25/contract
+is the ONLY modeled cost -- no commissions, exchange/clearing fees, BTIC-side slippage or
+bid/ask crossing. At 15,015 baseline contracts even $2/round-turn is roughly $60k, about 11% of
+the baseline total, so add costs BEFORE any sizing decision. PnL_imm vs PnL_TWAP differ only in
+the ES hedge leg (immediate = first tick 1s after fill; TWAP = mean of 10 time-sliced ticks to
+16:00, filtered $500,849 vs $585,830). Source for both: auctionResearch.t_cme_emini_sp500.
+The 8/24 imbal-gate work is superseded, not adopted: in-sample it cut 64% of profit ($830k /
+Sharpe 0.24 -> $302k / Sharpe 0.15) and its whole advantage came from the post-June window.
+The options decom and the vbam-data-oracle upload were NOT delivered before the close -- confirm
+with Zach whether they are dropped or need a new todo line.
+BTIC options recon 7/15-8/12 complete; only two known structural gaps remain (355 rebal put
+block, month-end launcher exclusion). FUTURES BACKTEST REFRESHED 8/21 (_run_cme.py ->
+backtest_btic_eod_cme_20260821_1507.xlsx). Cum-PnL charted for IMBAL_CONTINUOUS_100 (Sep 2022
+- Aug 2026) and GIST2026. Key finding: 2026 YTD is one catastrophic day -- 6/09/26 alone
+about -223k, nearly the whole YTD loss and the driver of full-period max DD. Decided 8/21 to
+leave the ES+BTIC/futures backtest on the legacy krishna_breach_signal fill engine -- the
+blackout / rebal gate / month-end skip changes stay options-only, intentionally. Details: chat
+"BTIC".
+------------------------------------------------------------------------------------------
+NAME: eod algo review automation 8_16_2026
+STATUS: completed
+START DATE: 2026-08-16
+END DATE: 2026-09-09
+DAY LOG: 2026-08-13, 2026-08-14, 2026-08-17, 2026-08-18, 2026-08-19, 2026-08-20, 2026-08-21,
+2026-08-24, 2026-08-25, 2026-08-26, 2026-08-27, 2026-08-28, 2026-08-31, 2026-09-01, 2026-09-02,
+2026-09-03, 2026-09-04, 2026-09-08, 2026-09-09
+TAKEAWAYS:
+CONCLUSION (Zach moved to todo_completed, seen 9/10): THE LOOP IS DONE AND IT STAYS RUNNING. 24 days
+from build to close, 22 corrections, and the last hand-corrected review is still 08_25 -- every run from
+8/26 through 9/8 was accepted as sent. The system is a weekday 8:25 Claude task that builds a
+deterministic pack from prod logs, algo_trade_log, SR executions and the T+1 backtest workbooks
+(D:/agent_projects/algo_daily_review: build_review_pack.py + REVIEW_GUIDE.txt + review_corrections.txt),
+writes scratch/algos/automated_algo_reviews/<MM_DD_YYYY>.txt and pushes it to Google Chat; two 8:19
+sibling tasks build the hacker and extra-layer backtests it reconciles against. It is now the main
+source of prod evidence in these notes, so treat closing this item as "converged", NOT as "stop
+reading it". THE ONE DATED THING IT STILL CARRIES: REVIEW_GUIDE section 7 suppresses the v8 atmVol flag
+only through 9/12/26 -- the first review after that date must check the vol once and either delete the
+entry or resume flagging. WATCH ITEM 4 (the 9/9 rebal veto) is the newest section and has never seen a
+live veto day. Its best catches, for the record: the v8 SPX dislocation, the ICON stale-chain cache, the
+backtest firing on days prod sat out, the 8/27 CLOSER strike miss (+$138k of prod-vs-backtest gap), the
+hacker wave-3 1105 failure, and the 9/8 355 case where the older script sold 149 spreads 30 cents worse
+than the v8 twin on the identical option. Details: chats "Algo review", "Automated Algo Reviews",
+"ALGO LOG REVIEWER / SS Algo Edits". Prior state below.
+THE CLEAN-RUN STREAK ENDED ON 9/8 -- CORRECTION #22 LANDED, THE FIRST SINCE 8/27, so "converged, set
+the END DATE" is now premature by one data point. #22 is a content trim, not a substance error: do not
+flag stale uPrc/sprc/row_ts on legs quoted a nickel wide at or below 0.10, because smrk is
+NBBO-bounded and stays accurate there (Zach's words: "the smrk will still be accurate"). Example was
+the 9/4 350_v8 wave-2 7695P refresh off a 14:48:19 row. Corrections now 22; newest _corrected.txt is
+still 08_25. THE 9/4 REVIEW (written and sent 9/8) EARNED ITS KEEP AGAIN and produced two sizing
+candidates plus two latency flags: DUAL_IMBAL is 3 up fire days at +13,089 with no change-log entry
+since 4/9 (size-up candidate), 355 SPREAD_BUYS is 4 straight losing fire days at -3,424 with no size
+change (size-down candidate), the 350 v7 vol0dte query took 11.5s at 15:49:55 against 11-25ms on 9/2-9/3,
+and three v8 wave-1 order inserts took 3,670ms each -- exactly the three that missed W1 and filled W2.
+Prior state below.
+EIGHT CLEAN RUNS AND STILL NO END DATE -- DAY 23. Verified 9/8: review_corrections.txt holds exactly
+21 corrections and the newest _corrected.txt is still 08_25, so 8/26 through 9/3 were all accepted as
+sent. The 9/7 run correctly skipped itself on the Labor Day trade-date gate, and today's run covers
+Friday 9/4. THE LOOP HAS CONVERGED; SET THE END DATE. Prior state below.
+SEVEN CLEAN RUNS AND STILL NO END DATE -- DAY 20. Verified 9/4: review_corrections.txt still holds
+exactly 21 corrections and the newest _corrected.txt is 08_25, so 8/26 through 9/2 were all accepted
+as sent. THE LOOP HAS CONVERGED; SET THE END DATE. It also kept earning its keep: the 9/2 review
+(delivered 9/3) found the same "wave-1 edge more aggressive than it needed to be" pattern on BOTH
+books -- 640 lots at 355 and 33 at 350 all filled instantly on wave 1 at better than our own limit
+-- which is a leaving-money-on-the-table signal, not a failure, and it is the only fill-quality
+theme now appearing on consecutive days. It also caught the v8 CLOSER 0-of-89 on the 33-cents-above-
+ask sprc print. NEW CAPABILITY 9/3: the hacker backtest is wired into the daily framework -- a
+weekday 8:19 task CreateBacktestsHacker (registered and Ready) builds the workbook at the prod cap,
+and the digest gained a 355 HACKER sub-block that prints only when prod hacked or the model
+attempted one, with by-design differences named rather than flagged. First live use is today's 8:25
+review. Verified against 9/1 (4 prod rows reconcile), 9/2 (quiet) and 8/27 (correctly not a wave-3
+flag). System: D:/agent_projects/algo_daily_review. Details: chats "Algo review", "Automated Algo
+Reviews". Prior state below.
+FIVE CLEAN RUNS DEEP NOW AND STILL NO END DATE -- DAY 19. The 9/1 review was written and sent 9/2 and
+it is the loop's most valuable output yet: it caught the hacker wave-3 1105 failure (fixed same day),
+the 355 wave-1 surface dislocation that left 916 lots unfilled, and the v8 atmVol recurrence. One new
+review rule shipped 9/2: REVIEW_GUIDE section 7 now SUPPRESSES the v8 atmVol flag through 9/12/26
+because SpiderRock confirmed it as a known bug with a fix due that date -- with a deliberate carve-out
+that a v8 trade decision visibly flipping on the bad vol still gets reported. The first review after
+9/12 must check the vol once and either delete the entry or resume flagging. Corrections still 21 and
+no _corrected.txt since 08_25. THE LOOP HAS CONVERGED; SET THE END DATE. Prior state below.
+THE 8/28 RE-RUN WAS DONE ON 9/1 AND THE LOOP IS NOW FOUR CLEAN RUNS DEEP -- IT IS TIME TO SET AN END
+DATE. VBAM's 8/28 load landed, so the re-run reconciled properly: prod 8,206 vs backtest 6,120 on the
+350 put spreads, decomposing to +765 (prod's 0.45 v7 fill vs the backtest's 0.40 replay on 153 lots)
++1,340 (the 29 v8 lots the backtest does not model) -19 fees, plus the BTIC settlement (-174 / -492 on
+a 3.24-ITM short 7715P) and the stock_fast near-miss (-0.18 bps on its 1s window vs a 1.5 bps gate
+while the 5s window read +4.29). Reviews now exist through 08_31; corrections still 21, and 08_26 /
+08_27 / 08_28 / 08_31 produced NO _corrected.txt at all. Day 18, no END DATE. SET IT.
+TWO REVIEW FINDINGS WERE FIXED IN PROD ON 9/1 (see [imbal source swap + spy first tick 9_1_2026]): the
+recap-gate timeout is now derived as FILL_POLL_FIRST_WAIT + 12s (25s today) instead of a hard 15s, so
+the 8/27 and 8/31 false "FILL STATUS UNKNOWN" banners should stop; and the FAST script's flat-tick
+misses were traced to SPX-vs-SPY and the tick source switched. STILL CARRIED, unfixed: the W1-dead /
+W2-full fill pattern on both the 350 spread book and 350pm_ss_script (W2 is NBBO-clamped and takes the
+offer -- MSFT paid 1.448 on a 1.08/1.50 market); FIRST_TICK 4 down days at -4,326 with no change-log
+entry on the equity book; and the v8 atmVol / SPX gaps. Prior state below.
+THE LOOP HAS CONVERGED AND THE ONLY THING LEFT IS TO CALL IT DONE. Verified 8/31: review_corrections.txt
+still holds exactly 21 corrections, and the last two runs (08_26 and 08_27) produced NO _corrected.txt at
+all -- the 08_27 review (written 8/28) was accepted as sent. That is two clean runs after five straight
+correction days. Day 16, no END DATE. SET IT.
+The 8/27 review is also the loop's best catch yet and is where four of today's prod flags come from: v7's
+IMBAL_GROWS_CLOSER landed on its parent's 7725/7720 at 0.42 against the backtest's 7730/7725 at 1.75 on
+791 lots (+138,425), which is exactly the signature the 8/25 diagnostic log line was added to catch; the
+algo_trade_log recorded that CLOSER as 0 of 550 when it actually filled 264 (the logger's 60s window shut
+at 15:56:07 before the fills settled, so the digest verdict was wrong); 10 CLOSER spreads were bought back
+at 15:58 for a 3.50 net debit in EOD31_C42 with NO script log explaining the order; and all four stock
+algos are 3 down days in a row, -6,527 combined. System: D:/agent_projects/algo_daily_review (build_review_pack.py +
+REVIEW_GUIDE.txt + review_corrections.txt); a weekday Claude task writes
+scratch/algos/automated_algo_reviews/<MM_DD_YYYY>.txt and pushes to gchat, and Zach hand-edits
+a _corrected.txt whose diffs become numbered corrections the next run must obey.
+CONVERGENCE SIGNAL: 8/26 added #16-#20 and every one of them CUT content -- near-miss bars are
+tight and silence is the default, "don't trade because X" is not an almost-fire, agreement gets
+four words, v8 sizes that match V8_SIZE_RATIO are not a flag, 4pm_script_v3 gets a block only
+on errors. Corrected 8/25 file: 44 lines, down from 52 raw. Earlier corrections #13-#15 (8/25)
+fixed the substance: fill quality reads msgsrparentexecution not a quote snapshot, and the
+prod-vs-backtest gap must be DECOMPOSED (8/24 355: -52,360 CLOSER precedence, -14,280 loss-cap
+pro-rata, -3,018 fill prices). New capability 8/26: v8 fill quality is readable at last.
+Deliberately kept: the 350PM imbal 16.6% source disagreement and the 1.88s/1.14s slow queries.
+Still open: does the 8/11 failed live 3:55 read need an infra fix? Should the backtest model
+min_price? (Zach said NO to changing the backtest's paired-imbal source.) The v7-vs-v8 SPX
+digest self-retires 2026-09-01. Details: chats "Automated Algo Reviews", "Algo review".
+------------------------------------------------------------------------------------------
+NAME: 201 backtesting 8_14_2026
+STATUS: active
+START DATE: 2026-08-13
+END DATE: -
+DAY LOG: 2026-08-13, 2026-08-16
+TAKEAWAYS:
+Sector and market-cap cuts done: sector edges are one-year tail mirages; the only conditioner
+that survived is large-cap ($43B+), broad and repeatable (best year 2022, not an April-2025
+artifact). Details: chat "Strategy backtesting project (201)". Remaining: bloomberg
+edit/skill; write the tradable-201 takeaway (PNL candidate awaiting a go/no-go). No work
+logged since 8/16 -- idle 8 trading days, still the longest-dormant active item.
+------------------------------------------------------------------------------------------
+NAME: equity offerings 8_16_2026
+STATUS: active
+START DATE: ~2026-08-13
+END DATE: -
+DAY LOG: 2026-08-14, 2026-08-17, 2026-08-18, 2026-08-19, 2026-08-20, 2026-08-24, 2026-08-26,
+2026-08-27
+TAKEAWAYS:
+8/27: THE CORRUPT-TICK DATA BUG IS FIXED AND THE NUMBERS ARE RESTATED. rebuild_vol_normalized.py
+(equity_raises/adhoc; dry-run by default, --apply to write; prescrub backup in
+data/twap_vol_normalized_prescrub.csv) rescrubbed the uBid = uAsk = 0 snaps. AMT 2021-05-05 drops out
+of the trigger set (sd_1130 -82.07 -> -0.88, and its $2.4B size fails the >$5B test); ITT 2025-12-08
+twap930 +115.1 -> +210.6; SIVB 2023-03-09 minor. PROPOSED STRATEGY RESTATED: 60 events (was 61), net
+mean +104.8 / median +38.5 bps per event at $1M/event, 70% win, Sharpe 0.370 (was +102.1 / +36.2 /
+69% / 0.36). Finding 7 shape and conclusion unchanged; every other row moved exactly 1.0 bps, which
+is the 2 -> 3 bps cost alignment. GUARD RULE WORTH KEEPING: uPrc in OPTIONINTRADAYHIST_EQT is the
+uBid/uAsk midpoint, so screen on uBid > 0 AND uAsk > 0, never uPrc > 0. Owed: re-run sample.py after
+clear_caches() so the report matches the restated CSV.
+Decided 8/26: KEEP the hedge (unhedged +110.2 mean vs hedged +102.1, but Sharpe a wash and roughly 2x
+max event drawdown). Rejected 8/24: a was-already-down-into-the-announcement trigger (prior-day
+<= -3%: N=25, median -26.2 bps, 40% win). Presentation and all nine research facets DONE.
+THE 9/1 DEADLINE IS NOW BLOWN: the daily offerings screener has STILL no work logged and no screener
+file exists anywhere under equity_raises or agent_projects as of 9/2 (the directory holds only
+edgar_search.py, sample.py and the three offerings workbooks). Three straight days (8/28, 8/31, 9/1)
+went elsewhere. The deadline is Zach's own. Either build the minimum version -- a daily list of
+qualifying offerings off the existing trigger definition, plausibly off edgar_search.py -- or restate
+the date. This is the item where a finished study is sitting on a shelf for want of a delivery
+mechanism. Also still owed:
+reviewing the presentation follow-ups, and the re-run of sample.py after clear_caches() so the report
+matches the restated CSV. Full status:
+vbam-data-oracle/projects/equity_raises/README.md. Details: chat "Equity Offerrings".
+------------------------------------------------------------------------------------------
+NAME: levered rebal 8_16_2026
+STATUS: active
+START DATE: 2026-08-16
+END DATE: -
+DAY LOG: 2026-08-25
+TAKEAWAYS:
+STARTED 8/25 AND IT IS NOW THE STRONGEST UNRESOLVED PNL CANDIDATE ON THE LIST. Tested the 3:55pm
+projected levered-ETF rebalance as a conditioner on the six 350PM stock strategies (2023-01-03 to
+2026-08-24, 913 days, px_last-exit backtest, per-trade PnL at prod stock sizing). Trading AGAINST
+the projected flow outperforms, symmetrically at +/-$5B: BUY with rebal <= -$5B = $497/trade over
+277 trades / 75 days, 57.0% win, vs $293 baseline; SELL with rebal >= +$5B = $177 vs $99, 57.2%.
+At +/-$10B the two sides split: BUY <= -$10B jumps to $1,679/trade (95 trades, 21 days, 65.3% win,
+$159k = over a third of all buy PnL), while SELL >= +$10B collapses to $98 = the unconditional
+average (62 trades, 11 days). Conclusion Zach wrote into eod_equity_algos/README.md as NOTE
+8/24/2026: the projection is NOT a reason to stand down when the stock algos trade against the
+flow. OPEN AND UNRESOLVED: big-negative-rebal days are mechanically big down days, so this may just
+re-express market_ratio -- the two-way cut (rebal x market_type) was offered and NOT run. That cut
+is the whole go/no-go. Details: chat "EOD equity algos backtest". Related: prod already polls the
+355 rebal in BTIC_AND_IMBAL, and the options-side version of the same question was answered 8/27 --
+see [adverse rebal no-trade gate 8_28_2026]. That answer (adverse rebal costs win rate, not dollars)
+is evidence AGAINST the stand-down reading here too.
+------------------------------------------------------------------------------------------
+NAME: monthend revert strategy 8_16_2026
+STATUS: active
+START DATE: 2026-08-16
+END DATE: -
+DAY LOG: 2026-08-16, 2026-08-31, 2026-09-01
+TAKEAWAYS:
+THE 9/30 HANDOFF IS NOW BUILT (9/1) -- this is as close to wrapped as it gets without the backtest
+extension. revert_month_end/README.md opens with a START HERE box giving the trade in four sentences
+plus the two commands, and was swept of all 188 non-ASCII characters so it reads under cp1252. The
+confusing name collision is gone: month_end_reversion was git-mv'd to month_end_reversion_STALE, and
+the third directory (month_end) is a different 350pm TWAP project. Zach's own note for next month, to
+use verbatim on 9/30: "read D:/agent_projects/revert_month_end/README.md then tell me the avg imbal
+and move in bps -- do we trade today?" Running me_spread_live.py prints AVG IMBAL, the signal in bps,
+every gate and the order if it fires. THE TWO OPEN ITEMS ARE UNCHANGED: the imbalance capture rule is
+still unsettled (the two candidate rules disagreed on SIGN on 8/31, +$127M vs -$113M, and only agreed
+on the no-trade because neither came near the $2,000,000 notional gate), and the backtest still covers
+month-ends only, not all days. Settle the capture rule before 9/30 or a close day gets decided by an
+unchosen rule. Details: chat "Month End Revert". Prior state below.
+WORKED LIVE ON 8/31 AND THE ANSWER WAS NO TRADE, BUT ONE RULE IS STILL UNSETTLED. The strategy needs a
+sign match between the month-end average imbalance and the SPY signal, plus enough conviction to clear
+a notional gate. On 8/31 both inputs were near-flat: signal +12.6 bps (SPY 766.47 to 767.44) and avg
+imbal only +$127M under the tested rule, giving $39,961 of uncapped notional against the $2,000,000
+needed -- at a $127M imbalance you would need a roughly +/-631 bps signal to qualify. It fires about
+four times a year, so a non-event month-end is the expected outcome.
+THE OPEN QUESTION IS THE IMBALANCE CAPTURE RULE, and 8/31 was lucky: the two candidate rules DISAGREED
+ON SIGN (+$127M under "snaps after 15:50 need seen percentage > 0.90" versus -$113M as-is) and only
+agreed on the answer because neither came within two orders of magnitude of the gate. Settle it before
+the next month-end (2026-09-30) or a close day will be decided by an unchosen rule. The comparison is
+limited by data: the T+1 settled table only reaches 8/27, so 8/27 is the single date where a live
+capture can be checked against the settled value. Second open item unchanged: extend the backtest to an
+automated strategy on all days, not just month-ends. Details: chat "Month End Revert".
+------------------------------------------------------------------------------------------
+NAME: v8 migration duplicate scripts 8_18_2026
+STATUS: completed
+START DATE: ~2026-07
+END DATE: 2026-08-19
+DAY LOG: 2026-08-18, 2026-08-19
+TAKEAWAYS:
+CONCLUSION (Zach, 8/19): done. Duplicate 350pm_script_v8.py / 355pm_script_v8.py built (not
+in-place migration), trading V8_SIZE_RATIO=0.10 of v7 size and firing simultaneously, with a
+sizing banner logging every "N --> M" scale-down (v7 output untouched); 355 v8 can trade
+hacker; wired into run_algos.sh + test_run_algos.sh WAVES. Root cause of the 8/18 prod issue:
+v8 traded FULL additional size on the bumped layer (114 v7 @0.59 + 114 v8 @0.55 = 228 lots,
+PNL LOG "1.9x too big"). Fix: ONE "V8 RESIZING SECTION" just before the send that scales every
+trade_dict entry -- parents, outrights, closer, bumped -- plus extra_spread_trader.SIZE_RATIO
+(350pm_script_v8.py:705-727); 355 hacker trades deliberately excluded (already-scaled parents).
+Verified in prod 8/19 for the parents only (91 --> 9); bumped/closer no-traded at vol 0.103, so
+those layers are still UNPROVEN live. Context: 340PM migrated + validated 7/27; running notes
+D:/PycharmProjects/scratch/algos/migration_to_v8.txt. Follow-on: [v8 migrate more strategies
+8_19_2026].
+------------------------------------------------------------------------------------------
+NAME: v8 migrate more strategies 8_19_2026
+STATUS: completed
+START DATE: 2026-08-19
+END DATE: 2026-09-09
+DAY LOG: 2026-08-19, 2026-08-20, 2026-08-21, 2026-08-24, 2026-08-25, 2026-08-26, 2026-08-27,
+2026-08-28, 2026-09-02, 2026-09-03, 2026-09-04, 2026-09-08, 2026-09-09
+TAKEAWAYS:
+CONCLUSION (Zach moved to todo_completed, seen 9/10): CLOSED WITHOUT THE RAMP. The two [DONE] lines
+(all equity algos on v8, SR account conversion) were finished 8/24; the third line -- "scale up V8
+350pm_script and 355pm_script from 8/20 to 8/26 (be completely on v8 by then)" -- was NEVER marked
+[DONE] and V8_SIZE_RATIO is verified STILL 0.20 at 350pm_script_v8.py:64 as of 9/10. So the close means
+the RAMP GOAL WAS ABANDONED, not met: v8 stays a permanent 20%-size exploratory track rather than a
+migration path, which is consistent with the 9/3 split and with every piece of evidence since (the
+surface dislocation costing v8 fills, the atmVol bug, the slow inserts). Read it that way when a future
+chat asks whether we are "on v8". Everything except 4pm_script_v3 (reverted to v7 on 9/3) sends v8
+orders at 20% alongside full-size v7. The four v8-only features (quantity chunking, live-spot strike
+selection, smrk anchor, swapped quote table) live on under [smrk nbbo + srlive indexquote 8_31_2026]
+and [w2 nbbo anchor below sprc 8_25_2026], which is where the open questions now sit. STILL OWED and
+now orphaned by this close: helpers_v8.py is UNTRACKED in git. One good sign 9/9: the 355 v8 script's
+loss cap engaged for the first time this month (GROWS orders trimmed 339 to 331 and 791 to 774 on
+$480k of demand against a $470k cap), i.e. the risk plumbing works at v8 sizes. Prior state below.
+THERE ARE FOUR FEATURES NOW, NOT THREE, AND THE MIGRATION NOTES ARE ACTUALLY WRITTEN. Verified 9/9:
+migration_to_v8.txt carries a full 2026-09-04 entry covering F1 quantity chunking, F2 live-spot strike
+selection (srlive.msgindexquote, with a $40 gap and 2s staleness fallback), F3 smrk anchor (steps half
+the sprc-smrk gap back, only when smrk is the more aggressive side) and F4, the quote table swapped to
+sranalytics.msgliveimpliedquote. Each has a single disable flag in both v8 scripts. So the paperwork gap
+is narrower than it read on 9/8: what is STILL missing is a git commit -- helpers_v8.py remains untracked
+-- and a prod_change_logs entry (the newest is 9_3_2026.md). Zach's own todo now marks the spot-price and
+smrk-instead-of-sprc lines [Done]. Also 9/8: fill_price_review.py was taught to read the v8 twins and the
+current orchestrator log format (--v8 flag, v8 archive on 192.81.231.66:3700, account resolved from the
+log's own INSERT so BUMPED/CLOSER/HACK rows work), fixing two pre-existing bugs that silently dropped
+microsecond fill timestamps. That is the tool that makes v8-vs-v7 fill quality auditable per order.
+V8_SIZE_RATIO still 0.20. Prior state below.
+THE THREE EXPLORATORY FEATURES WENT LIVE ON 9/4 AND ONE OF THEM ALREADY CHANGED A TRADE. Built and
+harness-tested 9/4 in helpers_v8.py, flag-switched from each v8 script: F1 quantity chunking (400
+lots per order instead of v7's $27k premium chunks), F2 live-spot strike selection, F3 smrk-based
+limit anchor. All 10 harness scripts exited 0. FIRST LIVE DAY 9/4 AND TWO THINGS NEED A DECISION.
+(1) v8 sold the same 7710/7695 put spread for 0.25 where v7 got 0.40 -- F3 anchored on smrk, which
+sat below sprc, so the new pricing hands back credit on sales. (2) v8's atmVol read 0.035 against
+v7's 0.075 and FLIPPED A DECISION: v8 sold a 17-lot IMBAL_SHRINKS bumped put spread that v7 declined
+outright ("No bumped trades triggered (vol=0.075)"). That is exactly the carve-out the review's
+vol-flag suppression leaves open, and it stands until SR's 9/12/26 fix. TWO PAPERWORK GAPS:
+helpers_v8.py is UNTRACKED in git, and there is no prod_change_logs entry for 9/4. V8_SIZE_RATIO
+verified STILL 0.20 on 9/8, nine trading days past "completely on v8 by 8/26". ALSO FOUND 9/4: a v7
+355 harness order was silently rejected PossDupe (five identical 214-lot chunks in 70ms from three
+strategies sharing the test account); nothing in the send path reads spdrRejectReason, so a reject
+leaves no log line and the fill check counts it as zero filled. Prod exposure depends on whether SR's
+similarity key includes the account -- unknown. Details: chats "V8 EOD scripts exploratory features",
+"V8 code tester". Prior state below.
+THE MIGRATION SPLIT IN TWO ON 9/3 AND V8 IS NOW AN EXPLORATORY TRACK, NOT A RAMP. Everything in
+run_algos.sh is on v8 except 4pm_script_v3, which went BACK to v7 on 9/3 (see [4pm icon stale cache
+fix 8_21_2026]) -- that closes the account/session mismatch. Zach then wrote a hand-off prompt
+turning the v8 twins into a test pad for features v7 will not get: v8-only edits, shared modules
+only if v7 stays byte-identical, every change logged in migration_to_v8.txt, and he runs the tests
+himself via test_run_algos.sh. Feature 1 (quantity-based order chunking, 400 lots/order) is planned
+and unbuilt -- see [contract limit reject + v8 premium limit 8_28_2026]; Feature 2 is unstated.
+THE RAMP ITSELF STILL HAS NOT MOVED: V8_SIZE_RATIO verified STILL 0.20 on the morning of 9/4, SEVEN
+trading days past "completely on v8 by 8/26", unchanged since 8/20 and with no change-log entry for
+the 0.10 -> 0.20 bump. Restate the date or ramp it -- as written the todo line is false. And the
+9/2 review gave the strongest reason yet NOT to ramp: v8's CLOSER sent 89 lots and filled 0 on both
+waves because its 7670C printed sprc 1.628 against its own NBBO of 1.05/1.30 (33 cents above the
+ask) while v7 printed 1.013 at the same second, plus a 1,736ms warm-pool open against v7's 125ms.
+The atmVol gap stays vendor-blocked until SpiderRock's 9/12/26 fix. Running notes:
+D:/PycharmProjects/scratch/algos/migration_to_v8.txt. Details: chats "ALGO INFRA / V8 Migrate /
+SPDR monitor", "V8 EOD scripts exploratory features". Prior state below.
+TWO BIG CHANGES 9/2. (1) THE ATMVOL GAP IS EXPLAINED: SpiderRock has confirmed it as a known bug on
+their side with a fix due 9/12/26, so it is now vendor-blocked rather than a mystery -- one of the
+three v7/v8 data gaps is off the list, and the daily review stops flagging it until 9/12. It recurred
+on 9/1 (v8 0.050 vs v7 0.109 at 350, 0.038 vs 0.102 at 355) and still moves v8's regime edges and
+target price, so trade impact is still real until the fix lands. (2) 4PM_SCRIPT IS BEING PULLED BACK
+TO V7: Zach repointed the ICON accounts to v7 on the SpiderRock side on 9/2 and asked for the code
+change, which is USE_V8 = SEND_V8 = False at 4pm_script_v3.py:36-37. VERIFIED 9/3 MORNING: BOTH FLAGS
+ARE STILL True, so the script would send v8 orders into v7-facing accounts on today's 16:00 run.
+Flip them before the close. Also verified 9/3: V8_SIZE_RATIO is STILL 0.20 at 350pm_script_v8.py:60,
+six trading days past the "completely on v8 by 8/26" deadline, with no change log for the 0.10 -> 0.20
+bump. Ramp it or restate the date. 9/1 evidence on the surface gap cut both ways: v8's 350 book went
+0/53 on wave 1 off a net sprc 0.875 against v7's 0.781 and then filled everything on wave 2, but at
+355 v8 sold the 7630C at 1.12-1.13 while v7 was selling the same spread at 1.00 -- v8 better that day.
+Prior state below.
+Successor to [v8 migration duplicate scripts 8_18_2026] (350pm/355pm v8 live in
+run_algos.sh). DONE 8/24: all equity/stock algos on v8 (USE_V8 = SEND_V8 = True in
+350pm_stock_script.py etc.), and the SpiderRock account conversion Zach was chasing.
+THE RAMP DEADLINE HAS NOW PASSED AND THE RAMP NEVER MOVED: V8_SIZE_RATIO verified STILL 0.20 on
+the morning of 9/2, FIVE trading days past the deadline, at 350pm_script_v8.py:60, unchanged since
+8/20, against Zach's "completely on v8 by 8/26". Raise it or restate the date -- as written the
+todo line is now false. No prod_change_logs entry was ever written for the 0.10 -> 0.20 bump.
+NOTE the 9/1 hacker expansion added 10 more parent accounts to v8's V8_ACCOUNT_MAP with the
+fail-closed assert widened to 15 -- see [hacker max price and duration 8_28_2026].
+8/28 ADDED THREE FRESH REASONS NOT TO RAMP YET, all from that day's review: the atmVol gap is
+UNCHANGED and now measured on both books (v8 0.046 vs v7 0.099 at 350, v8 0.037 vs v7 0.100 at 355 --
+still about half, and it moved v8's regime edges from 0.05/0.07 to 0.03/0.04 and its target price from
+0.5 to 0.3); the 350PM SPXW chain refresh took 5.81 SECONDS (15:50:05.355 to 15:50:11.226), so v8
+snapped SPX 7,715.05 against v7's 7,713.71 six seconds earlier -- that one is gate delay, not a quote
+table difference; and two further SR stalls the same run (a 6.33s DUAL_IMBAL send, a 3.55s fill check),
+which also stalled 350pm_stock_script's market orders at the identical instants. The v8 recap post took
+8.26s against v7's 0.83s, the second occurrence over the 3s bar. At 355 on 8/28 the SPX gap was 1.62
+pts 61ms apart, which IS a quote-table difference. Neither book traded that day at 355.
+AND THE CASE FOR RAMPING GOT WORSE ON 8/28: the surface gap now costs FILLS, not just prices. On
+8/27 wave 1, v8 went 0-filled on IMBAL_AND_TICK (0/4), HIGH_PAIRED (0/15) and IMBAL_VS_MARKET
+(0/1) while v7 filled all three 100% -- same 7730/7745 call spread, identical NBBO 0.55/0.60 seen
+30ms apart, but v8's sprc came in 0.052 higher (0.546 vs 0.494), so v8 asked 0.48 where v7 asked
+0.43 and v7 sold at 0.45-0.46. On the put side the NBBO ITSELF differed (v8 0.60/0.70 vs v7
+0.55/0.60, 3ms apart), so that leg is a genuinely different quote, not only a surface. Separately
+v8's 355 chain refresh took 1,383ms (1,092ms of it a fresh-connection pool miss), landing at
+15:55:03.097 against v7's 15:55:01.791 -- that 1.3s is what got v8 a different put strike. Scaling
+v8 up without fixing the surface means scaling up a book that systematically misses the cheap side.
+THREE UNRESOLVED V7/V8 DATA GAPS, all able to change what v8 trades independent of sizing:
+(1) v8's 0DTE atmVol reads roughly HALF v7's every day of the parallel run (8/21: 0.0283 vs
+0.0790 at 355) off the identical puts.satm.iloc[0] line, so it is the v8 quote table, not the
+code -- it gates BUMPED; (2) v8 SPX at 3:55 runs above v7 and WIDENED to 2.99 pts on 8/24
+(v8 7,655.83 vs v7 7,652.84, row_ts 18ms apart), which moved v8's parent short call from 7655
+to 7660 -- backtest and v7 both sold 7655/7660, v8 was the outlier; (3) SR's published NBBO
+disagrees with its own fill records (see [eod algo review automation 8_16_2026]). NEW EVIDENCE 8/27
+for the ask: on the 8/26 wave-1 7680 Put, quote rows 4.9ms apart, v7 read NBBO 0.40/0.50 with sprc
+0.398 (inside its quote) while v8 read NBBO 0.40/0.45 with sprc 0.530 -- 8.5 cents ABOVE its own ask.
+Same strike, same instant, different surface. All three
+are now bundled in the open todo "get response from SpiderRock on the ATM vol and SPX price
+issues at 3:55" -- the ask is drafted, not yet answered. Caveat still open: bumped/closer v8
+layers have never traded live, so the 8/18 double-sizing fix is proven for parents only.
+Prod code path. Running notes:
+D:/PycharmProjects/scratch/algos/migration_to_v8.txt. Details: chat "ALGO INFRA / V8 Migrate
+/ SPDR monitor".
+------------------------------------------------------------------------------------------
+NAME: michael smh xlk options 8_18_2026
+STATUS: active
+START DATE: 2026-08-18
+END DATE: -
+DAY LOG: 2026-08-21
+TAKEAWAYS:
+STARTED 8/21 and the data pipeline works. Trigger set is 110 dates; only 24 (22%) had a true
+0DTE option listed, and it is Friday-dominated (20 of 24) until recently -- 2026 is already
+5-of-10 (50%) thanks to near-daily listings. DTE distribution across triggers: 0 -> 24, 1 ->
+21, 2 -> 13, 3 -> 29, 4 -> 23. OPRA quotes pull clean (9,305 rows per date); "smh_move" is
+defined as 9:30 open -> 9:35-10:00 TWAP exit, the report's Case 1 window. No PnL numbers yet
+-- next step is pricing the trade on those 24 dates and deciding whether 0DTE-only is too thin
+a sample vs allowing 1-3 DTE. Ran on the shared kernel (tag smh_imbal_options) via the
+WebSocket fallback -- the Jupyter MCP bridge was 403ing that session. Details: chat "SMH".
+Possibly related (unconfirmed): 8/18 chat "SMTC/SYNA/ONTO correlation script" (30d
+correlations 0.77-0.80 vs 0.53-0.59 over 1yr).
+------------------------------------------------------------------------------------------
+NAME: hack 350 algos at 355 on flip 8_19_2026
+STATUS: completed
+START DATE: 2026-08-19
+END DATE: ~2026-08-25
+DAY LOG: 2026-08-19, 2026-08-20, 2026-08-21
+TAKEAWAYS:
+CONCLUSION (Zach moved to todo_completed.txt, seen 8/25): hacking is worth it and is automated;
+the threshold-sensitivity line moved to completed with it, so treat that question as closed.
+STILL OWED, carried under [automate 355 hacking of bumped 8_19_2026]: the live harness test of
+the 950M gate. As of the 8/24 review the 950M hacker gate has STILL never been exercised live
+(no 350pm complex fills for it to act on).
+8/21 PROD CHANGE, NOT YET TESTED: the hacker-only 355 imbal gate was lowered from 1.0B to
+950M (+/-0.95e9) so measured snap jitter cannot cost a fire that belongs; backtest stays at
+1B deliberately. Touched 355pm_script.py:342-345/465-466, 355pm_script_v8.py:452-455/619-620,
+hacker_trades.py:24-27/264/271/304-308, README ~397, change log
+eod_option_algos/prod_change_logs/8_21_2026.md. Zach said 8/21 "I will run the Harness test
+myself today" -- confirm it happened; the check is a 355-imbal override between 0.95B and 1B
+plus TEST_HACK rows, expecting fire at 960M and skip at 940M. 8/21 was also the first live
+session with the bumped hacker targets live, but no CLOSER fills existed so nothing fired.
+NEW TODO LINE (8/20, still not started): test the sensitivity of the hack to various thresholds.
+RERUN DONE 8/19 (hacking_355_backtest.py, extended to the bumped layer; output
+Downloads/hacking_355_backtest_20260819_1510.xlsx). All three bumped strategies improve on
+the hack: IMBAL_GROWS BUMP +$69,768 (9 of 103 legs hacked), IMBAL_VS_MARKET BUMP +$24,156
+(19 of 102), IMBAL_SHRINKS BUMP +$20,315 (1 leg only) -- +$114k total on 29 hacked legs, at
+live prod bumped sizing (roughly 30-115 lots/leg), Sharpe up on all three. 8/18 alone was
++$14,553 of loss reduction (114 lots IMBAL_GROWS BUMP + 33 IMBAL_VS_MARKET BUMP; 350 imbal
++1.23B flipping to -3.11B at 355; hack out at the 15:55:03 cross cut -$2.79 to -$1.80/share)
+-- ~16% of the whole delta from one recent date. Caveats: SHRINKS is n=1; bumped legs are
+small-PnL vs parents. Script gotcha: find_config prefix-matches 5 configs for
+ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS and takes the first. 8/20 finding: where the
+backtest shows a bump day prod never had (e.g. 4/28), the cause is a credit knife-edge --
+backtest picked 7130/7115 at $0.05 (below min_price 0.3, so parents fall to 1 lot and arm the
+bumped layer) while prod picked 7135/7120 at $0.35 and sized 125, never bump-eligible; plus
+live-vs-T+1 imbal (prod read 0, backtest +1.98B). Not a bug in the new CLOSER-precedence
+filter, and prod's hacker only ever acts on real logged bumped fills. The automation half is
+DONE -- see [automate 355 hacking of bumped 8_19_2026]. Details: chat "option algos
+backtests".
+------------------------------------------------------------------------------------------
+NAME: automate 355 hacking of bumped 8_19_2026
+STATUS: completed
+START DATE: 2026-08-19
+END DATE: 2026-08-20
+DAY LOG: 2026-08-19, 2026-08-20
+TAKEAWAYS:
+CONCLUSION (Zach moved to completed 8/20): BUILT. Decision was yes-automate on the backtest
+evidence in [hack 350 algos at 355 on flip 8_19_2026] (+$114k / 29 hacked legs at live prod
+bumped sizing), at the same half-size unwind. Shipped in scratch/algos/hacker_trades.py:
+TARGET_CLOSER_NAMES renamed TARGET_NAMES + the 3 _BUMPED names (lines 61-72),
+_lookup_parent_account gained a _BUMPED branch reading BUMPED_PARENT_CONFIGS at call time
+(122-149); 355pm_script_v8.py V8_ACCOUNT_MAP gained EOD20/25/28 -> EOD60/65/68 with the
+wiring assert widened to 5 hacker accounts. Change log:
+eod_option_algos/prod_change_logs/8_20_2026.md. Dry-fire (SR/send stubbed) passed incl.
+fail-closed on an unmapped account. STILL OWED BY ZACH ("I will do the testing"): the live
+harness pass -- a bumped row in TEST_HACK in 355pm_script.py plus bash test_run_algos.sh --
+and the edited file is already live in the prod algos dir. Prod code path.
+------------------------------------------------------------------------------------------
+NAME: project presentation claude skill 8_20_2026
+STATUS: active
+START DATE: -
+END DATE: -
+DAY LOG: -
+TAKEAWAYS:
+New item, no work logged. Build a "project presentation" Claude skill as discussed with
+Michael and upload it to vbam-data-oracle. Likely precedent to reuse: the 8/19 equity-offerings
+report workflow (HTML iterate-in-browser -> 6-page PDF + Bloomberg-free sample.py + README),
+see [equity offerings 8_16_2026]. Otherwise unsure of scope -- ask Zach for details if/when
+needed.
+------------------------------------------------------------------------------------------
+NAME: qyld ndx strike expiry analysis 8_20_2026
+STATUS: completed
+START DATE: ~2026-08-19
+END DATE: 2026-08-21
+DAY LOG: 2026-08-20
+TAKEAWAYS:
+CONCLUSION (Zach, 8/21): NO-TRADE, closed out. 26 flagged days, -2.3 bps mean / 38.5% win.
+QYLD ITM-strike expiry study (qyld/qyld_analysis.py). Added the June (6/18, 29200) and July
+(7/17, 30325) expiries to LISTED and reran; neither cleared the +2% ITM flag (June prior
+close +1.61% ITM, July -4.3%), so the flagged set stayed at 26 days and results are unchanged:
+ALL flagged mean -2.27 bps / median -2.12 / 38.5% win (TWAP -0.88 / -0.61 / 42.3%). Only the
+|imbal| <= 300M bucket is positive (n=3, +6.5 bps) -- i.e. no edge where there is size. Reads
+as a no-trade unless a longer history changes it. Next listed strike to add: 8/21/2026, 28550.
+Details: chat "QYLD project and strike expiry analysis".
+------------------------------------------------------------------------------------------
+NAME: ibit etha gld opening imbalance 8_20_2026
+STATUS: completed
+START DATE: 2026-08-20
+END DATE: 2026-08-21
+DAY LOG: 2026-08-20
+TAKEAWAYS:
+CONCLUSION (Zach, 8/21): closed out -- off the list. Which way he resolved it (multi-month
+capture vs drop) was not stated; ask if it comes up again.
+One-day (8/19) NOII capture of the opening auction in IBIT / ETHA / GLD. All three were
+SELL-side and all three tiny: IBIT final 191k sh (0.6% of 33.9M ADV), GLD 4k (0.05%), ETHA
+flipped to no-imbalance. All three gapped UP and kept going (GLD +1.2%, IBIT +5.4%, ETHA +8.7%
+open-to-close), so the signal was noise-sized and directionally wrong at n=1. Two data
+defects to fix before building anything: NOII auction_price is a HHMMSSmmm timestamp (request
+<AUCTION.PRICE> explicitly), and Arca's price is int64-truncated (GLD 408 vs 408.81). Needs a
+multi-month capture to be worth anything. Details: chat "IBIT/ETHA/GLD imbalance capture".
+------------------------------------------------------------------------------------------
+NAME: 4pm icon stale cache fix 8_21_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: 2026-08-21
+END DATE: -
+DAY LOG: 2026-08-21, 2026-08-24, 2026-08-25, 2026-08-26, 2026-08-27, 2026-08-28, 2026-08-31,
+2026-09-02, 2026-09-03
+TAKEAWAYS:
+BOTH OPEN THREADS MOVED ON 9/3. (1) THE V7 REVERT IS DONE: USE_V8 = SEND_V8 = False at
+4pm_script_v3.py:36-37, flags only, v8 machinery preserved behind them, logged in
+prod_change_logs/9_3_2026.md and migration_to_v8.txt. The account/session mismatch is closed.
+(2) THE uPrcAdjResult OtherError ROWS ARE FINALLY EXPLAINED, and they were never harmless: a bad SR
+surface made the execution engine reject our Surface-class limits with "Limit Error", holding the
+fills for close to TWO MINUTES on 8/28 until the surface recovered. So the five sessions of
+"sent clean, fill unverified" have a mechanism at last. Response so far is diagnostic only:
+refresh_legs now selects and prints calcErr (v7+v8) and uPrcAdjResult (v8 only -- the column does
+not exist on the v7 table), which reaches 4pm_script_v3, both 340PM scripts, 350PM_fast and
+btic_and_imbal but NOT the four scripts that use batched_refresh_legs_deduped. THE REAL FIX IS
+NAMED AND NOT BUILT, in Zach's own comment at 4pm_script_v3.py:1340: if it recurs, add a wave 3 that
+resends with plain limit prices (orderLimittype Prc + Simple limit classes), which skips the surface
+check entirely. That is the same escalation design as [smrk nbbo + srlive indexquote 8_31_2026] --
+build it once. Details: chat "ALGO LOG REVIEWER / SS Algo Edits". Prior state below.
+9/2: THE ICON ACCOUNTS WERE REPOINTED TO V7 ON THE SPIDERROCK SIDE AND THE SCRIPT WAS NOT FLIPPED WITH
+THEM -- USE_V8 and SEND_V8 are both still True at 4pm_script_v3.py:36-37 as of 9/3 morning, so today's
+16:00 run would send v8 orders into v7-facing accounts. Flip both to False before the close; nothing
+else needs changing (the use_v8 call, the AllDay session override and the T.AGMV8.01 test swap are all
+gated on those flags, and the ICON account names are unchanged). The mismatch is new as of 9/2, so it
+does not explain the earlier unconfirmed fills -- but it would create a fresh failure today. See [v8
+migrate more strategies 8_19_2026]. Prior state below.
+FIVE SESSIONS NOW WITH NO CONFIRMED FILL (8/25 through 8/31), AND THE SEPARATE TODO THAT SUPERSEDED THIS
+THREAD WAS CLOSED ON 8/31 WITHOUT AN ANSWER -- see [icon execution error 8_31_2026]. The 8/31 run sent
+MEAN_REVERSION BUY 8 lots of 09/01 7660/7670/7710/7720 at 5.20 (trigger: 2 consecutive buy losses), MWF
+SELL 2 of 09/02 at 5.20 and REGULAR SELL 2 of 09/01 at 5.00, reported "All trades sent successfully" at
+16:00:19.857, and again carried "filled 0/8", "filled 0/2", "filled 0/2" resends and 8 uPrcAdjResult
+OtherError rows. Prior state below.
+FOUR SESSIONS NOW WITH NO CONFIRMED FILL, AND ZACH HAS OPENED A SEPARATE TODO FOR IT -- see
+[icon execution error 8_31_2026], which supersedes the fill-verification thread here. 8/28 sent MWF 2
+and REGULAR 2 lots of 8/31 7680/7690/7735/7745 at 4.95 plus WEEKLY 1 lot of 9/04 7655/7665/7780/7790
+at 5.00, all AllDay, "All trades sent successfully" at 16:00:21 -- and again with "filled 0/2",
+"filled 0/2", "filled 0/1" resend lines and 8 uPrcAdjResult OtherError rows. BIG_MOVE and
+MEAN_REVERSION skipped on triggers. Prior state below.
+BOTH TODO LINES ARE [DONE] AND THE FIX LOOKS RIGHT, BUT FILLS ARE STILL UNVERIFIED TWO SESSIONS
+RUNNING. 8/26 sent three condors clean at 16:00:20 with marketSession 'AllDay' on every
+AddReplace row and "All trades sent successfully": MEAN_REVERSION BUY 8 lots of 8/27
+7635/7645/7715/7725 at 5.30 (trigger: 4 consecutive buy losses), MWF SELL 2 lots of 8/28
+7625/7635/7735/7745 at 4.95, REGULAR SELL 2 lots of 8/27 at 5.10. BIG_MOVE and WEEKLY skipped on
+triggers. The script still exits without confirming fills, so 8/25 AND 8/26 both need a
+trade-log check -- and note MEAN_REVERSION is now BUYING into a 4-loss streak at 8 lots, which
+is exactly the streak-probability question in [icons research vol filter + streaks 8_26_2026].
+The 8/25
+session ran the fixed path: MEAN_REVERSION 8 lots @5.25 and REGULAR 2 lots @5.05 sent at
+16:00:19, marketSession 'AllDay' on both AddReplace rows, script complete 16:00:21. Note the fix
+as shipped sets _srof.V8_MARKET_SESSION = "AllDay" (4pm_script_v3.py:43), NOT PostMkt as first
+described -- AllDay was chosen so intraday TEST runs still work. The log also shows the usual
+"Resending ... filled 0/8" and "filled 0/2" lines plus 8 uPrcAdjResult OtherError rows, and this
+script exits without confirming fills, so 8/25 fills must be checked against the trade log.
+STALE-CACHE FIX IS VERIFIED AND CLOSED (two clean sessions, 8/21 and 8/24: legs stamped
+~15:00:1x CT against the live SPX, 1.99 pts vs 13.9 pts on 8/20; the review watch item was
+retired). The 8/24 bug it replaced: all three icon orders Rejected with 0 filled at 16:00:19,
+resent 16:00:20, script exited 16:00:21 with no fill, because v8 kills RegMkt orders arriving
+past 16:00 (spdr_rock_order_functions.py:63-67, V8_MARKET_SESSION default "RegMkt").
+Two manual re-runs followed and did not clean up: 16:02 filled REGULAR 2 and left MWF 2 New and
+unfilled, with an "index 0 is out of bounds" error; 16:06 re-sent MEAN_REVERSION 8, still 0
+filled. Both re-runs re-derived different strikes/sizes (MWF 6 -> 2). The two log CSVs were
+hand-repaired 8/24 to one clean 8/24 row each (MWF 7620/7630/7690/7700 size 6 @4.80; REGULAR
+7630/7640/7675/7685 size 2 @5.25). RESOLVED 8/28: Zach marked both lines [DONE] on the todo -- the 4 additional MWF ICONS were sold, and
+the 4pm_script bug fix is done (its "TEST IT TOMORROW" note means the live test is the remaining bit).
+Original stale-cache detail below.
+PROD CODE PATH, FIX SHIPPED 8/21, LIVE VERIFICATION STILL OWED. Found in the 8/20 algo review:
+4pm_script_v3 filled 0 of 55 iron-condor lots across 8/19 and 8/20 (ICON_BIG_MOVE 41 +
+ICON_REGULAR 4 on 8/20; ICON_REGULAR 2 + ICON_MWF 8 on 8/19), both waves, curCumFillQuantity 0.
+Cause: run_query_cached (4pm_script_v3.py:74) had no TTL, so the ~21-minute-old 15:39 preview
+pull was reused at 16:00 -- legs stamped 15:39 ET with uprc 7655.7 against a live SPX of
+7641.82. That stale surface also drove STRIKE SELECTION: the 2.55 spread target picked
+7625/7635 when the live put spread was worth 3.16, leaving the short put 7 points from spot on
+a 0.62% implied move. Fix: 10s TTL on the cache plus a single _run_query_cache.clear() at the
+one dangerous boundary (the preview -> execution gap); wave 2 needs none because refresh_legs
+re-prices through run_query directly. Recap + the verification script (check_leg_staleness.py)
+are in D:/agent_projects/chat_recaps/icon_stale_cache_fix/. NEXT STEP: rerun
+check_leg_staleness.py after today's 4pm run and confirm leg stamps move from ~14:3x to
+~15:00:1x CT. Details: chat "INFRA 4pm_script_v3.py".
+------------------------------------------------------------------------------------------
+NAME: 3pm 0dte big effective dates backtest 8_24_2026
+STATUS: active
+START DATE: 2026-09-10
+END DATE: -
+DAY LOG: 2026-09-10
+TAKEAWAYS:
+THE BACKTEST IS BUILT AND RUN (9/10) AND IT DOES NOT PAY -- the deadline ("prior to the week of
+9/14/26") lands today, so all that is left is the go/no-go call. large_index_flows/backtest_strangle.py
+buys a 0DTE strangle at 15:00 on 19 single-name index-flow effective dates, roughly 120 bps OTM,
+held to the close, priced off ThetaData OPRA quotes (zero-bid legs paid at 70% of ask). Result per
+event in bps of spot, one strangle per event, no notional attached: ALL 19 mean -4 bps, 26% win,
+Sharpe -0.12; the >=$10B subset (n=13) is +0.4 bps, 31% win, Sharpe 0.01; the $7-10B subset (n=6)
+is -14 bps, 17% win. So it breaks even at best on the biggest events and loses on the smaller ones,
+BEFORE slippage. The mechanical reason is strike spacing: the legs land about 165 bps OTM on
+average, so real moves like AAPL -142 bps expire worthless, and the cost varies wildly (MRVL 192
+bps against AAPL 7 bps). Cheap variants if he wants one more look before killing it: run_backtest()
+takes OTM distance, spread fraction and entry time, so an entry-time sweep or a nearest-strike
+version is a one-loop change against the cached quotes. SMALLEST STEP: call it no-trade or name the
+one variant worth testing. Details: chat "Large index flows analysis", D:/agent_projects/large_index_flows;
+memory large-index-flows-project.
+------------------------------------------------------------------------------------------
+NAME: bps threshold linear size taper 8_24_2026
+STATUS: active
+START DATE: 2026-08-24
+END DATE: -
+DAY LOG: 2026-08-24
+TAKEAWAYS:
+A THIRD MOTIVATING CASE LANDED 9/8 AND IT IS THE BEST ONE YET, WITH THE 9/15/26 DEADLINE NOW THREE
+TRADING DAYS OUT AND NOTHING BUILT. On 9/8 the 350PM live imbalance read -1.96997B against the -2.0B
+call gate -- $30M short -- so IMBAL_GROWS did not trade, while the T+1 value the backtest uses was
+-2.0434B and the backtest sold 312 lots of the 7685/7700 call spread at 0.55 for +$17,160. One
+30-million wobble on a two-billion gate, $17k of decision. Zach wrote the case onto the todo line
+himself. This is now the same argument in three places (bps vetoes, strike choice on the 8/27 SPX
+half-point, and imbalance gates), which says build ONE tapering mechanism, not three. Prior state
+below.
+New item, created off the 8/24/26 355pm work. Deadline 9/15/26: build and test a linear size
+taper to replace the binary bps vetoes (factor_spy_chg_1550_1555_lt_neg12bps / _gt_12bps).
+Motivation, measured that day: the gates bite on only 13-23 days across four years, and a
+position can hinge on a hundredth of a bp -- 2025-06-17 sat at -12.03 bps and 2025-11-13 at
+-13.99, and a sub-second SPY snap choice swung $431k between them. The sensitivity sweep
+(adhoc/bps_threshold_sensitivity_355.py) showed the exact threshold is not identifiable from
+current data, so Zach kept all five thresholds unchanged rather than refit to small N. A taper
+degrades gracefully instead of cliff-edging. Open: needs sizing logic in BOTH the backtest and
+prod with a single shared definition; not modeled out yet. Zach added a second motivating case to the
+todo line (8/27): a +/-0.50 move in SPX swung 100k of PnL that day, and his own proposed smoothing is
+"trade a little of each" -- the same taper idea applied to STRIKE choice, not only to size. Worth
+building as one mechanism. Related work same day: SPY snap
+realignment to prod (-$371k / -1.71% on suite PnL). Details in eod_355_option_algos/README.md
+sections "SPY snap alignment with prod" and "bps threshold sensitivity".
+------------------------------------------------------------------------------------------
+NAME: 355pm unit-test baseline regen 8_24_2026
+STATUS: active
+START DATE: 2026-08-24
+END DATE: -
+DAY LOG: 2026-08-24
+TAKEAWAYS:
+New item off the 8/24/26 355pm snap work. run_unit_test.py fails 5 of 10 cases, and the SAME 5
+fail on the committed pre-change code -- verified by swapping in the HEAD version of
+create_backtests.py and rerunning. So the failures predate 8/24 and the suite is currently
+protecting nothing. EXPECTED was generated 4/16/26; the strike shifts and doubled net prices
+point to an index/strike-selection change since then, not a factor change. Smallest step: rerun
+generate_unit_test_cases.py and paste the new EXPECTED in. Caveat: rebaselining bakes in whatever
+is currently true, so check the 2025-01-24 MAINTAINS case first (net 0.50 -> 1.05, strikes
+6090/6085 -> 6095/6090) before accepting. Failing cases: 2022-10-25 GROWS, 2025-01-24 MAINTAINS,
+2023-09-13 and 2026-02-17 VS_MKT_LOW_VOL, 2024-01-25 VS_MKT_NO_350. Related: the 8/24 snap
+realignment (see eod_355_option_algos/README.md) will shift results again, so regen AFTER that is
+settled. Details: chat "automated algo review / 355 snap alignment".
+------------------------------------------------------------------------------------------
+NAME: imbal grows 355 size up 8_25_2026
+STATUS: completed
+START DATE: 2026-08-25
+END DATE: 2026-08-25
+DAY LOG: 2026-08-25
+TAKEAWAYS:
+CONCLUSION (Zach, moved to completed 8/25): SIZED UP. max_size scaled_355(120) -> scaled_355(127)
+= +62 lots at max (127 x 8.9 knob), roughly 65 additional contracts / ~30k extra loss at a 0.50
+price. Premium target was NOT the binding constraint: at the old 26,700 dollar_target the crossover
+price was 2.10, and the target only binds above it -- which never happens in backtest for either
+IMBAL_GROWS or IMBAL_GROWS_CLOSER. Bumped dollar_target to scaled_355(30480) so it now binds only
+above 2.40 (deliberately widened, still never reached). CLOSER inherits both via its 0.7x, so its
+crossover moves identically. Zach explicitly DECLINED the alternative 10%-dollar-target scale-up
+(29,370 / max_size 117) because it cut max lots. Trigger evidence: from the 8/24 review,
+IMBAL_GROWS_CLOSER was 4 straight positive fire days, +314,176 total, pinned at its 748 max every
+day. Caveat carried forward: the script loss cap also binds the call side (8/24 demand $548,240 vs
+$470,000 cap, -14.3% pro-rata), so the larger max_size will often be haircut anyway. Details: chat
+"V7 algos pro rata size caps analysis".
+------------------------------------------------------------------------------------------
+NAME: closer strike selection bug 8_25_2026
+STATUS: completed
+START DATE: 2026-08-25
+END DATE: 2026-08-25
+DAY LOG: 2026-08-25, 2026-08-28
+TAKEAWAYS:
+REOPEN CANDIDATE -- THE SIGNATURE RECURRED ON 8/27 AND THE NEW LOG LINE CAUGHT IT, which is the
+condition Zach set when he closed this ("reopen only if the new log line shows the signature again").
+From the 8/27 review: the 15:55:01.791 chain refresh printed SPX 7,728.83 with a highest returned put
+strike of 7,725, so IMBAL_GROWS_CLOSER landed on its parent's 7725/7720 at a 0.42 net credit while the
+backtest sold 7730/7725 at 1.75 on 791 lots for +138,425 (idx_at_trade 7729.47) and v8 matched the
+backtest. v7 was the sole outlier, and it is -58,305 of that day's prod-vs-backtest residual. The
+open question from 8/25 is now the live decision: widen the $1 buffer or source spot from the calls
+row. Original close below.
+CONCLUSION (Zach moved to todo_completed.txt 8/25): question answered, diagnostic logging accepted
+as the response; no trading-logic change made. The open item that remains is whether to widen the
+$1 buffer or source spot from the calls row -- reopen only if the new log line shows the signature
+again. First live print was the 8/25 355 session: READ IT IN TODAY'S REVIEW.
+ROOT-CAUSED SAME DAY; diagnostic shipped, fix not. Zach's todo asks why
+ALGO_42_355PM_SPREAD_SALES_SPX_IMBAL_GROWS_CLOSER (EOD73_C42) sold 7660/7665 for 0.15 on 8/24
+instead of the lower 7655/7660, when the printed uPrc was 7655.83 and msd=-1 admits strikes down
+to 7654.83. Cause: the ITM window in the chain SQL (okey_xx >= uprc - 1,
+spdr_rock_order_functions.py) gates on each ROW's own uprc in the quote table, while the spot used
+downstream is puts.uprc[0] from a separate query ~14ms later. When the two diverge past the $1
+buffer the CLOSER silently loses its near-ATM strike and lands on its parent's spread -- and at
+0.15 credit that is below min_price 0.30, so size floors to 1 and it fills nothing. Shipped 8/25
+(logging only, no trading logic): both 355 scripts now print calls-side uprc, lowest call strike
+returned, and highest put strike returned at the 15:55:01.2 refresh, so the failure signature is
+directly observable. prod_change_logs/8_25_2026.md. NOT YET EXERCISED LIVE -- first print is
+today's 355 session. Open: whether to widen the $1 buffer or source spot from the calls row.
+Prod code path. Related: [v8 migrate more strategies 8_19_2026] (same divergence, v8 side).
+------------------------------------------------------------------------------------------
+NAME: w2 nbbo anchor below sprc 8_25_2026
+STATUS: active
+START DATE: 2026-09-04
+END DATE: -
+DAY LOG: 2026-09-04, 2026-09-08, 2026-09-09, 2026-09-10
+TAKEAWAYS:
+A FOURTH EXAMPLE, AND THIS ONE COST A WHOLE WAVE ON THE BIGGEST BOOK. From the 9/9 review (written
+9/10): the 355 v7 7640 call printed a surface price of 0.413 against its own market of 0.95/1.30 --
+half a dollar BELOW the bid -- so the call spread went out at 0.30, which was 0.40 through the printed
+bid, and 2 of 1,093 lots filled on wave 1; 3.3 seconds later that call was quoted 0.45/0.50. All 1,093
+then filled on wave 2 at 0.31-0.37. Note both waves were clamped at the 0.30 min_price floor, so edge
+aggressiveness was NOT the binding constraint -- the anchor was. The reviewer flagged it "THIS SHOULD
+BE REVIEWED". SMALLEST STEP UNCHANGED: decide whether the smrk anchor carries the one-sided rule Zach
+specified (listen to the book only when it is BELOW the surface price) and wire it on v8 at 20% size.
+Details: chat "Algo review". Prior state below.
+TWO MORE PAID EXAMPLES IN TWO SESSIONS, AND THE 9/8 ONE IS THE CLEANEST ARGUMENT YET THAT THE SMRK
+ANCHOR IS RIGHT. 9/8, 355 v7: the 7675 call's surface price printed 2.018 against its own market of
+1.20/1.45 -- 57 cents ABOVE the ask -- so the CLOSER's wave-1 limit went out at 1.29, filled 0 of 150,
+and wave 2 took 149 lots at a net 0.95; the v8 twin priced the same option in the same second at 1.172,
+sent 0.74 net and filled 29 of 29 on wave 1 at a net 1.25. v7 was 30 cents worse on 149 lots, roughly
+$4.5k, purely from the anchor. The same read also pushed v7's parent onto a strike it then could not
+price. 9/9, 355 v8: the biggest dislocation yet on the send path -- the 7640 call printed 0.514 against
+a 1.00/1.15 market, 49 cents BELOW the bid on a 0.9-second-old row, wave 1 filled 0 of 220, and the
+smrk-anchored wave 2 (limit 0.43 off smrk 0.527) went out 3 seconds later. Note smrk agreed with the
+market both times, which is the whole case for it. SMALLEST STEP UNCHANGED: decide whether the smrk
+anchor needs the one-sided rule Zach actually specified -- listen to the book only when it is BELOW the
+surface price, never above -- and wire it on v8 at 20% size. Zach added 8/27/26 and 9/1/26 to the todo
+line's example dates. Details: chats "Algo review", "ALGO LOG REVIEWER / SS Algo Edits". Prior state
+below.
+PARTLY DELIVERED 9/4 IN THE V8 TEST PAD. Feature F3 in helpers_v8.py is this line's idea in its smrk
+form: price off smrk, which is NBBO-bounded, rather than off sprc. What is NOT built is the asymmetry
+Zach actually specified -- listen to the book only when it is BELOW sprc, never above -- nor the
+escalate-to-plain-limit wave. The 9/4 evidence argues the asymmetry matters: v8 sold at 0.25 where v7
+got 0.40, which is the symmetric version handing back credit rather than rescuing a fill. SMALLEST
+STEP: decide whether the one-sided rule gates F3, and wire it on v8 before anything touches v7.
+Details: chats "V8 EOD scripts exploratory features", "V8 code tester". Prior state below.
+NO LONGER BLOCKED -- SPIDERROCK ANSWERED ON 9/3 AND THE ANSWER FORCES THIS ITEM'S DESIGN. Saurav:
+"We do not have a way to set a limit based on the smrk value. The limits are based on sprc." So
+there is no vendor-side fix; any NBBO awareness has to be ours, computed before we send. Zach's own
+stated workflow is now the spec: try the surface-offset fill, and if it does not work after a few
+seconds escalate to a plain limit order (orderLimittype Prc + Simple limit classes, which skips
+SR's surface check). That is the same wave-3 escalation named in [4pm icon stale cache fix
+8_21_2026] -- build it once and use it in three places. SMALLEST STEP: pick where it lands first;
+the v8 scripts are the obvious test pad at 20% size. Still worth respecting the original asymmetry
+in the todo: only listen to the NBBO when it is BELOW sprc, not above. Details: chat "ALGO LOG
+REVIEWER / SS Algo Edits". Prod code path. Related: [smrk nbbo + srlive indexquote 8_31_2026],
+[contract limit reject + v8 premium limit 8_28_2026]. Prior state below.
+New todo line 8/25, no work logged. Ask: make 350pm_script.py and 355pm_script.py listen to the
+NBBO on wave 2 ONLY when the NBBO is BELOW SpiderRock's sprc, not when it is above (example date
+8/21/26). This is the same proposed-not-implemented fix noted earlier (8/4, 7/23) for
+sprc-anchored spread-sale limits missing fills when the SR surface dislocates from the NBBO.
+It was blocked on a SpiderRock answer about quote latency -- and 8/25's finding that SR's
+published NBBO disagreed with its own fill records by 65-70 cents within 2.4 seconds is exactly
+that question, now with evidence. Sequence this AFTER the SR response.
+Prod code path. Related: [v8 migrate more strategies 8_19_2026], [eod algo review automation
+8_16_2026].
+------------------------------------------------------------------------------------------
+NAME: spiderrock v8 data response 8_25_2026
+STATUS: active
+START DATE: 2026-08-25
+END DATE: -
+DAY LOG: 2026-08-25, 2026-08-28, 2026-09-03
+TAKEAWAYS:
+THE THIRD PIECE OF THE ASK CAME BACK 9/3 AND IT IS A NO: SR cannot set a limit off smrk, only off
+sprc. Tally of the original three-part ask -- the sprc-vs-NBBO question is answered in practice
+(no vendor fix; the evidence example is with Saurav, who is checking whether SR still holds the
+logs), the atmVol half is answered separately as a known SR bug with a 9/12/26 fix, and the SPX
+price half has a candidate source in srlive.msgindexquote and no explicit answer. So nothing here
+is still waiting on SpiderRock in a way that blocks work -- the follow-through now lives in
+[smrk nbbo + srlive indexquote 8_31_2026] and [w2 nbbo anchor below sprc 8_25_2026]. Prior state
+below.
+PARTIALLY UNBLOCKED -- SPIDERROCK ANSWERED, AND THE REPLY IS NOW ITS OWN TODO ITEM. See
+[smrk nbbo + srlive indexquote 8_31_2026] for the verbatim reply (msgliveimpliedquoteadj is
+NBBO-bounded, srlive.msgindexquote is a live SPX feed, mlink vs srse are different API types,
+and Saurav still owes the SMRK-relative surface-adjust answer). The atmVol and SPX-price halves
+of the ask are NOT explicitly answered, but srlive.msgindexquote is a direct candidate fix for
+the SPX-price half. Resequence the gated items off the new entry rather than off this one.
+Original ask below.
+BLOCKED ON SPIDERROCK, not on Zach -- tracked, not nagged, but it gates three other items. The
+ask, drafted 8/25 with the evidence table ready to paste: why does sranalytics.msgoptionimpliedquote
+publish nbbo = 1.50 / 2.20 with sprc 0.932 at 14:55:01.222 CT on the SPXW 8/24 7655 Call, when
+srtrade_agm_2026_08_24.msgsrparentexecution shows fills 0.8s later at fillPrice 0.82-1.00 against
+fillBid 0.80-0.95 / fillAsk 0.95-1.05? The sprc was close to fair; the published NBBO was not.
+Same ask bundles the two standing v8 gaps: 0DTE atmVol reading roughly half v7's, and v8 SPX
+running 1.7-3.0 pts above v7 at 3:55. Gates: [w2 nbbo anchor below sprc 8_25_2026], the v8
+scale-up ramp, and the review's fill-quality correction.
+------------------------------------------------------------------------------------------
+NAME: extra spreads 355 variants 8_25_2026
+STATUS: completed
+START DATE: 2026-08-25
+END DATE: 2026-08-26
+DAY LOG: 2026-08-25, 2026-08-26
+TAKEAWAYS:
+CONCLUSION (Zach moved to completed 8/26): SHIPPED AND ARMED. But it has still never fired --
+8/26 3:55 had zero parent triggers ("No 355 parent spread strategies triggered", every strategy
+"No conditions met"), so the ladder had nothing to rest on. THREE THINGS OUTLIVE THE CLOSE:
+(1) EOD4_C42 HAS NEVER TRADED AN INDEX OPTION -- its only history is VXX shares, and IS_TEST
+routes to T.AGM1, so no harness run can prove SR has it provisioned for SPX MLeg. Watch the
+first live run's error prints for account rejects, or ask SR to confirm. (2) The ladder bypasses
+loss caps and position-log risk, the same module-owned pattern that caused the 8/18 bumped
+double-size: 199 contracts/side of $5-wides is roughly $99k theoretical per side, stacking on
+whatever the 350 ladder is already resting. Nothing in the script models it. (3) Fixed 8/26:
+the background send loop was missing the proven 350 module's sleep(0.3) pacing and would have
+burst 34 REPLACE INTOs (extra_spread_trader_355.py:147); 34 orders now finish ~15:55:16. Also
+8/26, the backtest's prod-ladder tripwire was softened from a hard assert to a loud print so it
+warns instead of blocking; run it with "cd /d/agent_projects/eod_355_option_algos/ && python
+limit_spread_backtest_355.py". Verified 8/26: parents are short[0]/long[1] so the ladder's long
+leg is the parent's own, dedup ordering is right, counter is thread-safe, userData1 fits.
+Ladder: 17 rungs 0.90-2.50, 199 contracts max per side, window 15:55:07-15:59:30,
+resting on the SAME $5-wide spread the parent sold; trigger parents IMBAL_GROWS and
+VS_MKT_LOW_VOL (dedup per symbol/cp/day). Backtest 2021-8/2026: $751,436, 101 fill-days, 92% day
+win rate, Sharpe 0.46, worst day -$62,770 = full-ladder max loss (7/23/26, the same worst day as
+the 350 version). That is ~1.6-1.75x the 350 ladder's $444k on half the trigger days. Rejected
+alternatives: the original 20-rung ladder (+$8k but 47 extra small-PnL days, 30% marketable-at-
+arrival vs 17%) and shifting every rung up $0.20 (-10%). Parent overlap is negligible (3 shared
+days), so both parents earn their keep. Prod: account EOD4_C42 (dormant VXX_BUY account, clean
+attribution start), wired into 355pm_script.py v7 ONLY -- no v8 version. Backtest
+(limit_spread_backtest_355.py) imports LIMIT_LEVELS_355 from the prod config with a 199-contract
+assert, so the two cannot silently drift. Pending: Zach's harness run (strikes, 17 orders/side,
+goodTillDttm 15:59:30, T.AGM1 routing, dedup, recap). Change log
+eod_option_algos/prod_change_logs/8_25_2026.md; full analysis eod_355_option_algos/README.md
+"355PM extra-spreads ladder". Prod code path. Details: chats "option algos backtests",
+"ALGO INFRA / V8 Migrate / SPDR monitor".
+------------------------------------------------------------------------------------------
+NAME: research dx80 8_26_2026
+STATUS: active
+START DATE: -
+END DATE: -
+DAY LOG: -
+TAKEAWAYS:
+New todo line (first seen 8/26), two words: "research dx80". No work logged and nothing matching
+"dx80" appears in any chat session. Unsure. Ask Zach for details if/when needed.
+------------------------------------------------------------------------------------------
+NAME: sp500 candidate vol at neg1 sns 8_26_2026
+STATUS: completed
+START DATE: 2026-08-28
+END DATE: 2026-08-31
+DAY LOG: 2026-08-28, 2026-08-31
+TAKEAWAYS:
+CONCLUSION (Zach, 8/31, verbatim on the completed line): "LOOKED WORSE". The -1 sns version loses to
+ATM, so the existing ATM convention stands and [spx candidate vol initiate 8_28_2026] is now unblocked
+on strike choice -- put the trade on at ATM. Built to answer it: sp500_adds/candidates_buying_vol_puts.py,
+a put twin of the calls script (buy -1 sns puts, ~66d, $5k vega/name, 6 timing variants) hedged with
+SHORT SPY -1 sns puts instead of ATM calls; writes cp-specific opt_store/{SYM}/{date}__Put.parquet so
+the shared calls parquets are untouched, and uses collision-safe kernel variable names (combined_put,
+clear_put_caches) after a same-morning lesson about clobbering. Documented in sp500_adds/README.md
+including the 8/31/26 ATM-looks-better finding. The put fill step is far past the MCP 60s cap and must
+run in Zach's kernel; it is resumable. Details: chat "SP500 options backtest script". Original below.
+STARTED 8/28 but only as far as finding the script -- see [spx candidate vol initiate 8_28_2026] for
+what was located (sp500_adds/candidates_buying_vol.py, 7 entry variants, vega-neutral short SPY call
+hedge) and for the fact that no current backtest output exists on disk. The -1 sns cut itself is unrun.
+New todo line (first seen 8/26): backtest the S&P 500 index-add candidate vol-buying strategy at
+-1 sns instead of 0 sns (i.e. buy the wing one standard deviation below spot rather than ATM).
+This is a re-cut of the off-cycle S&P adds work from 8/14, which used hedge_symbol "SPY",
+SNS_BAND 2.0 loaded per leg, and trade_vega 5000 per candidate -- that project was flagged as
+untracked in an earlier brief and has now surfaced as a real todo. Only the strike-selection knob
+changes; the pipeline exists. Details: chat "S&P 500 adds offcylce".
+------------------------------------------------------------------------------------------
+NAME: ai update matt + michael review share 8_25_2026
+STATUS: completed
+START DATE: 2026-08-25
+END DATE: 2026-08-25
+DAY LOG: 2026-08-25
+TAKEAWAYS:
+CONCLUSION (Zach moved to completed 8/25): done -- Matt got the AI update and Michael got the EOD
+algo review. Shared while the review was still mid-correction-loop (#15 on 8/25), so the version
+Michael saw is not final; expect follow-up questions. The three-sentence pitch used for it, worth
+reusing: a weekday 8:31 Claude task builds a deterministic review pack from prod logs,
+algo_trade_log, SR executions and the T+1 backtest workbooks, then answers six fixed questions
+(fill waves, fill quality, prod-vs-backtest reconciliation decomposed, data slowness, sprc-vs-NBBO,
+anything unusual); it has already caught the v8 SPX dislocation, the ICON stale-chain cache, and
+the backtest firing on days prod sat out; and every correction is written into a corrections file
+the next run must obey, so it converges on what Zach would check himself. Artifact:
+D:/agent_projects/algo_daily_review + scratch/algos/automated_algo_reviews/. See [eod algo review
+automation 8_16_2026].
+------------------------------------------------------------------------------------------
+NAME: btic present to matt 8_26_2026
+STATUS: active
+START DATE: 2026-08-26
+END DATE: -
+DAY LOG: 2026-08-26
+TAKEAWAYS:
+New todo item, created the moment [btic futures backtest + options decom 8_16_2026] closed:
+present the refreshed BTIC backtests to Matt off
+C:/Users/zdietz/Downloads/backtest_btic_eod_cme_rebal_filter_20260826_1347.xlsx, then answer his
+follow-ups. Headline to lead with: REBAL_FILTER_5B $585,830 / 243 days / Sharpe 0.23 / worst day
+-$56,103 vs baseline $532,188 / 302 days / Sharpe 0.10 / worst -$223,445. Two caveats he will
+find if you do not raise them first: it is post-hoc fill filtering rather than a signal
+re-simulation, and ES_SLIPPAGE $0.25/contract is the only modeled cost (no commissions or fees;
+$2/round-turn on 15,015 contracts is about $60k, roughly 11% of baseline PnL). Smallest step:
+send the workbook with those two lines stated up front.
+------------------------------------------------------------------------------------------
+NAME: 350pm single-stock ss script 8_26_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: ~2026-08-26
+END DATE: -
+DAY LOG: 2026-08-26, 2026-08-28, 2026-08-31, 2026-09-01, 2026-09-03, 2026-09-08
+TAKEAWAYS:
+THE AAPL STRIKE BUG IS FIXED -- AAPL TRADED ON 9/4. It qualified at +311M against a 311M threshold and
+the 320 Call went out: wave 1 filled 0 of 3 as a Surface/Seeker at a 0.92 limit, wave 2 took 4 of 4 at
+0.60 against a 0.60 ask for $240 of premium. So the one known way this book silently dropped a
+qualifying signal is closed. TWO THINGS REPLACE IT. (1) The W2-takes-the-offer pattern is now this
+book's signature, not an incident -- W1 dead at our own limit, W2 paying the ask, three sessions
+running. (2) The full premium was lost, making 9/4 the THIRD straight losing fire day, -10,951 across
+the three, on a strategy already judged overfit and already cut to half size on 9/3. That combination
+argues for finishing [ss backtest overfit redo 9_4_2026] rather than tuning execution here. Details:
+chats "Algo review", "ALGO LOG REVIEWER / SS Algo Edits". Prior state below.
+THE BOOK WAS SIZED DOWN 50% ON 9/3 AND THE AAPL BUG IS STILL UNFIXED. BASE_PREMIUM went 500 -> 250
+in configs_ss/ss_2_5pct_adv_350pm.py:40 because the strategy behind this script is judged overfit --
+flat backtest since 10/1/25, negative out-of-sample in both backtest and prod since 5/1/26; see [ss
+option algos backtest pull 9_1_2026] and [ss backtest overfit redo 9_4_2026]. So this live book now
+trades at half size pending a ground-up backtest redo, which is the right risk posture but means
+every remaining bug matters less in dollars and no less in signal. UNCHANGED AND STILL THE ONE KNOWN
+WAY THIS BOOK SILENTLY DROPS A QUALIFYING SIGNAL: the AAPL strike filter returns nothing (1 of 5
+signals lost on 8/31; the chain pull DOES return AAPL rows, so it is the strike filter or the premium
+target, not the listing pull). Also still open from 8/28: wave 2 is NBBO-clamped and takes the offer
+(paid 1.448 on a 1.08/1.50 market for MSFT), which is the next thing to look at once AAPL works.
+Details: chats "Test harness for algo scripts", "EOD_SS_OPTIONS backtest". Prior state below.
+9/1 WAS A NO-OP -- "No 0DTE SS options today, exiting" at 15:42:07, so the AAPL strike bug is STILL
+unfixed and still untested. It remains the one known way this live book silently drops a qualifying
+signal (1 of 5 lost on 8/31). SMALLEST STEP unchanged: find why the strike filter returns nothing for
+AAPL specifically -- the chain pull DOES return AAPL rows, so it is the strike filter or the premium
+target, not the listing pull. Prior state below.
+IT TRADED FOR REAL ON 8/31 -- FIRST LIVE POSITION, AND FOUR OF FIVE SIGNALS EXECUTED. Month end, special
+day, SPX imbal +7,798M / NDX +11,150M. Five names qualified (NVDA 162% of threshold, GOOGL 317%, AMZN
+286%, AAPL 206%, AVGO 218%); four traded. Options: AVGO filled 18/18 on W1 at $2.033; NVDA, GOOGL and
+AMZN went 0-filled on W1 and then filled IN FULL on W2 at $0.51 / $0.99 / $0.78 (67 / 36 / 47 contracts,
+about $3.4-3.7k premium each). Stock leg: LOC sells of 6,700 NVDA, 3,600 GOOGL, 4,700 AMZN, 1,800 AVGO.
+So the book is now genuinely short single names into the close, which is what makes
+[ss locate file + sp500 cands 8_31_2026] urgent rather than housekeeping.
+THE AAPL STRIKE BUG IS NOT FIXED -- it printed "no qualifying Call strike for AAPL (or GOOG fallback)"
+and was dropped, so 1 of 5 signals was lost. That is the same failure that killed NVDA and TSLA on 8/28
+(NVDA and TSLA now work; AAPL does not), so the 8/28 fix was partial. SMALLEST STEP: find why the strike
+filter returns nothing for AAPL specifically -- the chain pull DID return AAPL rows (46-row chain,
+symbols list includes AAPL), so this is the strike filter or the premium target, not the listing pull.
+Also worth noting: the W1-dead / W2-full pattern is identical to the 350 spread book on 8/28, and the
+8/28 review caught this script paying 1.448 on a 1.08/1.50 market for MSFT -- W2 is NBBO-clamped and
+takes the offer, so fill quality is the next thing to look at once AAPL works. Prior state below.
+PRE-CHECK FIX CONFIRMED 8/28, NEW BLOCKER ONE STEP LATER. The 15:22 harness run
+(test_logs/2026-08-28_152216_350pm_ss_script.txt) got clean past the widened 0DTE pre-check and
+reached strike selection, so that fix works. But both qualifying names then died there: NVDA at 236%
+of its 805M threshold and TSLA at 256% of 665M both QUALIFIED, and the script printed "no qualifying
+Call strike for NVDA (or GOOG fallback)" for each, then "No trades to send. Exiting." So the script
+has now had two consecutive sessions where signals fired and nothing could be priced. SMALLEST STEP:
+find out why strike selection returns nothing for NVDA/TSLA -- most likely the strike filter or the
+GOOG fallback path, not the listing pre-check. Related: [ss locate file + sp500 cands 8_31_2026],
+which is the other thing this script needs before it can actually short single names.
+PROD CODE PATH, LIVE, AND NOT ON THE TODO LIST. 350pm_ss_script.py runs strategy
+SS_2_5PCT_ADV_350PM into account EOD30_C42 with IS_TEST=False / SEND_TRADES=True over an
+8-name mega-cap universe (NVDA TSLA GOOGL MSFT AMZN AAPL META AVGO), sizing off per-ticker
+imbalance thresholds. 8/26 ran clean end to end and no name qualified (SPX +1,560M, NDX +373M;
+best was GOOGL at 53% of its 474M threshold), so it has produced no fills yet.
+Open work 8/26: the 0DTE listing pre-check was single-name and would exit the whole script when
+one ticker had no 0DTE listing; widened to okey_tk IN (all 8) at 350pm_ss_script.py:1224-1233 so
+it exits only when NONE of the universe has a listing. Compiles, ASCII-clean. SMALLEST STEP:
+re-run the harness and confirm it gets past the pre-check on today's listings.
+GOTCHA WORTH REMEMBERING: an earlier version of this same fix was silently overwritten at 15:39
+by a stale PyCharm buffer, and the first re-application landed in a git worktree instead of the
+real file. Reload From Disk in PyCharm before touching scratch/algos files. Details: chat "Test
+harness for algo scripts".
+------------------------------------------------------------------------------------------
+NAME: icons research vol filter + streaks 8_26_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: ~2026-08-10
+END DATE: -
+DAY LOG: 2026-08-26
+TAKEAWAYS:
+Two ICON research threads, both landed 8/26, neither on the todo list.
+(1) atmVol FILTER ON ICON_REGULAR: REJECTED and written up. It costs 13-18% of total PnL and
+blocked only 1 of the 5 worst streaks, so it buys nothing; blurb is in icons/README.md:278 under
+a new "## Research" section (the 8/4 analysis was demoted to ### under it), script
+adhoc/icon_regular_vol_filter_test.py, workbook icon_regular_vol_filter_20260810_1307.xlsx.
+Note the no-lookahead arms have a 252-row warmup, so they only diverge from baseline after
+2023-05; the static arm peeks at future vol. This one is CLOSED -- consider it a takeaway.
+(2) MEAN_REVERSION BUY-STREAK ODDS, and this one is open and live: refreshed the prod backtest
+(icons_custom_SPXW_20260826_1422.xlsx, 2022-05-16 to 2026-08-24, 246 Buy / 40 Sell / 786 SKIP).
+Longest buy streak 6 days; conditional on a streak already exceeding 2 (n=25 only), P(=3) 64%,
+P(=4) 24%, P(=5) 4%, P(=6) 8%. SKIP days break the streak (the alternative definition -- Buys
+among traded days only -- gives a longest of 26 and P(=3|>2) of 9.1%, a different question).
+Why it matters now: 8/26's live ICON_MEAN_REVERSION bought 8 lots on a 4-consecutive-loss
+trigger, so these odds are the sizing question in front of prod. Open: what decision the streak
+distribution is meant to drive. Details: chat "ICONS". Related: [4pm icon stale cache fix
+8_21_2026].
+------------------------------------------------------------------------------------------
+NAME: morning imbal vs market 8_27_2026
+STATUS: active
+START DATE: 2026-09-10
+END DATE: -
+DAY LOG: 2026-09-10
+TAKEAWAYS:
+STARTED 9/10 AND THE FIRST ANSWER IS A TIMING ONE: 9:28:01 IS TOO EARLY TO TRADE OFF, 9:29:31 IS NOT.
+Zach anchored the study on the Nasdaq opening-cross cutoffs (MOO entry closes 9:28:00, LOO entry
+closes 9:29:30, cross prints 9:30) and asked how stable the published SPY imbalance is one second
+either side of each. Over 20 random non-serial, non-month-end days from t_exchange_snaps: the
+9:28:01 number moves a MEDIAN 46% in absolute terms by 9:28:02 and flips sign on 5 of 20 days, while
+9:29:31 moves only 3.7% median (median dollar move $34.6mm versus $6.9mm). Means are garbage here --
+tiny denominators blow them up -- so read medians. One caveat worth carrying: 2025-2026 days are
+noticeably noisier at 9:29:31 (10-78%) than 2021-2024 (under 4%). NYSE cutoffs (9:29:01) were
+deliberately deferred. Nothing tested yet on the actual trade -- Matt's 8/26 setup (SPX ~30M for
+sale against NDX ~180M to buy, market rallied the first 15 minutes) is still unexamined. SMALLEST
+STEP: run the imbal-vs-market signal off the 9:29:31 snap now that the 9:28 snap is ruled out.
+Details: chat "S&P/Nasdaq morning imbalance storage". Prior state below.
+New todo line, no work logged. Two parts: build a MORNING version of the imbal-vs-market study
+(the existing work is all 3:50/3:55 close-side), and test the specific setup Matt flagged on
+8/26 -- SPX about 30M for sale against NDX about 180M to buy, and the market rallied over the
+first 15 minutes. So the hypothesis is a same-day open trade off divergent SPX/NDX opening
+imbalance. Data for the test exists: NOII opening-auction capture was already exercised in
+[ibit etha gld opening imbalance 8_20_2026], including its two gotchas (auction_price comes back
+as a HHMMSSmmm timestamp unless <AUCTION.PRICE> is requested explicitly; Arca prices are
+int64-truncated). Unsure whether Zach wants the n=1 date checked first or the full history --
+ask if it comes up.
+------------------------------------------------------------------------------------------
+NAME: nvda earnings reversion + high paired sizing 8_27_2026
+STATUS: active
+START DATE: 2026-08-27
+END DATE: -
+DAY LOG: 2026-08-27, 2026-09-09
+TAKEAWAYS:
+QUESTION (e) IS EFFECTIVELY ANSWERED, AND THE ANSWER WAS SIZE TIERS RATHER THAN A HIGHER GATE. Rather
+than raise the 21B paired-imbalance gate that 97% of 2026 days clear, HIGH_PAIRED now trades HALF SIZE
+when the recreated paired imbalance is at or below 32B (roughly the 2026 median) and full size above it,
+with the 21B gate left alone; the NDX confirmation veto was also tightened from 10% to 50% of the SPX
+imbalance, which is the "no trigger if NDX imbal too small" line on the same todo. Both are in the
+configs with the 8/27 change log, and the README now states plainly that the static gate passes ~97% of
+2026 days and that Zach is knowingly trading it. The measurement behind it: paired imbalance has grown
+about 3x since 2021, median $9.9B to $32B, so the old gate simply stopped selecting. Caveat on record --
+the NDX 50% rule was fitted on 3 losing legs (27 of 155 legs vetoed, -$24.4k avoided, Sharpe 0.31 to
+0.51), so it is a thin fit. The 350 unit test was rebaselined for it (HIGH_PAIRED case moved from
+2025-01-10 to 2025-01-28, 63/63 pass). STILL OPEN: only (a), the market-reversion-ahead-of-big-earnings
+question that started the item -- NVDA 8/26/26 as the trigger case, no work logged. Twin-day work on 9/9
+looked at 8/27 from the other side and found nothing dangerous: the VS_MARKET family is historically
+benign on days that look like it, and the prior-day-high retracement screen qualifies 8/27 but carries
+no signal (mean return to the close on retrace days about -0.1 bps). Details: chat "EOD option
+backtesting [LETF REBAL/NVDA EARNINGS]", eod_option_algos/exploratory_questions_8_27_26.md. Prior state
+below.
+THREE OF THE FIVE QUESTIONS ARE NOW ANSWERED IN ZACH'S OWN HAND ON THE TODO LINE (8/27):
+(b) days when HIGH_PAIRED is the only 350pm algo to trade -- "before 8/26/26, the performance was not
+noticeably worse", so solo-fire is not a problem; (c) selling sub-50-cent spreads at 3:50 -- "strong.
+Looks positive for nearly every algo"; (d) HIGH_PAIRED too big versus the other 350PM strategies --
+"yes, sized down 10%", already actioned. STILL OPEN: (a) is there a market reversion effect ahead of
+big earnings, NVDA 8/26/26 as the trigger case -- no work logged; and (e), added 8/27, should the
+HIGH_PAIRED threshold be raised given that 97% of 2026 days qualify. (e) is the live one: a gate that
+admits nearly every day is not a gate, and HIGH_PAIRED is already the strategy whose prod-vs-backtest
+divergence keeps recurring (prod's recreated paired imbal cleared 21B where the backtest's did not).
+Smallest step on (e): plot the 2026 distribution of paired imbal against the 21B line and pick the
+percentile Zach actually wants. Related: [eod algo review automation 8_16_2026], [350pm closer sizing
+vs parents 8_28_2026], [earnings season size down 8_28_2026].
+------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------
+NAME: 350pm closer sizing vs parents 8_28_2026
+STATUS: completed
+START DATE: 2026-09-01
+END DATE: 2026-09-03
+DAY LOG: 2026-09-01, 2026-09-02, 2026-09-03, 2026-09-04
+TAKEAWAYS:
+9/4 FOLLOW-THROUGH AFTER THE CLOSE: a further closer execution edit was committed (commit d465f31,
+touching closer_spread_trader.py, closer_strike_config.py and spdr_rock_order_functions.py) and the
+9/3 change log gained a 9/4 addendum covering the cheap-price guard's recap explanation, its
+wave-1-verified / wave-2-review-only test status, and a cosmetic forced-run banner. Caveat recorded
+in that addendum: the recap fix is NOT threaded through the v8 path. Prior state below.
+CONCLUSION (Zach moved to todo_completed, seen 9/4): NOT OVERFIT, SIZE RESTORED. IMBAL_VS_MARKET
+CLOSER ratio_to_parent went back 1.25 -> 1.4 on 9/3; the 9/1 cut was always temporary pending the
+overfit check. His reason, in his words: the upside of running the closer at the larger size beats
+the alternative of firing parent or bumped on those days -- CLOSER earned $1,165,691 on its 56 trade
+days versus $206,557 for the parent+bumped counterfactual (+$959k). The 3-losses-in-6 streak that
+prompted the cut washed out under a 5PA plus a clustering check: exact iid P = 8.3%, 6 of 51
+historical rolling windows were as bad, and under a Markov fit to the observed persistence
+(P(loss|loss) 0.30 vs P(loss|win) 0.18) it is ~12.6%, i.e. a 1-in-8 stretch; 2024 had a worse
+consecutive cluster and 2025 was the best year. Loss COUNT per year is stable (1/3/3/1/3) -- only
+dollar size grew, because sizing did. WATCH ITEM ON RECORD: effective sizing is now ~$192k target /
+597-lot max, about 20% larger than the June 1.4 because the parent's 8/27 +20% flows through
+multiplicatively; and avg loss ($127k) is 2.2x avg win ($57k) at 80.4% win (N=56), ~11pp over the
+~69% breakeven. Change log prod_change_logs/9_3_2026.md. SHIPPED THE SAME DAY, worth knowing
+separately: a CLOSER cheap-price guard (wave limit <= $0.30 caps the closer at 20 lots instead of
+~533 and forces the parent to min_size with a loud VERIFY DATA warning; 1 of 96 historical trades
+hit, -$10,640). Details: chat "EOD_OPTION_ALGOs sizing changes diagnosis". Prior state below.
+THE NUMBERS TO DECIDE ON NOW EXIST (9/2, off the fresh EOD_OPTION_ALGOS_20260902_0813 and
+closer_strike_backtest_20260902_0819 workbooks). Per trade-day, raw: IMBAL_VS_MARKET parent Sharpe
+0.40 / 92.6% win / N=338 versus its CLOSER 0.25 / 80.4% / N=56; IMBAL_GROWS parent 0.22 / 92.7% / 248
+versus its CLOSER 0.18 / 77.5% / 40. On per-trigger dollars (days under $500 magnitude excluded):
+VS_MARKET parent $28,566 mean / $29,820 median, its CLOSER $21,006 / $47,970; GROWS parent $14,134 /
+$18,720, its CLOSER $6,723 / $19,710. So the closers are worse on Sharpe and win rate but their MEDIAN
+per-trigger dollars are HIGHER than the parents' -- a fat-left-tail profile, which is a real answer to
+the "overfit" prior rather than a restatement of it. The 1.25 cut's rationale, in Zach's words: a
+response to the 8/27 loss, not confident in the sizing, down about 10% for a bit. SMALLEST STEP: decide
+whether that tail profile is acceptable at 1.25 or whether the closer ratio comes down again. Prior
+state below.
+ACTED ON 9/1 -- ONE OF THE TWO CLOSERS WAS SIZED DOWN, SO THE TODO IS PART-ANSWERED. Zach cut
+IMBAL_VS_MARKET CLOSER ratio_to_parent 1.4 -> 1.25 (closer_strike_config.py:33), a ~10.7% cut, as a
+response to that strategy's large 8/27 loss and his own "not confident in the sizing"; change log
+prod_change_logs/9_1_2026.md. IMBAL_GROWS CLOSER (0.7) untouched. Note the effective dollar size also
+carries the parent's own 8/27 +20% dollar_target increase ($114.4k -> $137.3k), which flows through
+ratio_to_parent, so this cut only partially offsets it. The stats behind it, off
+Downloads/closer_strike_backtest_20260901_0818.xlsx (per-trade, raw): IMBAL_VS_MARKET CLOSER Sharpe
+0.25 / 80.4% win / N=56; IMBAL_GROWS CLOSER 0.18 / 77.5% / N=40. ALSO FOUND 9/1: the 6/16 sizing
+change (1.0 -> 1.4 and 0.5 -> 0.7) has NO documented rationale anywhere -- no June change log exists
+-- and the closest thing is the 6/1 README entry's review trigger. His "ThINK ITS OVERFIT" prior is
+therefore still unanswered on the merits; 1.25 is a risk decision, not a backtest answer. Tool for the
+full parent-vs-closer table already exists: adhoc/combine_350pm_closer_bumped.py. Confound to respect:
+the script loss-cap pro-rata usually binds before config max_size, so compare demanded size, not
+filled. Details: chat "EOD_OPTION_ALGOs sizing changes diagnosis". Related: [nvda earnings reversion +
+high paired sizing 8_27_2026].
+------------------------------------------------------------------------------------------
+NAME: hacker max price and duration 8_28_2026
+STATUS: completed
+START DATE: 2026-08-27
+END DATE: 2026-09-03
+DAY LOG: 2026-08-27, 2026-08-31, 2026-09-01, 2026-09-02, 2026-09-03, 2026-09-04
+TAKEAWAYS:
+CONCLUSION (Zach moved to todo_completed, seen 9/4, verbatim): "Work them until 30 seconds before
+the close and the limit price is less aggressive now. Backtest supports this." So HACK_MAX_PRICE
+1.70 + wave 3 resting to the close is the settled policy. CLOSED 9/3 with the backtest brought into
+line with prod and put on a daily schedule: hacking_355_backtest.py gained --last-days N (5-day
+incremental, ~3 min) and half-size unwind is now the DEFAULT (hack_size = floor(size/2), 1-lot legs
+skipped, whole-position PnL), matching prod; --full-size restores the old model. A weekday 8:19
+Windows task CreateBacktestsHacker runs it at the prod cap (regex-read from hacker_trades.py, fails
+loudly rather than defaulting to 2.10), and the daily digest gained a 355 HACKER sub-block. Earlier
+full-size sweeps are NOT comparable (deltas roughly halve). TWO THINGS OUTLIVE THE CLOSE: the risk
+checks and TEST_HACK harness passes are still owed by Zach, and there is still NO hacker entry in
+prod_change_logs for 9/1 or 9/2, so two live prod changes remain undocumented. Also
+adhoc/hack_limit_price_sensitivity.py still models full-size/no-slippage, so its optimal-cap answer
+is stale. Details: chat "Hacker script max spread price". Prior state below.
+THE NEW WAVE 3 BROKE ON ITS FIRST LIVE DAY AND WAS FIXED 9/2. On 9/1 both v7 hackers filled fully on
+wave 2 and then threw "WAVE-3 rest FAILED ... Trying to insert a duplicate row" (SR 1105). Cause: the
+wave-3 loop cancelled ALL grouping codes, but wave-1 codes were already cancelled inside
+send_complex_two_waves and v7's GetParentNumber only treats spdrCloseReason "Closed" as done -- a
+UserCxl row still carries parentNumber, so it looked alive, got a second cancel, and the catch-all
+aborted the whole wave-3 block. On a PARTIAL-fill day that silently means the remainder never rests.
+Fix (hacker_trades.py _fire_one): wave-1 codes only have their fills read, only wave-2 codes go through
+batched_fill_check_and_cancel with terminal gating, plus two fail-safes that skip wave 3 rather than
+risk an overfill. Stub-tested on all four paths; a second latent bug (SEND_V8 imported from the wrong
+module, would have thrown on the v8 book's first partial fill) was caught the same way. Wave 3 now
+lands about 15:55:08 (3s after wave 2 plus the cancel poll). 9/1 logging verified correct on all four
+hacker rows, and v8 VS_MARKET filled 22/22 in WAVE 1 -- the first wave-1 hacker fill ever, the
+aggressive edges working. STILL OWED, unchanged and now larger: the risk checks, the TEST_HACK harness
+passes, and a prod change log entry -- there is STILL no hacker entry in prod_change_logs for either
+9/1 or 9/2, so two live prod changes are undocumented. Prior state below.
+BOTH HALVES OF THE TODO WERE ANSWERED AND SHIPPED TO PROD ON 9/1 -- AND THE PAPERWORK AND TESTING ARE
+BOTH STILL OWED. Live now in scratch/algos/hacker_trades.py: HACK_MAX_PRICE 2.00 -> 1.70 (the price
+half), a WAVE 3 that rests the unfilled remainder at exactly -1.70 with orderDuration running to
+16:00:00 (the 30-second-duration half -- it now works until the close, server-side at SR),
+TARGET_NAMES 5 -> 15 (the 10 SPX parents over $10 wide plus the 2 CLOSERs and 3 BUMPEDs; NDX
+excluded), deliberately over-aggressive edges 0.060/0.120 and 0.080/0.160, and a new
+refresh_hacker_fills() that re-logs hacker fills at ~16:00:30 so size_filled is truthful. Both 355
+scripts wired; v8 got 10 more accounts in V8_ACCOUNT_MAP with the fail-closed assert widened to 15.
+OWED BY ZACH, EXPLICITLY SPLIT TO HIM: the risk checks (worst-case debit outlay, loss-cap
+non-interaction, cancel-sweep audit), the TEST_HACK harness passes, and the prod change log entry --
+there is NO 9/1 hacker entry in prod_change_logs, so a live prod change is currently undocumented and
+untested. Backtest support for the cap: adhoc/hack_limit_price_sensitivity.py still lacks the 8/31
+slippage model (cross + max($0.20, 10%)), so its optimal-limit answer is not yet trustworthy.
+Details: chat "Hacker script max spread price". Prior state below.
+Todo line 8/28: should the hacker script use a more aggressive limit than $2, and should it work for
+longer than 30 seconds? THE PRICE HALF IS ALREADY ANSWERED AND THE ANSWER IS NO. From
+hacking_355_backtest_20260827_1042.xlsx (all 7 strategy sheets, hacked legs only), just 17 legs on 14
+days would need to pay more than $2.00, out of 129 hacked legs across 78 days -- and hacking those
+uncapped is -$1,037,179 versus holding, at live prod hacked-leg sizing. Only 3 of the 14 days are
+positive; the worst are 2025-03-07 -$291,920, 2025-11-24 -$215,380, 2024-07-24 -$214,668. So the $2.00
+cap has been quietly protective and raising it buys losses. Caveat: the backtest models UNCAPPED
+exits, so prod with the cap would not realize those numbers -- it fires a $2 limit and mostly misses.
+STILL OPEN AND UNTESTED: the 30-second duration question. Details: chat "Hacker script max spread
+price"; memory hack-max-price-over-2-backtest.
+------------------------------------------------------------------------------------------
+NAME: contract limit reject + v8 premium limit 8_28_2026
+STATUS: active
+START DATE: 2026-09-01
+END DATE: -
+DAY LOG: 2026-09-01, 2026-09-03, 2026-09-04
+TAKEAWAYS:
+THIRD LINE ON THIS TODO BLOCK, NEVER YET NOTED: "speak with Tyler about delta limit" -- no work logged
+and no session mentions it. Unsure what limit is meant; ask Zach if it does not fall out of the algo
+suite's risk checks. The other two lines are below.
+THE V8 HALF IS BUILT AND LIVE AS OF 9/4. "Get rid of premium limit for v8" shipped as V8_QTY_CHUNKING
+in helpers_v8.py -- 400 lots per order instead of the $27k premium chunker, switchable by a flag in
+each v8 script, and it ran clean in the 9/4 harness and prod. THE PRECONDITION WAS NEVER CONFIRMED:
+no one has checked with SpiderRock that v8 accounts carry no per-order premium cap, and 9/4's live
+sizes were far too small to test it. At the 0.20 ratio a 100-lot order on a $3 spread is a single
+$30k order that v7 would have split; if v8 rejects it the way v7's accounts do, the biggest days
+trade zero on both waves. SMALLEST STEP: send one deliberate above-$30k-premium order into
+T.AGMV8.01, or keep a premium belt on max_qty until SR confirms. The total-contract-limit-reject half
+is still untouched. Details: chat "V8 EOD scripts exploratory features". Prior state below.
+THE DROPPED-SIZE BUG IS FIXED IN V7 (9/3) AND THE V8 REDESIGN IS PLANNED BUT NOT BUILT. Shipped:
+trade_complex now sends up to 8 premium chunks instead of dropping everything past 4, with chunks
+5-8 decremented 1/2/3/4 lots to dodge SpiderRock's identical-repeat-order block, and only 9+ chunks
+dropped. That is the 8/27 failure fixed -- IMBAL_GROWS_CLOSER had sent 564 of 791 and dropped 227.
+Max sendable per trade is now ~8 x int($27k / (limit x 100)). Accounting is unaffected (wave-2
+remainder math recovers the shed lots); the backup module deliberately keeps the old 4-cap. Change
+log prod_change_logs/9_3_2026.md. THE V8 HALF ("get rid of premium limit for v8") IS A PLAN AWAITING
+ZACH: a new v8-only helpers_v8.py that chunks on max 400 lots per order / 8 orders instead of
+premium, installed by monkey-patching trade_complex from the v8 scripts so the shared v7 file stays
+byte-identical. FOUR OPEN QUESTIONS BLOCK IT: keep the 8-order cap, exempt the 355 hackers or not,
+patch vs an explicit hook in the shared module, and -- the real precondition -- CONFIRM WITH
+SPIDERROCK that the v8 accounts have no per-order premium cap, because one oversized order that
+rejects fills zero and is strictly worse than v7. The total-contract-limit-reject half is still
+untouched. Details: chats "V8 EOD scripts exploratory features", "EOD_OPTION_ALGOs sizing changes
+diagnosis". Prod code path. Related: [v8 migrate more strategies 8_19_2026]. Prior state below.
+THE PREMIUM LIMIT IS NOW IDENTIFIED EXACTLY AND A FIX IS SKETCHED BUT NOT BUILT (9/1). The cap is
+PREMIUM_LIMIT = 27000 at spdr_rock_order_functions.py:17 (SR hard-rejects at $30k), which chunks any
+order into int(27000 / (limit x 100)) contracts -- and then line 302 truncates to FOUR chunks and
+lines 303-304 DROP the rest. That is what produced the 9/1 355 warning: IMBAL_GROWS_CLOSER sent
+564 of 791 contracts and dropped 227. Max sendable per trade is 4 x int(27000 / (price x 100)).
+PROPOSED (roughly 15 lines, not implemented, needs Zach's go-ahead since it is in PycharmProjects):
+allow 8 chunks, routing 5-8 to an overflow account (A_A_42). The real work is the cancel path --
+send_complex_two_waves and cancel_order write a single account, so cancels must carry (gc, account)
+pairs or unmanaged orders are left live. THREE CAVEATS: it is UNVERIFIED that SR's duplicate-order
+detection is per-account (if it keys on trader/firm/legs the overflow chunks get rejected anyway --
+ask SR first); fills split across two accounts break recap/loss-cap/reconciliation attribution; and
+the file is shared, so the change hits all 350PM and 355PM scripts. The total-contract-limit-reject
+half is still untouched. Details: chat "EOD_OPTION_ALGOs sizing changes diagnosis". Prod code path.
+Related: [v8 migrate more strategies 8_19_2026].
+------------------------------------------------------------------------------------------
+NAME: earnings season size down 8_28_2026
+STATUS: active
+START DATE: -
+END DATE: -
+DAY LOG: -
+TAKEAWAYS:
+New todo line 8/28: is it worth sizing down during earnings season, defined as the day of any big-tech
+name's earnings or the following day? No work logged. Answerable off the existing 350/355 backtest
+workbooks with an earnings-day flag; the big-tech universe is already coded (NVDA TSLA GOOGL MSFT AMZN
+AAPL META AVGO in 350pm_ss_script.py). Report the flagged-day denominator -- the sample will be thin.
+Trigger case is NVDA 8/26/26, the same one behind [nvda earnings reversion + high paired sizing
+8_27_2026].
+------------------------------------------------------------------------------------------
+NAME: adverse rebal no-trade gate 8_28_2026
+STATUS: completed
+START DATE: 2026-08-27
+END DATE: 2026-09-09
+DAY LOG: 2026-08-27, 2026-08-28, 2026-09-09
+TAKEAWAYS:
+CONCLUSION (Zach moved to todo_completed 9/9, verbatim): "The below questions were all researched on
+9/9/26. The only change to prod was that IMBAL_GROWS bumped and CLOSER variants now do not trade if the
+predicted leveraged ETF rebalance at 3:55 pm is more than 5 billion in an adverse direction to the
+credit spread." So the broad no-trade veto was REJECTED (the 8/28 size-weighted redo below killed it)
+and only the narrow tail-control version shipped. LIVE IN PROD 9/9 -- new module
+scratch/algos/rebal_veto.py, wired into 350PM_script.py and 350pm_script_v8.py plus the closer and
+bumped trader modules; change log prod_change_logs/9_9_2026.md. PROD THRESHOLD IS 4.5B, NOT 5B (a
+deliberate buffer, strict inequality); both backtest mirrors model 5.0B, so a (4.5, 5.0] day will
+legitimately disagree. Basis: 19 historical legs cut for a net +$35.4k (bumped -$89.0k of losses
+removed, closer +$53.7k of profit given up), at live prod closer/bumped sizing -- tail control on two
+low-contribution layers, not a PnL trade. Plumbing: btic_and_imbal_script's existing 15:49:00 rebal
+poll now upserts levered_rebal_355_daily.csv and the 350 scripts read it at 15:49:55, inside the
+pre-3:50 wait, so no new work on the critical path; unreadable value FAILS OPEN with a loud banner.
+Review side is wired too (build_review_pack section_rebal_veto + REVIEW_GUIDE WATCH ITEM 4). TWO THINGS
+OUTLIVE THE CLOSE: the veto has NEVER FIRED LIVE (9/9's projection was only -0.49B, well inside the
+bar), and on 9/9 the CSV read landed at 15:50:05 before Zach moved it to 15:49:55 that evening -- so
+today is the first session running the intended timing. Also still unanswered from the original ask:
+the $7B sanity check on 8/27. Details: chats "EOD option backtesting [LETF REBAL/NVDA EARNINGS]",
+"ALGO INFRA / V8 Migrate / SPDR monitor"; eod_option_algos/exploratory_questions_8_27_26.md. Prior
+state below.
+THE 8/28 SIZE-WEIGHTED REDO KILLS THE VETO OUTRIGHT -- weight by contracts actually traded and the
+adverse "problem" disappears. Adverse >$5B: 497 legs / 166 days / 84,887 contracts, $53.2 weighted
+mean PnL per spread against neutral's $45.2, 85.9% win. Adverse >$10B: $60.9 vs neutral $46.6, 89.0%
+win, and aligned >$10B is the best bucket of all at $78.9. Even the marginal 5-10B adverse band is
+$49.4 vs $45.2. So adverse-rebal days lose MORE OFTEN (about 7pp of win rate) but collect enough
+extra premium at the sizes actually traded to more than pay for it. Contract-weighting RAISED the
+adverse mean from $31.9 to $49.4 because the 300-600 lot IMBAL_VS_MARKET legs perform well there and
+1-lot noise legs were dragging the unweighted view. Two facts to carry: the book is structurally
+short into this flow (adverse days carry 5.4-5.7x the contracts of aligned days; 84,887 of 188,846
+contracts ever traded went out on adverse >$5B days), and 8/27 alone costs the 5-10B adverse bucket
+$5.7 per spread. Tool built for it: adhoc/combine_350pm_closer_bumped.py, which merges the regular /
+CLOSER / bumped workbooks into one per-leg frame respecting prod's CLOSER-precedence and live-bumped
+rules -- reuse it for [350pm closer sizing vs parents 8_28_2026]. Original three asks below.
+Three asks (todo 8/28): was the 8/27/26 rebalance calc right at only $7B when NVDA was +8.5%; would
+3:50 spread sales benefit from a no-trade when more than $5B rebalances in an adverse direction; and
+the same question for the 350PM equity algos. THE SPREAD-SALE HALF WAS ANSWERED 8/27 AND IT IS A NO.
+Across 633 traded days, adverse rebal costs win rate but not money: the $5-10B adverse band runs 86.6%
+win (versus roughly 94% on quiet days) yet earns +$1,974,991 pooled, and >$10B days are fine at 90%+
+win. IMBAL_VS_MARKET alone earns $1,449,552 in that band on 101 of its 250 days -- it structurally
+sells into these moves and the richer credits pay -- so no veto is warranted on it. Ex-VS_MARKET the
+band is +$525k across 13 algos, with only IMBAL_SHRINKS (-$13,428), IMBAL_GROWS_SML (-$11,625) and
+DUAL_IMBAL (70.6% win) negative. Any build should be a small size haircut on 5-10B adverse days for
+the weak algos, not a no-trade -- and the size-weighted redo above argues against even that. Not a
+factor in the 8/26 HIGH_PAIRED loss: that day's 3:55 projection was only +$1.08B. Caveat: projection
+history starts 2023-01. STILL OPEN: the $7B sanity check on 8/27; the equity-algo version; and two
+lines Zach added 8/28 -- find similar days to 8/27 where IMBAL_VS_MARKET traded and the market was
+strong into the close despite a large selling balance, and test whether 8/27 happened because we were
+retracing the prior day's highs. Details: chat "EOD option backtesting analysis". Related: [levered
+rebal 8_16_2026].
+------------------------------------------------------------------------------------------
+NAME: spx candidate vol initiate 8_28_2026
+STATUS: completed
+START DATE: 2026-08-28
+END DATE: ~2026-09-02
+DAY LOG: 2026-08-28, 2026-09-02, 2026-09-04
+TAKEAWAYS:
+9/4 WAS THE RAMP DATE AND THERE IS EVIDENCE OF WORK BUT NOT OF THE FILL: index_adds/
+current_adds_9_4_26.ipynb was built that day, which is the candidate list this position trades off.
+Whether the book actually reached the 25k vega SOD target (up to 40k midday) is unconfirmed in any
+session -- ask, since his own sizing note was "if i lose 1 vega on this, I wipe YTD PNL". Prior state
+below.
+CONCLUSION (Zach moved to todo_completed, seen 9/3): THE TRADE IS ON, at ATM strikes per the -1 sns
+study. His own completed line: 2,500 vega on as of 9/2, target a 25k vega swap by start of day Friday
+(9/4) and up to 40k midday Friday, sized slightly smaller because "if i lose 1 vega on this, I wipe YTD
+PNL". So the item is closed but the RAMP IS LIVE AND DATED -- 2,500 of 25,000 vega with one day to go.
+That sizing caveat is the risk to watch, not the entry. Prior state below.
+UNBLOCKED, PRICED, AND STILL NOT INITIATED -- 3 TRADING DAYS PAST THE 8/28 DEADLINE. The strike
+question is settled ([sp500 candidate vol at neg1 sns 8_26_2026] closed 8/31 with "LOOKED WORSE", so
+ATM stands) AND the numbers now exist: Downloads/buy_sp500_candidate_vol_vega_flat_20260831.xlsx plus
+the put twin (buy_sp500_candidate_put_vol_vega_flat_20260831.xlsx) were both written 8/31, alongside
+sp500_announcement_monday_morning_trades_20260831_1400.xlsx. So nothing is missing except the
+decision. This is the clearest "one step from done" item on the list: put the ATM position on at
+trade_vega 5000 per candidate against the vega-neutral short SPY call hedge, or move the date. Prior
+state below.
+THE 8/28 DEADLINE PASSED AND THE TRADE DOES NOT LOOK INITIATED. Work logged 8/28 was locating the
+tooling, not trading: the script is sp500_adds/candidates_buying_vol.py -- buys roughly 66-day ATM
+calls on S&P 500 add candidates against a vega-neutral short SPY call hedge, across 7 entry-timing
+and tenor variants (day-of, T-1, T-3, T-5, hold-through-Monday, closer-dated) -- and the older
+spreadsheet version is in Dropbox at "Transferred from old C Drive/exceldocs DEPRECATED/buying sp500
+candidate vol/buy_sp500_candidate_vol_20260302.xlsx" plus three same-day variants (_top_from_last,
+_vega_flat, _top_from_last_vega_flat). NOTHING FRESH WAS RUN: no buy_sp500_candidate_vol_*.xlsx
+survives anywhere on disk, the README's per-cycle results stop at the 2025-12-05 cycle, and the
+newest sp500 file on disk is the EQUITY basket backtest
+(Downloads/sp500_candidate_basket_backtest_20260731_1217.xlsx), a different script. So the todo is
+overdue with no current numbers behind it. STILL TRUE: it sits on top of [sp500 candidate vol at
+neg1 sns 8_26_2026] -- settle the 0-sns vs -1-sns strike convention before putting size on, or the
+position goes on at the old strike. Prior pipeline context: hedge_symbol "SPY", SNS_BAND 2.0 per leg,
+trade_vega 5000 per candidate. Details: chats "SP500 options backtest script", "S&P 500 adds offcylce".
+------------------------------------------------------------------------------------------
+NAME: 355pm month end trading 8_28_2026
+STATUS: completed
+START DATE: 2026-08-31
+END DATE: ~2026-09-02
+DAY LOG: 2026-08-31, 2026-09-02
+TAKEAWAYS:
+CONCLUSION (Zach moved to todo_completed, seen 9/3, verbatim): "Finished this analysis. Notes in
+month-end sizing Excel. Decided to run trade until end of year." So the 10% month-end policy stands
+through 2026 and is a risk decision by choice -- the backtest still excludes month-ends entirely
+(apply_config skips every is_month_end row), so there is no number behind the 10%. Revisit at year end.
+Prior state below.
+THE POLICY IS ALREADY SETTLED AND WAS EXERCISED LIVE ON 8/31 -- the open question is narrower than the
+todo line reads. Prod trades month-ends at 10% size with 8 configs opted in (FLIPS, GROWS,
+GROWS_CLOSER, MAINTAINS, MAINTAINS_CLOSER, VS_MKT_LOW_VOL, VS_MKT_LOW_VOL_CLOSER, VS_MKT_NO_350) and 2
+dropped (SPREAD_BUYS_SPX, IMBAL_GROWS_SML -- the latter excluded 8/4 on a single thin data point).
+8/31 log line 12 confirms: "MONTH END RUN at 10% size. Trading 8 configs; dropped 2". No parent
+triggered, so nothing traded and the 10% path is still unproven live.
+SHIPPED 8/31: the extra-spreads ladder had NO month-end awareness and would have rested its full
+199-contract ladder against 10%-sized parents. extra_spread_trader_355.py now scales each rung by
+MONTHEND_SIZE_MULT_355 = 0.10 (defined in extra_spread_config_355.py to dodge a circular import),
+max(1, round(...)) per rung, about 22 contracts/side, with a "MONTH END: ladder rungs scaled to 10%"
+recap line as the receipt (only printed when orders actually send). README decisions-log entry 8/31/26.
+THE REAL OPEN ITEM: the BACKTEST still excludes month-ends entirely -- apply_config skips every
+is_month_end row unless a config carries month_end_only, ignores allowed_on_month_end, applies no size
+multiplier. So prod and backtest disagree on month-ends and there is no number behind the 10%. Closing
+this todo honestly means either backtesting month-ends or accepting the 10% as a pure risk decision.
+Details: chat "Month-end 355 options backtesting", eod_355_option_algos/README.md. Original ask below.
+New todo line 8/28: should the 3:55pm algos trade on month end at all? TIMING MATTERS -- the next
+month end is Monday 2026-08-31, so this wants an answer today or first thing Monday. Answerable off
+the existing 355 backtest workbooks using calendar_utils.is_month_end: per-strategy PnL and win rate
+on month-end days versus the rest, quoting the month-end denominator because the sample is thin
+(roughly 12 days a year). Precedent already in the book: the BTIC options work carries a deliberate
+month-end launcher exclusion, see [btic futures backtest + options decom 8_16_2026]. Related:
+[monthend revert strategy 8_16_2026].
+------------------------------------------------------------------------------------------
+NAME: ndx versions of 350 355 algos 8_28_2026
+STATUS: active
+START DATE: -
+END DATE: -
+DAY LOG: -
+TAKEAWAYS:
+New todo line 8/28: build 350pm and 355pm NDX versions of the best algos. No work logged. This is a
+universe extension of the existing SPX suites rather than new research -- NDXP is already a live
+symbol in the order path (spdr_rock_order_functions gates secKey_ts on it) and the qqq_* imbal columns
+are already pulled alongside the spy_* ones. Unsure which algos Zach counts as "best" -- ask if it
+does not fall out of the backtest workbooks. Sizeable PNL-expansion candidate: it multiplies an
+already-proven suite rather than adding a new signal.
+------------------------------------------------------------------------------------------
+NAME: cancel poll timeout bump 8_27_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: 2026-08-27
+END DATE: -
+DAY LOG: 2026-08-27
+TAKEAWAYS:
+PROD CODE PATH, SHIPPED 8/27, NOT YET EXERCISED LIVE. _CANCEL_POLL_TIMEOUT_S raised 1.00 -> 1.50 at
+spdr_rock_order_functions.py:522, with a dated comment recording the evidence. Cause: on gc=636 the
+cancel-confirmation poll missed by only 30-50ms. SR took about 780ms to move a partially-filled 2-leg
+parent to Closed (UserCxl) after our cancel INSERT committed, plus at least 240ms of publish lag
+before that Closed row was queryable -- our own polls were 5-17ms and never the problem. First miss in
+44 runs, and the same run's other cancels confirmed in under 100ms, so this is SR tail latency on the
+hardest case (partial fill with working residuals), not a systemic slowdown. Position impact was
+bounded: wave 1 finished at 27 of 72, so wave 2 could only underfill -- no overfill, nothing to
+flatten. Covers every orchestrate_batched_send caller (350PM and 355PM). WORTH KNOWING: the 350PM
+FAST, hacker and 340PM paths use legacy send functions with NO cancel-confirmation protection at all,
+so this knob does nothing for them. Details: chat "Test harness for algo scripts".
+------------------------------------------------------------------------------------------
+NAME: snowflake 0dte cache cutover 8_27_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: 2026-08-27
+END DATE: -
+DAY LOG: 2026-08-27, 2026-09-08
+TAKEAWAYS:
+9/8 TRACED A SECOND, BIGGER CONSEQUENCE OF THIS CUTOVER: THE BACKTEST'S atmVol IS NOW V8 DATA. The
+options cache moved from SpiderRock's liberator API to their Snowflake share (V8_US.OPTIONINTRADAYHIST_EQT)
+on 8/26, and that is exactly when backtest atmVol dropped to v8 levels. Sources side by side: v7 prod
+reads sranalytics.msgoptionimpliedquote.satm at 15:49:55, v8 prod reads sranalytics.msgliveimpliedquoteadj.satm,
+and the backtest reads t_historical_options_snaps.atmVol filled from Snowflake. So the standing "v8 vol is
+half v7's" gap now means the BACKTEST agrees with v8 and disagrees with live v7 -- which reframes every
+prod-vs-backtest vol-gated difference after 8/26 (bumped layers especially, e.g. 9/4 IMBAL_SHRINKS_BUMPED
+where v8 and the backtest both entered and v7 did not). Wait for SR's 9/12 vol fix before drawing
+conclusions, then re-check. Details: chat "Zero-day ATM vol comparison across scripts". Prior state below.
+A DATA-PIPELINE CHANGE THAT CAN SILENTLY MOVE BACKTEST RESULTS. On 8/27/2026 update_data.py Step 1
+(the daily 0DTE options cache) switched from the SpiderRock liberator subprocess to Snowflake. The
+cached rows are NOT identical across the cutover: raw collection-time grid instead of the old 5-minute
+grid (15:56:0x), session bounds 09:00-16:55 instead of 09:30-16:15:30, index tte 0.583 instead of
+0.107. Documented in eod_option_algos/README.md (the Step 1 row plus Dependencies, which now name
+snowflake_helpers with cache_data_with_liberator.py demoted to manual fallback) and in the
+data-sources skill in three places, including an explicit grid-shift warning. WATCH FOR IT in any
+study whose window spans 8/27/2026 -- results either side of that date are not strictly comparable.
+Details: chat "option algos backtests [DEPR]".
+------------------------------------------------------------------------------------------
+NAME: smrk nbbo + srlive indexquote 8_31_2026
+STATUS: active
+START DATE: 2026-08-28
+END DATE: -
+DAY LOG: 2026-08-28, 2026-08-31, 2026-09-02, 2026-09-03, 2026-09-04, 2026-09-08, 2026-09-09,
+2026-09-10
+TAKEAWAYS:
+MONITORING DAY 1 (9/10) WAS CLEAN AND THE WINDOW CLOSES 9/12, SO TODAY IS THE LAST SESSION BEFORE THE
+KEEP-OR-REVERT CALL. Zach checked the 9/10 v8 logs himself: no slowness anywhere (every gap over 2.5s
+is a scheduled gate), no errors or rejects, and surface alignment was GOOD -- 350 v8 wave 1 saw the
+7585 put at 0.363 inside a 0.35/0.45 market and the 7590 put 2.5 cents under the bid, 355 v8 saw the
+7595 call at 1.156 inside 1.15/1.30. That is the opposite of 9/9. One normal escalation: 355 v8
+IMBAL_FLIPS filled 0 of 71 on wave 1, the underfill add-on fired, wave 2 went out on time. No fill
+probes ran on the stock scripts (no trades), so the 9/8 parentbrkrstate stall could not recur.
+SMALLEST STEP: with three clean-ish sessions in hand, make the keep-or-revert call on F2/F3 by 9/12
+rather than letting the window lapse. Details: chat "ALGO LOG REVIEWER / SS Algo Edits". Prior state
+below.
+THE TODO BLOCK WAS REWRITTEN 9/9 WITH A DATED MONITORING WINDOW AND A NEW PRICE-SOURCE ASK. All three
+original lines are marked [Done]. The two new lines: (1) monitor the 350 and 355 v8 logs UNTIL 9/12 to
+confirm the new pricing and strike-selection behaviour is working, which makes this the only item on the
+list with a live observation deadline this week -- three sessions to decide keep or revert; (2) look at
+changing the SPX price source again, this time to srlive.msgStockBookQuote for SPX, where per Zach's own
+note the EQT/IDX row is the raw index quote and the EQT/NMS row is the implied forecast. Nothing is built
+for (2) and he explicitly said it was exploratory, stand by.
+ONE NEW PROD RISK FOUND 9/9 AND NOT FIXED: the live-spot query the v8 scripts now use has NO TIMEOUT. A
+midday sampling run saw one srlive index query hang for about two minutes before returning a fresh row,
+so the feed was healthy (it republishes once a second) and the QUERY itself stalled -- the same failure
+as the 3.76-second spot query at 3:50 on 9/4, an order of magnitude worse. At the real 3:50 gate that
+blocks the entire send until SpiderRock answers. The fix is small and already specified: a hard ~0.5s
+timeout on the spot future in fetch_v8_chains, falling back to the existing quote-table path with a
+warning, plus printing the two row timestamps being compared so the log proves the fallback next time.
+Zach said stand by, so it needs one word from him. Details: chat "V8 EOD scripts exploratory features".
+Prior state below.
+BOTH HALVES OF THIS LINE ARE NOW BUILT AND ZACH MARKED THEM [Done] -- the srlive.msgindexquote spot read
+is F2 and the smrk anchor is F3, both live in the v8 scripts, with F4 additionally swapping the quote
+table to sranalytics.msgliveimpliedquote. First cost of F2 showed up in the 9/4 review: the spot SELECT
+took 3.759s against a 0.019s chain pull, though that call goes down the legacy fresh-connection path so
+slow connect cannot be ruled out. WHAT IS STILL OPEN IS THE ONE QUESTION THAT MATTERS: on sales the smrk
+anchor gives up credit (0.25 versus v7's 0.40 on the same spread), so decide whether F3 needs the
+one-sided rule -- listen to the book only when it is BELOW sprc -- see [w2 nbbo anchor below sprc
+8_25_2026]. The escalate-to-plain-limit wave is still unbuilt. Answer it on v8 at 20% size before this
+goes near v7. Prior state below.
+THE TEST PAD IS BUILT -- F2 AND F3 WENT LIVE IN THE V8 SCRIPTS ON 9/4. F2 takes spot from the live
+quote table for strike selection (harness: spot within 0.18 of uPrc, no strike shift). F3 anchors the
+order limit on smrk instead of sprc, stepping partway back toward sprc when the two diverge. First
+live prints 9/4 behaved as designed on the buy side -- the 355 debit buy anchored on smrk and the
+sale spreads fell back to v7 pricing where smrk was less aggressive -- but the 350 book still sold
+0.25 where v7 sold 0.40, so on sales the new anchor gives up credit. THAT IS THE OPEN QUESTION NOW:
+is cheaper-but-fills the trade we want, or does F3 need the one-sided rule (listen only when the book
+is below sprc)? Answer it on v8 at 20% size before this idea goes anywhere near v7. Still unbuilt:
+the srlive.msgindexquote spot read and the escalate-to-plain-limit wave. Details: chats "V8 EOD
+scripts exploratory features", "V8 code tester". Prior state below.
+SAURAV ANSWERED ON 9/3 AND THE ANSWER IS NO: "We do not have a way to set a limit based on the smrk
+value. The limits are based on sprc." So half the todo line is closed -- a surface-adjust order
+CANNOT be pegged to SMRK, and reading smrk to compute our OWN plain limit is the only route left.
+Zach stated the target design in the same exchange: aim for the surface-offset fill, and if it does
+not work after a few seconds, escalate to a simple limit order -- pinning to smrk was only ever
+meant to make that fallback rarer. Saurav's own framing is worth noting: he says a surface outside
+NBBO indicates a bad fit and should land in a risk hold, which is exactly what did NOT happen to us.
+Zach sent him the polished evidence (8/28 14:50:05.206 CT, SPXW 7705 Put sprc 0.480 against SR's own
+0.60/0.70, fresh row, no risk hold, account EOD10_C42; the 7690 Put still below bid 3s later at the
+W2 refresh), and Saurav is checking whether SR still holds the logs. SMALLEST STEP: build the
+escalate-to-simple-limit wave on the v8 scripts (Feature 2 of the v8 exploratory track is the
+natural home) and separately wire the srlive.msgindexquote spot read. The cost of not fixing this
+keeps compounding -- on 9/2 v8's CLOSER went 0 of 89 because its 7670C printed sprc 1.628 against
+its own 1.05/1.30 NBBO while v7 printed 1.013 at the same second. Details: chat "ALGO LOG REVIEWER /
+SS Algo Edits". Prior state below.
+ZACH TURNED THE SPIDERROCK REPLY INTO A CONCRETE TEST PLAN ON 9/2, AND THE 9/1 REVIEW GAVE IT THE
+BIGGEST COST NUMBER YET. New todo lines: use the V8 scripts as the test pad for (a) taking spot price
+from the table SR pointed at (srlive.msgindexquote) and (b) anchoring the limit to SMRK instead of
+sprc, using 9/2 as the worked example. That is exactly the right sequencing -- v8 is 20% size, so a
+bad anchor costs little while it is proven. WHY IT IS NOW THE HIGHEST-VALUE PROD FIX ON THE LIST: on
+9/1 the 355 wave 1 went 0 of 1,080 lots because the 7630 call's sprc printed 1.111 against its own
+NBBO of 0.85/1.00, putting the 0.84 net limit 0.19 ABOVE the cross; wave 2 recovered only 164 lots and
+916 went unfilled. The review's own verdict is that this is not an edge-target problem. SMALLEST STEP:
+send the polished 8/28 evidence example to Saurav (still owed on the SMRK-relative surface-adjust
+question), and in parallel wire the smrk read into the v8 scripts. Prior state below.
+THE EVIDENCE EXAMPLE FOR SPIDERROCK WAS WRITTEN AND POLISHED 8/31 AND IS READY TO SEND. Zach iterated it
+to a three-sentence copy-pasteable form naming v7 and the exact table: on Friday 8/28 at 14:50:05.206 CT,
+sranalytics.msgoptionimpliedquote showed the SPXW 8/28 7705 Put with sprc 0.480 while SR's own obid/oask
+was 0.60/0.70 -- sprc 12 cents BELOW its own bid on a fresh row -- and our order went out with
+orderLimittype 'Prc' and take/makeLimitClass 'Surface', worked normally with no risk hold, so the
+surface-offset limit was anchored to that dislocated sprc. The account was EOD10_C42 (HIGH_PAIRED, W1
+grouping code 3263, W2 3275; the same legs also went out in EOD11_C42 and EOD12_C42). The 7690 Put was
+also below bid (sprc 0.033 vs 0.05/0.10) and was STILL below bid at the W2 refresh 3 seconds later.
+Bigger fallback example if they want one: 8/24 355, 7655 Call sprc 0.932 against NBBO 1.50/2.20, 57
+cents below the bid. SMALLEST STEP: send it to Saurav / SR support. This is the concrete case that
+unblocks [w2 nbbo anchor below sprc 8_25_2026] and the SMRK-as-anchor question. Details: chat "ALGO LOG
+REVIEWER / SS Algo Edits". Original reply below.
+THIS IS THE SPIDERROCK REPLY WE HAVE BEEN BLOCKED ON, PASTED INTO THE TODO AS A NEW ITEM -- and it
+carries two concrete candidate fixes. (1) SMRK in sranalytics.msgliveimpliedquoteadj is NBBO-BOUNDED,
+so it is a candidate replacement for sprc as the limit anchor -- which is exactly the problem behind
+[w2 nbbo anchor below sprc 8_25_2026] and behind v8 pricing 5 cents rich and going 0-filled on 8/27.
+(2) srlive.msgindexquote is a live SPX feed ("SELECT * FROM srlive.msgindexquote WHERE ticker_tk =
+'SPX'"), a candidate fix for the v7-vs-v8 SPX divergence and possibly a better source for picking and
+sending strikes. Schema doc:
+docs.spiderrockconnect.com/docs/8.6.8.3/MessageSchemas/Schema/SRSE Products/SRLive/IndexQuote/
+STILL OWED BY SPIDERROCK, per Aisling Wallace 8/28: whether a surface-adjust order can be sent
+relative to SMRK instead of SPRC (Saurav to confirm), and the mlink-vs-srse latency question for
+msgliveimpliedquoteadj -- they offered a call on the API differences. Note the reply does NOT address
+the 0DTE atmVol half of the ask. Prod code path. Related: [spiderrock v8 data response 8_25_2026],
+[w2 nbbo anchor below sprc 8_25_2026], [v8 migrate more strategies 8_19_2026].
+------------------------------------------------------------------------------------------
+NAME: icon execution error 8_31_2026
+STATUS: completed
+START DATE: -
+END DATE: 2026-08-31
+DAY LOG: -
+TAKEAWAYS:
+CLOSED BY ZACH 8/31 (moved to todo_completed.txt) WITH NO LOGGED INVESTIGATION IN ANY SESSION, AND THE
+SIGNATURE RECURRED THE SAME DAY. The 8/31 4pm run is now the FIFTH straight session of the same pattern:
+three condors sent, "All trades sent successfully" at 16:00:19.857, and the log still carries
+"filled 0/8", "filled 0/2", "filled 0/2" resend lines plus 8 uPrcAdjResult OtherError rows, with the
+refresh prints showing sprc through the NBBO on several legs (7710 Call sprc 6.600 vs nbbo 7.10/7.50).
+The trade-log CSVs DO settle PnL (the 8/28 MWF and REGULAR rows closed at +266 each against SPX
+7,686.38), but those rows are written at SEND time, so they are not fill evidence. So either Zach
+satisfied himself off-session that these fill, or the close was premature. ONE-TIME CHECK STILL WORTH
+DOING: pull 8/31 ICON1/ICON5 fills from srtrade_agm_2026_08_31.msgsrparentexecution. Do not re-nag
+beyond that -- Zach closed it. Original reading below.
+New todo line 8/31: "look into icon execution error". Reading it against the logs, the 8/28 4pm
+session is the trigger: all three condors were sent and reported "All trades sent successfully" at
+16:00:21, yet the log carries "filled 0/2", "filled 0/2" and "filled 0/1" resend lines plus 8
+uPrcAdjResult OtherError rows, and the script exits without ever confirming a fill. That is now four
+consecutive sessions (8/25, 8/26, 8/27, 8/28) sent-clean-but-fill-unverified. Two candidate causes
+already on record: the uPrcAdjResult OtherError rows have appeared every session since the AllDay fix
+and have never been explained, and 4pm_script_v3 has no fill-confirmation step at all. SMALLEST STEP:
+pull the 8/28 ICON fills from srtrade_agm_2026_08_28.msgsrparentexecution and the iron_condor_*_logs
+CSVs and establish whether these condors are filling at all -- everything else depends on that answer.
+Supersedes the fill-verification thread in [4pm icon stale cache fix 8_21_2026]. Prod code path.
+------------------------------------------------------------------------------------------
+NAME: ss locate file + sp500 cands 8_31_2026
+STATUS: completed
+START DATE: 2026-08-31
+END DATE: 2026-09-01
+DAY LOG: 2026-08-31
+TAKEAWAYS:
+CONCLUSION (Zach moved to todo_completed.txt, seen 9/2): DONE. The SS names and sp500 candidates are
+in the locate file and the delivery mechanism is ftp_file_upload/sftp_upload.py --locates, which
+pushes SPDR_daily_locates.csv. The verification line ("should see EWY and BE auto loaded locates")
+went to completed WITHOUT being marked [DONE], so it was either satisfied off-session or waived -- do
+not re-nag, but if a locate-related reject ever appears in an SS log, check that first. Bulk-locate
+context (v8 works; v7 rows land in SQL but not the SV GUI so Zach does v7 by hand): memory
+spiderrock-locate-upload, adhoc/upload_stock_locates.py. Details: chat "Upload locates into
+Spiderrock". Why it mattered: [350pm single-stock ss script 8_26_2026] shorted 6,700 NVDA / 3,600
+GOOGL / 4,700 AMZN / 1,800 AVGO on the 8/31 close. Original detail below.
+LINE MARKED [DONE] 8/31 AND ONE VERIFICATION STEP REMAINS. Zach's own follow-up line:
+"verify above working: should see EWY and BE auto loaded locates." The delivery mechanism built 8/31 is
+ftp_file_upload/sftp_upload.py, which gained an --locates CLI flag (UPLOAD_LOCATES global for kernel
+use) to push SPDR_daily_locates.csv instead of the mapping file, plus a header docstring covering both
+commands; run it as "python /d/agent_projects/ftp_file_upload/sftp_upload.py --locates" from anywhere.
+SMALLEST STEP: confirm EWY and BE show as auto-loaded locates. Why it matters now: the SS book put on
+real size for the first time on 8/31 -- see [350pm single-stock ss script 8_26_2026], which shorted
+6,700 NVDA / 3,600 GOOGL / 4,700 AMZN / 1,800 AVGO on the close. Bulk-locate context (v8 works, v7
+rows land in SQL but not the SV GUI so Zach does v7 by hand): memory spiderrock-locate-upload,
+adhoc/upload_stock_locates.py. Details: chat "Upload locates into Spiderrock". Original reading below.
+New todo line 8/31: "add aapl and all other SS names to locate file. also add sp500 cands". No work
+logged. Reads as prod plumbing for the single-stock short side: get borrow locates in place for the
+whole 350pm_ss_script universe (NVDA TSLA GOOGL MSFT AMZN AAPL META AVGO) rather than a subset, plus
+the S&P 500 index-add candidates. Why it matters now: [350pm single-stock ss script 8_26_2026] is
+LIVE with SEND_TRADES=True, and on 8/28 NVDA and TSLA both cleared their imbalance thresholds -- the
+first day it would have wanted to trade. Without locates a sell signal on an unlisted name cannot be
+executed. Unsure which locate file is meant -- ask Zach if it does not fall out of the ss script or
+the sp500_adds directory. Related: [350pm single-stock ss script 8_26_2026], [spx candidate vol
+initiate 8_28_2026].
+------------------------------------------------------------------------------------------
+NAME: matt ai workflow blurb 8_31_2026
+STATUS: completed
+START DATE: 2026-08-28
+END DATE: 2026-08-31
+DAY LOG: 2026-08-28
+TAKEAWAYS:
+CONCLUSION (Zach moved to todo_completed.txt 8/31): delivered. The blurb went to Matt. The other Matt
+deliverable is still outstanding -- see [btic present to matt 8_26_2026], which has now sat since 8/26.
+Original detail below.
+Todo line 8/31 is "give matt requested blurb", and the artifact was already built on 8/28: an AI
+workflow slide for the EOD option algos, structured as two pillars -- automated daily oversight
+(taken from Zach's own blurb) and a faster idea-to-backtest cycle, with the 3:55pm levered-rebal test
+as the live example -- plus a flagged-impact-action case study band on the SpiderRock catch worth
+about $14K. Iterated to a polish pass and handed back as a file. SMALLEST STEP: send it to Matt. Open
+option offered and not taken: adding one hard stat such as the number of strategies reviewed daily.
+Details: chat "AI workflow slide for EOD option algos". Related: [ai update matt + michael review
+share 8_25_2026] (the 8/25 predecessor), [btic present to matt 8_26_2026] (the other Matt deliverable
+still outstanding).
+------------------------------------------------------------------------------------------
+NAME: imbal source swap + spy first tick 9_1_2026
+STATUS: active (not in todo.txt -- prod infra work found in chat sessions)
+START DATE: 2026-09-01
+END DATE: -
+DAY LOG: 2026-09-01, 2026-09-03
+TAKEAWAYS:
+THE VALUES CHECK IS NOW BEING DONE DAILY AND THE NEW SPY TICK IS HOLDING UP (9/3, covering 9/1 and
+9/2). 9/1: live -2.50 bps against the backtest's -1.18, same sign, same no-trade decision. 9/2: live
+-0.33 against +0.26, a 0.6 bps gap with a sign flip but deep inside the no-trade zone and PnL 0 on
+both sides. Compare the SPX era, where the two disagreed by 2-5 bps WITH sign flips on days that
+mattered. The residual is the definitional one already accepted: live measures :00 to about :01.3,
+the backtest uses the VBAM :01 snap. ONE THING TO KEEP WATCHING rather than close: on 9/1 live sat
+only 0.5 bps from the -3 sell threshold while the backtest sat 1.8 bps away, so a fast day can still
+produce a one-sided fire -- the daily reconciliation is the monitor and Zach asked for this check
+again each morning. Everything else from 9/1 is verified: all 13 scripts logged, no traceback or
+NO_IMBAL_VAL anywhere, and both changes are documented in prod_change_logs/9_1_2026.md. Details:
+chat "eod_equity_algos backtest". Prior state below.
+THE BIGGEST SINGLE-DAY PROD CHANGE IN WEEKS -- SIX CHANGE-LOG ENTRIES ON 9/1, AND 9/2 IS THE FIRST
+FULL DAY THEY ALL RUN TOGETHER. All are in prod_change_logs/9_1_2026.md. (1) get_355_imbal PRIMARY
+and BACKUP swapped: t_imbal_1555_BasketSnapshots is now primary, auctionResearch basket_detail the
+backup from attempt 14; seen-pct tightened 0.90 -> 0.95 in both. Trigger: on 8/31 the two sources
+disagreed by ~$2.1B at the same second and prod traded the stale +0.58B print while the snapshots
+table already showed -1.56B. (2) get_350_imbal fallback query fixed (strategyMode widened to
+Terminated OR OrderSent -- it had returned empty on 7 of 15 days -- plus a deterministic ORDER BY so
+the ES :01 row wins instead of row-order luck), retimed to 30 attempts / 0.25s with the backup only
+from attempt 9, and primary seenPct raised 0.80 -> 0.90. Affects NINE caller scripts. (3) First-tick
+source switched SPX index -> SPY last trade (save_spx_prices.py git-mv'd to save_spy_prices.py,
+spy_data.csv), because the calculated index lags the tape at 1 second -- FAST fired on only 4 of 10
+August signals and the three verified misses all read a flat SPX against a moved SPY. This aligns
+prod with the backtest but ALSO changes the 5s tick value slightly, so 5s strategies with 1.5-3 bps
+thresholds can flip on marginal days. (4) The 1s end anchor moved +0.2s (:01.15 fire, FAST gate
+:01.50), so FAST's first order goes out ~0.3s later. (5) Recap gate now derived as
+FILL_POLL_FIRST_WAIT + 12s (25s today) instead of a hard 15s, fixing the 8/27 and 8/31 false
+"FILL STATUS UNKNOWN" banners on all three stock scripts. (6) IMBAL_VS_MARKET CLOSER sized down --
+see [350pm closer sizing vs parents 8_28_2026]. FIRST-DAY CHECK 9/2 (done): all 13 scripts produced
+9/1 logs, save_spy_prices wrote spy_data.csv at 15:50, and no traceback / NO_IMBAL_VAL / dropped-size
+warning appears in any 9/1 log. What still needs eyes is the VALUES, not the plumbing: confirm the
+9/1 tick request_ts and bps look right and that the new 355 primary picked the correct imbal.
+Prod code path. Details: chats "imbal source change for prod", "eod_equity_algos backtest",
+"Automated Algo Reviews". Related: [eod algo review automation 8_16_2026], [355pm spy equity algo
+review 8_19_2026].
+------------------------------------------------------------------------------------------
+NAME: ss option algos backtest pull 9_1_2026
+STATUS: active
+START DATE: 2026-09-01
+END DATE: -
+DAY LOG: 2026-09-01, 2026-09-02, 2026-09-03
+TAKEAWAYS:
+THIS REACHED A VERDICT ON 9/3 AND THE LIVE BOOK WAS CUT IN HALF. The strategy is judged overfit:
+the backtest equity curve has been FLAT since 10/1/25, and out-of-sample from 5/1/26 both sides are
+negative -- backtest -$18.2k, prod -$21.0k, t = 3.79. The prod-vs-backtest gap was fully reconciled
+to a $2,703 residual (strike $0 / price -$3,538 / size +$6,703 / missed fills -$462), so the losses
+are the signal, not execution. ACTED ON, live prod: BASE_PREMIUM 500 -> 250 in
+configs_ss/ss_2_5pct_adv_350pm.py:40, the single scratch file touched. Everything compounds off it,
+so a fully-stacked month-end drops from $3,600 to $1,800 per symbol; create_backtests.py imports the
+same config, so future backtests size at $250 automatically. Sizing context worth keeping: the
+multipliers are 4x special day, 1.2x momentum, 1.5x SPX confirm = 7.2x max, and month-ends average
+3.1 qualifying symbols (max 5), so ~$18k of ten-minute premium was at risk on a stacked close
+before the cut. The redo is now its own todo -- see [ss backtest overfit redo 9_4_2026]. Also 9/3:
+the README gained a FAST PATH refresh section (two commands, ~10-20 min versus the two days the cold
+rebuild took) plus the three cache traps that caused it. Notes:
+eod_ss_option_algos/notes_9_3_2026_size_cut_and_reconciliation.md. Details: chat "EOD_SS_OPTIONS
+backtest". Prior state below.
+FIRST RESULTS ARE IN (9/2) AND THEY ARE NEGATIVE, WHICH MATTERS BECAUSE THE PROD BOOK IS ALREADY LIVE.
+ss_backtest_20260902_1528.xlsx over the last month: 11 trades, -$6,820 total, 9% win rate, and the only
+winner is NVDA 8/31 +$2,793 -- i.e. the one day prod actually traded is the one day that worked. Sizing
+basis is the script's own per-ticker 2.5% of 30d ADV notional thresholds. A new --add-symbols flag was
+added (bit-identical behavior without it) to test MU / INTC / AMD: computed thresholds MU $786M, INTC
+$254M, AMD $284M; MU and AMD never triggered at all and INTC's three triggers were all small losers
+(-$574, -$252, -$126). So universe expansion is not the win here. SMALLEST STEP: run the full-history
+backtest, not the one-month window -- 11 trades cannot carry a go/no-go on a book that is short real
+single-name size into the close. The real pipeline fix is still undone: batch the price queries monthly
+or source them from cq_helpers instead of one Liberator query per day. Prior state below.
+A NEW PROJECT DIRECTORY APPEARED ON 9/1 AND IS NOT ON THE TODO LIST: eod_ss_option_algos, the
+single-stock option-algo backtest. The 9/1 session was pure data plumbing, no results yet. The data/
+imbal cache had been lost in the drive migration (gitignored), so a full rebuild was needed:
+"python pull_imbal_universe.py --start-date 2024-05-01 --end-date 2026-09-01" over 12 symbols / 586
+business dates, snapped to a 1-second grid 15:40-16:00. It was catastrophically slow -- roughly 7
+seconds per per-day price query, about 69 minutes per symbol, projecting 12-13 more hours -- because
+the price side loops one Liberator query per day (~7,000 round trips) while the imbal side already
+does one multi-day query per symbol. WORKAROUND SHIPPED, NOT THE FIX: four pull_worker_N.py scripts
+(1 = MSFT+META, 2 = GOOGL+GOOG, 3 = AVGO+IBIT, 4 = GLD+SLV) to run in four Git Bash windows, skipping
+cached names and checkpointing every 25 dates; NVDA and AAPL were already complete. NEXT STEP:
+confirm all four workers printed "Worker done", then "python create_backtests.py". THE REAL FIX IS
+STILL UNDONE and is worth doing before the next refresh: batch the price queries monthly (7,000 round
+trips -> a few hundred) or source them from cq_helpers instead of raw Liberator ticks. Details: chat
+"eod_single_stock_algos backtest". Related: [350pm single-stock ss script 8_26_2026] (the live prod
+book this backtest would support).
+------------------------------------------------------------------------------------------
+NAME: vbam-data-oracle updates 9_2_2026
+STATUS: completed
+START DATE: 2026-09-02
+END DATE: 2026-09-02
+DAY LOG: 2026-09-02
+TAKEAWAYS:
+DONE 9/2. All three rules tests passed: the projects-only PR self-merged (#12), generic "Require
+approvals" had to be UNCHECKED with "Require review from Code Owners" left checked, and the
+protected-path PR showed "Code owner review required" with merge disabled. Cleanup finished -- five
+loose equity_raises adhoc scripts committed under projects/equity_raises/zach_local_adhoc_scripts,
+rules_test.txt deleted, and all four test branches removed locally and on GitHub. FLAG: the todo line
+was DELETED from todo.txt rather than moved to todo_completed.txt, so this close is inferred from the
+session, not from Zach's hand -- correct me if it was meant to stay open. The repo is now the ready
+destination for [project presentation claude skill 8_20_2026] and the never-delivered BTIC upload.
+Details: chat "vbam-data-oracle setup". Prior state below.
+IN PROGRESS (9/2 morning) -- todo line was "Finish updates to vbam-data-oracle". The work is
+repo governance on the AlpineGlobalMgmt/vbam-data-oracle GitHub repo, not data content: branch
+protection on master, a CODEOWNERS-based review requirement, and a file-size check that must pass.
+Being validated with three deliberate test PRs: (1) a projects-only path should self-merge with no
+required reviewers and a green file-size check -- PR #12, confirmed and merged; (2) generic
+"Require approvals" had to be UNCHECKED (its dropdown only goes 1-6) while "Require review from Code
+Owners" stays checked, otherwise every PR demanded an approval Zach cannot give himself; (3) a
+protected-path PR (branch test/rules-protected) should show "Code owner review required" with the
+merge button DISABLED, waiting on James -- that is the pass condition, and it should be closed rather
+than merged. SMALLEST STEP: run test 3, confirm the block, then close the PR, delete both test
+branches, and remove rules_test.txt. Related: [project presentation claude skill 8_20_2026] (the
+skill is meant to be uploaded here) and [btic futures backtest + options decom 8_16_2026] (its
+data-oracle upload was never delivered). Details: chat "vbam-data-oracle setup".
+------------------------------------------------------------------------------------------
+NAME: ss backtest overfit redo 9_4_2026
+STATUS: active
+START DATE: -
+END DATE: -
+DAY LOG: -
+TAKEAWAYS:
+New todo line, first seen 9/4, and it is the follow-through Zach promised himself when he cut the
+live size on 9/3 -- see [ss option algos backtest pull 9_1_2026] for the diagnosis (flat since
+10/1/25, negative out-of-sample in both backtest and prod, reconciled to a $2.7k residual). DEADLINE
+by 9/26/26, ideally 9/16/26; note the project README carries 9/30/26, so the todo line is the
+tighter date and governs. THE DESIGN DIRECTION IS ALREADY SETTLED IN HIS OWN WORDS: drop all the
+special-day scaling, just buy cheap options (under about 30 cents) and fire on any large dollar
+imbalance, so the thing can be scaled out to new symbols as new zero-days list. Supporting evidence
+already in hand: the cheapest ask quintile carries half the PnL at a 58% win rate. Anti-overfitting
+discipline is the whole point -- walk-forward fitting, no post-hoc multiplier tuning. Refresh is
+cheap now (two commands, ~10-20 min) as long as the caches survive. No work logged yet. Details:
+eod_ss_option_algos/README.md "Strategy under review", chat "EOD_SS_OPTIONS backtest". Related:
+[350pm single-stock ss script 8_26_2026] (the live book this governs).
+------------------------------------------------------------------------------------------
+NAME: month end 350pm outright buys 9_2_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: 2026-09-02
+END DATE: -
+DAY LOG: 2026-09-02
+TAKEAWAYS:
+The month_end project (ALGO_04 350PM OUTRIGHT BUYS SPX MONTH END), worked 9/2 and not on the todo
+list. The strategy, in Zach's own settled blurb: on month ends only, buy 0DTE SPXW options at
+15:50:07 ET in the direction of the 3:50 imbalance (minimum $500M), calls on a buy imbal and puts on
+a sell, struck 6 to 11 SPX points out of the money (about $0.60-$1.10 in SPY terms), held to the 4pm
+expiry. 8/31 was backfilled into month_end_spx_trade_SEP_2026.xlsx (7700C at 1.85/2.00, size 65,
+-$13k) and a half-size cumulative PnL chart was built over all 64 month-ends including untriggered
+zeros; six days won more than $40k, the biggest being 1/31/23 at +$116.2k.
+THE REAL FINDING IS A DATA-PIPELINE HOLE, NOT THE STRATEGY. The 8/31 quote pull died on ThetaData v3
+"UNAUTHENTICATED: Invalid session ID" -- intermittent session collisions on the one shared API key
+(re-tested clean the same day, so not a broken credential). The damage came from update_data.py step
+5a, whose missing-date check is a SELECT DISTINCT trade_date: a 9-strike partial day counts as done
+forever, which turned a transient auth blip into a silent month-long gap in t_opra_quotes. Two
+hardenings were proposed and NOT implemented: retry with re-auth on UNAUTHENTICATED, and count rows
+per date against a threshold so 5a self-heals partial days. Zach waved off the auth issue as
+intermittent; the self-heal fix was never answered. Details: chat "Month-end Options Trade".
+Related: [monthend revert strategy 8_16_2026] (different strategy, same month-end calendar),
+[snowflake 0dte cache cutover 8_27_2026] (the other update_data.py data-integrity item).
+------------------------------------------------------------------------------------------
+NAME: dram rsi 5day return study 9_4_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: 2026-09-04
+END DATE: -
+DAY LOG: 2026-09-04
+TAKEAWAYS:
+One-off ask on 9/4, answered inside the session, nothing followed. DRAM US Equity since 5/1/26:
+9-day RSI quintiles against the forward 5-day return, N=83 days. The shape is non-monotonic and reads
+as noise at this sample -- lowest quintile +4.58% mean / +0.91% median / 64.7% win, quintile 4 the
+best at +6.44% / +3.01% / 62.5%, and the two middle buckets negative (quintile 2 -3.16% / 43.8%).
+Live 9-day RSI was 50.83 at a 59.19 price, right on the 2/3 boundary. About 17 days per bucket over
+four months cannot carry a trade. Either take one more cut -- longer history, or the same test across
+a basket of memory names -- or drop it. Details: chat "DRAM US EQUITY RSI/return analysis".
+------------------------------------------------------------------------------------------
+NAME: remove opt ck from pnl snap 9_4_2026
+STATUS: active
+START DATE: -
+END DATE: -
+DAY LOG: -
+TAKEAWAYS:
+New todo line with a 9/4 date on it: "remove OPT CK from pnl snap on 9/4". No work logged, no session
+mentions it, and the date has passed by three trading days. Unsure what OPT CK refers to -- ask Zach for
+details if/when needed. If it is a one-line edit to the PnL snapshot he uses each morning, it is the
+cheapest open item on the whole list.
+------------------------------------------------------------------------------------------
+NAME: sp500 failed candidates short 9_8_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: ~2026-09-05
+END DATE: -
+DAY LOG: 2026-09-08, 2026-09-09
+TAKEAWAYS:
+THE 9/4 CYCLE IS FILLABLE NOW AND THE REST HAS TO WAIT FOR FRIDAY (9/9). Snowflake now carries 9/8, so
+running candidates_buying_vol.py and then announcement_day_trade.py today prices the 9/4 cycle
+end-to-end -- the 0DTE leg and the close-the-short-calls-Monday-morning variant both complete; only the
+hold-short-calls-to-expiry-with-delta-hedge leg fails inside its try/except and shows blank columns,
+because the 9/11 expiry does not exist yet. CONCRETE DATED STEP: rerun the 9/11 fill on Friday 9/11 to
+finish the cycle. Still missing on disk as of 9/9: the 9/8 Monday and the 8/28-9/3 T-5 to T-1 window
+that candidates_buying_vol.py wants. Details: chat "S&P 500 adds, shorting failed candidates". Prior
+state below.
+A SECOND, SEPARATE S&P-ADDS STRATEGY THAT IS ALREADY BEING TRADED AND IS NOT ON THE TODO LIST -- short
+the names that ran on announcement day, on the theory that a runner is usually a failed candidate. Both
+sides charted 9/8 at $1M-scale sizing per leg: SHORT names up more than 2% on announcement day earns
++$48k over 11 traded cycles / 31 names, 73% win, Sharpe 0.40, max drawdown $7k, but Dec-24 alone is
+$32k of it; the LONG leg (non-adds down more than 2% on T+1) earns +$26k over 11 cycles / 40 names, 55%
+win, Sharpe 0.15, and is negative excluding Mar-25's +$43k. The script default is now announcement day
+only (RUNUP_LOOKBACK = 1). THE KNOWN FAILURE MODE BIT AGAIN THIS CYCLE: the gate cannot see the
+announcement, so it shorted BE, which ran +7.4% and then WAS the add (+11.5% Fri-to-Mon, -$11.5k),
+turning a +$7.3k cycle from the three non-adds into -$5.6k. Second occurrence in 31 shorts (CRWD, Jun
+24). SMALLEST STEP: decide whether the short leg needs an add-exclusion rule it structurally cannot
+have, and whether the long leg survives ex-Mar-25 -- i.e. is this one trade or half a trade. Details:
+chat "S&P 500 adds, shorting failed candidates". Related: [spx candidate vol initiate 8_28_2026],
+[be put spread book 9_8_2026].
+------------------------------------------------------------------------------------------
+NAME: be put spread book 9_8_2026
+STATUS: active (not in todo.txt -- live position, found in chat sessions)
+START DATE: ~2026-09-05
+END DATE: -
+DAY LOG: 2026-09-08, 2026-09-09, 2026-09-10
+TAKEAWAYS:
+BE KEPT FALLING AND THE NEAR EXPIRY IS TODAY (9/11). BE 259.36 at 15:17 on 9/10, down from 272.91 on
+9/9 and 276.09 on 9/8. The book marks about -$72,500 on SpiderRock's surface and the further loss
+from those marks to a BE of zero is roughly $79,500 (zero-floor -$152,000). Positions were traded on
+9/10: the 5x 9/11 280/257.5 spread was CLOSED and an 8x 9/18 267.5/245 spread ADDED, which raised the
+zero-floor by $6,750. What expires today: short 10x 270 and 1x 272.5 puts against long 10x 252.5 and
+1x 247.5 -- at 259.36 both short strikes are deep in the money and the longs are not, so today is a
+real settlement, not a formality. The 9/18 side is short 10x 270 / 2x 272.5 / 15x 280 / 8x 267.5
+against long 10x 230 / 10x 232.5 / 7x 240 / 8x 245. WORTH KNOWING WHEN READING THE MARKS: sprc is
+printing BELOW the NBBO bid on the short legs (9/18 280P sprc 25.70 against 26.25/26.50), so the
+surface flatters the book by about $1,650; on NBBO mid the loss to zero is about $77,900. Details:
+chat "BE Put spread max loss". Prior state below.
+REFRESHED 9/9 AND IT GOT BIGGER AND CLOSER TO THE MONEY, WITH THE FIRST EXPIRY THIS FRIDAY 9/11. BE fell
+again to 272.91 (from 276.09 on 9/8), the book marks about -$47,400, and the further loss from those
+marks to a BE of zero is now roughly $97,800 (zero-floor value -$145,250 against $44.6k of credit
+collected). The position was rolled and added to on 9/9: 9/11 now short 10x 270 / 1x 272.5 / 5x 280 puts
+against long 10x 252.5 / 5x 257.5 / 1x 247.5, and the 9/18 side is short 10x 270 / 2x 272.5 / 15x 280
+against long 10x 230 / 10x 232.5 / 7x 240. So at 272.91 the 280 and 272.5 shorts are already in the money
+on BOTH expiries and 270 is within a dollar, and Friday settles the near half. Implied vols are pinned
+around 78-82% across every strike. Nothing to decide unless BE keeps falling, but the Friday expiry is a
+forced decision date -- roll it, close it, or take assignment. Details: chat "BE Put spread max loss".
+Prior state below.
+LIVE RISK WORTH KEEPING VISIBLE, NOT A RESEARCH ITEM. The ADD2 account is short five BE put spreads
+across the 9/11 and 9/18 expiries (272.5/247.5 x1, 280/257.5 x10, 270/230 x10, 280/232.5 x10, 280/240
+x5) -- $132,500 of total width, $44,646 of credit collected, so MAX LOSS IF BE GOES TO ZERO IS $87,854.
+BE fell to 276.09 on 9/8, marking the book about -$45,100, and the incremental loss from those marks to
+a BE of zero is roughly $87,400. ADD1 is flat and no new BE trades went on 9/8. So this is a bullish
+position in the same name that just cost the [sp500 failed candidates short 9_8_2026] study its cycle,
+which is worth knowing when sizing either. Nothing to decide unless BE keeps falling; the number to
+watch is 280, where two of the five spreads are already at or through the short strike. Details: chat
+"BE Put spread max loss".
+------------------------------------------------------------------------------------------
+NAME: sr query latency escalation 9_8_2026
+STATUS: active (not in todo.txt -- prod infra found in chat sessions)
+START DATE: 2026-09-08
+END DATE: -
+DAY LOG: 2026-09-08, 2026-09-09
+TAKEAWAYS:
+A THIRD, EVEN STARKER DATA POINT ARRIVED 9/9 AND IT BELONGS IN THE SAME PACKAGE: an srlive index query
+issued midday did not return for about TWO MINUTES, and the row it eventually returned was fresh, so the
+feed was fine and the query hung. That is the strongest slow-query evidence we have and it is on the
+same table the v8 scripts now depend on for spot -- see [smrk nbbo + srlive indexquote 8_31_2026] for
+the unbuilt timeout guard. The 9/9 evening log review found no slowness at all in the prod session
+(every large gap was a scheduled gate, and the previous day's fill-probe stall did not recur), so this is
+intermittent server-side behaviour, not a trend. SMALLEST STEP unchanged: send the corrected package to
+SR. Prior state below.
+AN EVIDENCE PACKAGE FOR SPIDERROCK IS BEING ASSEMBLED AND IT WAS CORRECTED BEFORE SENDING -- send the
+part that cannot be argued with. UNAMBIGUOUS: on 9/4 three v8 wave-1 order inserts into
+srtrade.msgparentordergatewayext each took 3,668ms of SERVER-side execution on a warm pooled connection
+(the log prints get=0.0ms, exec=3668ms), against 23-24ms for the same pooled inserts seconds earlier;
+all three released together at 15:50:12.79 and they are exactly the three that missed wave 1 and filled
+wave 2. WEAKER, quote it second: the 3.76s srlive.msgindexquote spot SELECT went down the legacy
+fresh-connection path, so slow connect cannot be separated from slow query. SEPARATE OCCURRENCE THE
+SAME WEEK, and it matches SR's own "2 queries, almost 9 seconds": on 9/8 two of the three
+350pm_stock_script fill probes against msgsrparentbrkrstate returned 9.6s and 9.8s late (15:50:28.4 and
+:28.6 against a designed 15:50:18.85), and the MOC status checks in the same 21-second window took
+9.8-11.2s versus about 2s. Everything either side of that window ran at single-digit ms, so it is a
+server-side stall on that table, and nothing functional broke. The v8 scripts are NOT exposed to that
+one -- their fill checks hit srtrade.msgsrmlegbrkrstate. SMALLEST STEP: send the corrected package to
+SR. Details: chats "Automated Algo Reviews", "ALGO LOG REVIEWER / SS Algo Edits".
+------------------------------------------------------------------------------------------
+NAME: sign up for codex 9_10_2026
+STATUS: active
+START DATE: -
+END DATE: -
+DAY LOG: -
+TAKEAWAYS:
+New todo line, first seen 9/10, three words: "sign up for codex". No work logged. Reads as signing up
+for OpenAI's Codex coding agent, presumably to run alongside Claude Code -- the cheapest item on the
+list and a one-sitting task. Unsure whether he wants a comparison or just the account; ask if it does
+not fall out on its own.
+------------------------------------------------------------------------------------------
+NAME: bumped backtest double bump 9_10_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: 2026-09-10
+END DATE: -
+DAY LOG: 2026-09-10
+TAKEAWAYS:
+A REAL BACKTEST BUG, ROOT-CAUSED 9/10, FIX WRITTEN AND NOT APPLIED -- IT NEEDS ONE WORD FROM ZACH.
+Found off the 9/9 review, where prod's bumped layer sold 7635/7620 at 0.65 (+584) while the backtest
+sold 7640/7625 at 1.90 (-5,742) off the same parent and the same BUMP_STEP. Cause: the backtest
+double-bumps. bumped_spread_backtest.py:147-152 both decrements the strike index AND cuts
+min_strike_distance by $5, but in index-based strike selection the distance filter is what defines
+index 0, so relaxing it re-admits the near-ATM strike and shifts the whole ladder one more step. Prod
+(bumped_spread_trader.py:66-68) just takes the parent's short strike and adds $5. Net effect: on days
+where spot sits within $1 of a strike -- roughly 20% of days, and symmetric for calls and puts -- the
+backtest's bumped short is TWO strikes closer than the parent instead of one. All three bumped parents
+(GROWS, VS_MARKET, SHRINKS) carry min_strike_distance 1 and short index 1, so all three are affected;
+the other ~80% of days agree, which is why the layer looked reconciled. THE CONSEQUENCE THAT MATTERS
+FOR SIZING: the bumped layer's historical PnL and Sharpe -- the numbers the layer was sized on -- are
+overstated in aggressiveness on those days, so a rerun after the fix will move them. Fix is about five
+lines (keep min_strike_distance, decrement the index only, raise if a parent's index is already 0) and
+is written out in the chat ready to paste. SMALLEST STEP: say yes, apply it, and rerun the bumped
+backtest. Verified 9/11: line 147 is unchanged, so nothing has been applied. Details: chat "Bumped
+spread strike discrepancy". Related: [eod algo review automation 8_16_2026] (which caught it).
+------------------------------------------------------------------------------------------
+NAME: asdz dividend futures book 9_10_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: 2026-09-10
+END DATE: -
+DAY LOG: 2026-09-10
+TAKEAWAYS:
+A ONE-SESSION DECOMPOSITION OF SOMEONE'S DIVIDEND-FUTURES BOOK (9/10), off a position file -- not one
+of the EOD algo projects and not on the todo list. What it established: the Dec27 position in
+1_DIVOPTS_US is long SPX annual dividend call spreads (long 42,470 calls struck 80-89 against short
+33,400 struck 88-92, net 9,070 calls, about +$376mm of dividend delta), hedged by short 12,307 ASDZ27
+(-$269mm) plus short 5,314 RDIZ7 Russell dividend futures (-$96mm), leaving Dec27 net long roughly
+$11mm of delta. The gap worth knowing is VEGA, not delta: Dec27 carries +$901k per vol point against
+only -$317k from Dec26 and nothing elsewhere, so about +$550k per vol point of Dec27 dividend vol is
+an outright long, and Dec26 is a poor hedge for it because those dividends are mostly declared. Also
+established that the apparent "missing $150mm" of Dec26 delta is an artefact of assigning all three
+short legs to the call spreads -- Dec26 has +$528mm of other longs, leaving the book structurally long
+near-dated US dividends by roughly $380mm. Unsure why Zach was asked for this or what decision it
+feeds -- ask if it comes up again. Details: chat "ASDZ".
+------------------------------------------------------------------------------------------
+NAME: skhy short calls pricing 9_8_2026
+STATUS: active (not in todo.txt -- found in chat sessions)
+START DATE: 2026-09-08
+END DATE: -
+DAY LOG: 2026-09-08
+TAKEAWAYS:
+One-off pricing question on 9/8, answered in session: break-even and -1x payout tables for selling SKHY
+9/18/26 calls against 20 long shares, priced off sprc minus 7 cents. At the 210 strike (sprc 2.522,
+stock 187.40) the position breaks even at 175.14 down or 218.72 up, with max PnL +6.97 at 210; at the
+215 strike (sprc 1.893, delta 0.16) it is 178.42 down / 224.14 up, max +7.32. No trade decision
+recorded and nothing followed. Unsure whether this is a position being put on or a hypothetical -- ask
+Zach if it recurs. Details: chat "SKHY Short Calls".
+------------------------------------------------------------------------------------------

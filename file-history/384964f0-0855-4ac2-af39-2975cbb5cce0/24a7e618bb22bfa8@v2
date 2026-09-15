@@ -1,0 +1,213 @@
+"""Pull 0DTE option bid/ask quotes (1-sec bars) for one (symbol, date) and save
+to MySQL t_opra_quotes.
+
+Mirrors the approach in pull_data_from_thetadata.ipynb, adapted for equity/ETF
+options with percentage-of-spot strike filtering.
+
+Data access: ThetaData v3 (`thetadata` pip library via thetadata_helpers, gRPC
+direct to Theta servers -- no local ThetaTerminal). Auth: THETADATA_API_KEY env
+var or D:/PycharmProjects/utils/thetadata_creds.json. Migrated from the
+deprecated v2 ThetaTerminal HTTP API (127.0.0.1:25510) on 2026-09-02.
+
+Usage:
+    python pull_options_single.py --symbol NVDA --date 2026-04-24
+    python pull_options_single.py --symbol NVDA --date 2026-04-24 --dry-run
+    python pull_options_single.py --symbol NVDA --date 2026-04-24 --force
+"""
+import argparse
+import datetime as dt
+import sys
+import time
+from urllib.parse import quote_plus
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+from xbbg import blp
+
+from calendar_utils import HALF_DAYS
+from thetadata_helpers import get_bulk_chain_v3, get_option_quotes_v3
+
+# DB connection -- same as pull_data_from_thetadata.ipynb
+HOST = 'alpine-vbam-dev.c7wvpkbyvjzb.us-east-1.rds.amazonaws.com'
+PORT = 3306
+DATABASE = 'optionsResearch'
+USERNAME = 'options_research_user'
+PASSWORD = 'P@9xZt5#Lq'
+CONN_STR = f'mysql+pymysql://{USERNAME}:{quote_plus(PASSWORD)}@{HOST}:{PORT}/{DATABASE}'
+TABLE = "t_opra_quotes"
+
+THRESHOLD_PCT = 0.04            # +/- 4% of spot
+QUOTE_INTERVAL = '1s'           # 1-sec bars
+CUTOFF_TIME = dt.time(15, 49, 50)
+END_TIME = dt.time(16, 0, 0)
+INTER_CONTRACT_SLEEP = 0.3
+
+
+def get_underlying_close(symbol: str, date: dt.date) -> float:
+    """Bloomberg unadjusted close for `date` -- used to pick strike range."""
+    df = blp.bdh(f'{symbol} US Equity', 'PX_LAST', date, date, adjust='-')
+    if df.empty:
+        raise RuntimeError(f"No Bloomberg PX_LAST for {symbol} on {date}")
+    return float(df.iloc[0, 0])
+
+
+def fetch_raw_chain(root: str, date: dt.date) -> pd.DataFrame:
+    """Fetch the raw 0DTE chain from ThetaData v3 (no spot filter). Returns an
+    empty DataFrame fast when no 0DTE is listed -- this is the cheap pre-check
+    that lets callers skip the Bloomberg spot lookup."""
+    return get_bulk_chain_v3(root, exp=date, trade_date=date)
+
+
+def filter_chain(resp: pd.DataFrame, spot: float,
+                 threshold_pct: float = THRESHOLD_PCT) -> pd.DataFrame:
+    """Apply the OTM-biased strike filter near spot to a raw chain."""
+    if resp.empty:
+        return resp
+    threshold = threshold_pct * spot
+    diff = resp.strike - spot
+    idx = ((resp.cp == "Call") & (diff > -threshold / 2)) | \
+          ((resp.cp == "Put")  & (diff <  threshold / 2))
+    idx &= diff.abs() < threshold
+    return resp.loc[idx, ["symbol", "strike", "cp", "exp"]].reset_index(drop=True)
+
+
+def get_symbols(root: str, date: dt.date, spot: float,
+                threshold_pct: float = THRESHOLD_PCT) -> pd.DataFrame:
+    """Fetch the 0DTE chain and apply the OTM-biased strike filter near spot.
+    (Kept for backward compat; fetch_raw_chain + filter_chain split lets pull_options
+    skip the Bloomberg spot call on no-0DTE days.)"""
+    return filter_chain(fetch_raw_chain(root, date), spot, threshold_pct)
+
+
+def get_quotes(root: str, strike: float, cp: str, exp: dt.date) -> pd.DataFrame:
+    """1-sec bar bid/ask quotes for one contract on its expiry day, via ThetaData
+    v3. Server-side trimmed to [CUTOFF_TIME, END_TIME]; canonical QUOTE_COLS
+    schema (symbol, trade_date, exp, strike, cp, timestmp, bidPrc, askPrc,
+    bidSize, askSize) matches the t_opra_quotes writer unchanged."""
+    return get_option_quotes_v3(root, strike, cp, exp, trade_date=exp,
+                                start_time=CUTOFF_TIME, end_time=END_TIME,
+                                interval=QUOTE_INTERVAL)
+
+
+def check_if_in_db(date: dt.date, symbol: str) -> bool:
+    engine = create_engine(CONN_STR)
+    try:
+        with engine.connect() as conn:
+            q = conn.execute(text(
+                f'SELECT 1 FROM {TABLE} WHERE symbol = :sym AND trade_date = :td LIMIT 1'),
+                {"sym": symbol, "td": date.strftime('%Y-%m-%d')})
+            return q.fetchone() is not None
+    finally:
+        engine.dispose()
+
+
+def drop_from_db(date: dt.date, symbol: str) -> int:
+    engine = create_engine(CONN_STR)
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text(
+                f'DELETE FROM {TABLE} WHERE symbol = :sym AND trade_date = :td'),
+                {"sym": symbol, "td": date.strftime('%Y-%m-%d')})
+            conn.commit()
+            return res.rowcount
+    finally:
+        engine.dispose()
+
+
+def save_to_db(df: pd.DataFrame):
+    engine = create_engine(CONN_STR)
+    try:
+        df.to_sql(TABLE, con=engine, if_exists='append', index=False)
+    finally:
+        engine.dispose()
+
+
+def pull_options(symbol: str, date: dt.date,
+                 threshold_pct: float = THRESHOLD_PCT,
+                 dry_run: bool = False, verbose: bool = True) -> dict:
+    """Pull all 0DTE quotes for one (symbol, date), save to t_opra_quotes."""
+    # Half-day guard (9/14/26): the 15:49:50-16:00 window does not exist on an NYSE early
+    # close (options stop at 13:00) -- ThetaData would return stale post-close bars.
+    if date in HALF_DAYS:
+        if verbose:
+            print(f"  {symbol} {date}: NYSE half day (13:00 close) -- no close-auction window, skipping")
+        return {"contracts": 0, "rows_saved": 0, "spot": None, "half_day": True}
+    # Cheap ThetaData pre-check FIRST -- exit fast (no Bloomberg call) if there is
+    # no 0DTE listed for this symbol/date (e.g. Tue/Thu, or pre-listing era).
+    raw = fetch_raw_chain(symbol, date)
+    if raw.empty:
+        if verbose:
+            print(f"  No 0DTE chain for {symbol} on {date}")
+        return {"contracts": 0, "rows_saved": 0, "spot": None}
+
+    spot = get_underlying_close(symbol, date)
+    if verbose:
+        print(f"  spot {symbol}@{date} = {spot:.2f} | "
+              f"threshold = {threshold_pct:.1%} = ${threshold_pct * spot:.2f}")
+
+    chain = filter_chain(raw, spot, threshold_pct)
+    if chain.empty:
+        if verbose:
+            print(f"  No strikes within threshold for {symbol} on {date}")
+        return {"contracts": 0, "rows_saved": 0, "spot": spot}
+    if verbose:
+        print(f"  {len(chain)} contracts in filtered chain "
+              f"(strikes {chain.strike.min():.2f}-{chain.strike.max():.2f}, "
+              f"{(chain.cp == 'Call').sum()} calls / {(chain.cp == 'Put').sum()} puts)")
+
+    rows_saved = 0
+    contracts_with_data = 0
+    for _, row in chain.iterrows():
+        try:
+            df = get_quotes(symbol, row["strike"], row["cp"], row["exp"])
+        except Exception as e:
+            print(f"    {row['strike']:.2f} {row['cp']}: ERROR {e}")
+            continue
+        if df.empty:
+            continue
+        keep = (df.timestmp >= CUTOFF_TIME) & (df.timestmp <= END_TIME)
+        to_save = df[keep].copy()
+        if to_save.empty:
+            continue
+        if not dry_run:
+            save_to_db(to_save)
+        rows_saved += len(to_save)
+        contracts_with_data += 1
+        time.sleep(INTER_CONTRACT_SLEEP)
+
+    tag = " (DRY RUN)" if dry_run else ""
+    if verbose:
+        print(f"  Saved {rows_saved:,} rows from {contracts_with_data}/{len(chain)} contracts{tag}")
+    return {"contracts": len(chain), "contracts_with_data": contracts_with_data,
+            "rows_saved": rows_saved, "spot": spot}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--symbol", required=True)
+    p.add_argument("--date", required=True, help="YYYY-MM-DD")
+    p.add_argument("--threshold-pct", type=float, default=THRESHOLD_PCT)
+    p.add_argument("--dry-run", action="store_true", help="Don't write to DB")
+    p.add_argument("--force", action="store_true",
+                   help="Drop existing rows for (symbol, date) first")
+    args = p.parse_args()
+
+    date = dt.datetime.strptime(args.date, '%Y-%m-%d').date()
+
+    if not args.dry_run and check_if_in_db(date, args.symbol):
+        if args.force:
+            n = drop_from_db(date, args.symbol)
+            print(f"[force] Dropped {n} existing rows for {args.symbol} on {date}")
+        else:
+            print(f"{args.symbol} {date}: already in DB. Use --force to overwrite.")
+            return
+
+    t0 = time.perf_counter()
+    out = pull_options(args.symbol, date, args.threshold_pct, dry_run=args.dry_run)
+    print(f"Done in {time.perf_counter() - t0:.1f}s | {out}")
+
+
+if __name__ == "__main__":
+    main()

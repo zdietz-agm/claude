@@ -1,0 +1,14 @@
+import pandas as pd
+pd.set_option("display.width", 250)
+x = pd.ExcelFile("C:/Users/zdietz/Downloads/EOD_OPTION_ALGOS_20260911_0813.xlsx")
+print(x.sheet_names)
+dates = ["2026-08-12", "2026-08-13"]
+for s in x.sheet_names:
+    if s in ("350 SPR SELL IMBAL GROWS", "350 SPR SELL IMBAL VS MARKET", "350 SPR SELL IMBAL SHRINKS"):
+        df = pd.read_excel(x, s)
+        if "trade_date" not in df.columns:
+            continue
+        df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        r = df[df.trade_date.isin(dates)]
+        print("\n==", s, "==")
+        print(r.to_string() if not r.empty else "  no rows on 8/12 or 8/13")

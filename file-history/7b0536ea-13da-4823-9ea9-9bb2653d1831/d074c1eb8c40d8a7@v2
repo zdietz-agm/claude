@@ -1,0 +1,45 @@
+import sys
+sys.path.insert(0, "D:/PycharmProjects/utils")
+import pandas as pd
+from spdr_rock_functions import run_query
+
+STRIKES = {"SPY": 750.0, "QQQ": 696.0, "SMH": 530.0}
+NOTIONAL = 100e6
+# 45-day daily-return betas (2026-07-14 -> 2026-09-15)
+BETA = {"SKHY": {"SPY": 3.20, "QQQ": 3.67, "SMH": 2.15},
+        "SPXC": {"SPY": 1.94, "QQQ": 1.27, "SMH": 0.71},
+        "BE":   {"SPY": 4.43, "QQQ": 3.81, "SMH": 2.04}}
+
+q = """SELECT okey_tk, okey_xx, uprc, obid, oask, sprc, th, de, svol, timestamp
+       FROM msgoptionimpliedquoteadj
+       WHERE okey_cp='Put' AND okey_yr=2026 AND okey_mn=9 AND okey_dy=16
+         AND ((okey_tk='SPY' AND okey_xx=750) OR (okey_tk='QQQ' AND okey_xx=696)
+              OR (okey_tk='SMH' AND okey_xx=530))"""
+opt = run_query(q).set_index("okey_tk")
+for c in ["okey_xx", "uprc", "obid", "oask", "sprc", "th", "de", "svol"]:
+    opt[c] = opt[c].astype(float)
+# est price = sprc after 40% of one day's theta decay (theta is negative in SR)
+opt["est_price"] = opt["sprc"] + 0.40 * opt["th"]
+
+print("quote ts:", opt["timestamp"].max())
+print(opt[["okey_xx", "uprc", "obid", "oask", "sprc", "th", "est_price", "de", "svol"]].round(4).to_string())
+
+rows = []
+for name, betas in BETA.items():
+    for bm, beta in betas.items():
+        o = opt.loc[bm]
+        hedge_notional = NOTIONAL * beta
+        contracts = hedge_notional / (o["uprc"] * 100)
+        rows.append({
+            "name": name, "hedge": bm, "beta": beta,
+            "hedge_notional_$mm": round(hedge_notional / 1e6, 1),
+            "contracts": round(contracts),
+            "put": f"{bm} {o['okey_xx']:.0f}P",
+            "est_price": round(o["est_price"], 2),
+            "cost_est_$mm": round(contracts * o["est_price"] * 100 / 1e6, 2),
+            "cost_mid_$mm": round(contracts * (o["obid"] + o["oask"]) / 2 * 100 / 1e6, 2),
+            "cost_pct_of_100mm": round(contracts * o["est_price"] * 100 / NOTIONAL * 100, 2),
+        })
+out = pd.DataFrame(rows)
+print()
+print(out.to_string(index=False))

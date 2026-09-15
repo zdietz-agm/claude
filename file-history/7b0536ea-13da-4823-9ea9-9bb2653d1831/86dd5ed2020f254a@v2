@@ -1,0 +1,38 @@
+import sys
+sys.path.insert(0, "D:/PycharmProjects/utils")
+import pandas as pd
+from spdr_rock_functions import run_query
+
+TARGET_PCT = {"SPY": 1.05, "QQQ": 1.32, "SMH": 2.36}
+EXP = (2026, 9, 16)
+
+rows = []
+for tk, pct in TARGET_PCT.items():
+    q = f"""
+        SELECT okey_tk, okey_xx, uprc, obid, oask, sprc, svol, de, timestamp
+        FROM msgoptionimpliedquoteadj
+        WHERE okey_tk='{tk}' AND okey_cp='Put'
+          AND okey_yr={EXP[0]} AND okey_mn={EXP[1]} AND okey_dy={EXP[2]}
+    """
+    df = run_query(q)
+    if df is None or df.empty:
+        print(tk, "NO ROWS")
+        continue
+    for c in ["okey_xx", "uprc", "obid", "oask", "sprc", "svol", "de"]:
+        df[c] = df[c].astype(float)
+    spot = df["uprc"].median()
+    target_strike = spot * (1 - pct / 100.0)
+    df["dist"] = (df["okey_xx"] - target_strike).abs()
+    b = df.sort_values("dist").iloc[0]
+    rows.append({
+        "ticker": tk, "spot": round(spot, 2), "tgt_pct": -pct,
+        "tgt_strike": round(target_strike, 2), "strike": b["okey_xx"],
+        "actual_pct": round((b["okey_xx"] / spot - 1) * 100, 2),
+        "bid": b["obid"], "ask": b["oask"], "mid": round((b["obid"] + b["oask"]) / 2, 3),
+        "sprc": b["sprc"], "iv": round(b["svol"] * 100, 1), "delta": round(b["de"], 3),
+        "quote_ts": str(b["timestamp"]),
+    })
+    print(tk, "strikes:", len(df), "spot:", spot, "latest ts:", df["timestamp"].max())
+
+print()
+print(pd.DataFrame(rows).to_string(index=False))

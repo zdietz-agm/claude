@@ -1,0 +1,60 @@
+# 9/11/2026 -- Bumped layer sized down 50% after backtest strike-selection bug fix
+
+## Why
+The bumped backtest (bumped_spread_backtest.py) did not match prod strike selection.
+Prod (bumped_spread_trader.py) always sells the parent's short strike one strike closer
+to ATM. The legacy backtest both decremented the strike index AND lowered
+min_strike_distance by $5. In the index-based strike logic the distance filter defines
+index 0, so on days where spot sat within $1 of a strike (the parent's filter dropped the
+near strike, ~20-25% of legs) the backtest landed TWO strikes closer than prod and
+collected 2-3 dollars of credit prod never had. Found reconciling 9/9/26 (prod bumped
+7635/7620 at 0.65, backtest 7640/7625 at 1.90). Confirmed in logs back to 7/16/26: 3 of
+8 prod bumped triggers hit the condition (8/12, 8/13, 9/9).
+
+Fixed 9/11/26. The backtest now uses prod semantics by default (--legacy-double-bump
+reproduces the old method). Re-running history with the fix, 43 of 172 legs change and
+the layer looks materially less attractive:
+
+                     legacy PnL   fixed PnL   fixed worst day   fixed lifetime, no rebal veto
+  IMBAL_GROWS         192,314     119,062       -96,444           ~62,000
+  IMBAL_VS_MARKET     -18,065     -13,687       -26,169           -13,687
+  IMBAL_SHRINKS       169,115      84,935       -32,045            84,935
+  Combined            343,364     190,310
+
+Without the retroactive rebal veto (which prod did not have before 9/9/26), the worst
+single day for GROWS and VS_MARKET loses more than the strategy's lifetime PnL, and for
+SHRINKS the worst day is ~38% of lifetime. On the affected days themselves the fix cuts
+PnL from 272k to 119k (win rate 74% -> 95%, worst day -19.5k -> -2.1k): the legacy
+method was booking near-ATM premium with tail risk prod never carried.
+
+I still believe these are net positive, but with less conviction, so sizing is halved
+rather than retired. Prod bumped history is short (first trade 4/22/26, 21 trades) and
+already includes -60.9k (8/18, 1.9x oversized) and -33.9k (6/4) on GROWS.
+
+## Changes
+
+D:/PycharmProjects/scratch/algos/configs_bumped_spreads/bumped_spread_config.py
+  - Removed from the scaled() / SIZE_KNOB methodology: dollar_target and max_size are now
+    literal values, not multiplied by SIZE_KNOB=2.6 at import. Effective sizing:
+      IMBAL_GROWS     57,200 / 114  ->  11,000 / 22
+      IMBAL_VS_MARKET 14,300 /  33  ->   2,750 /  7
+      IMBAL_SHRINKS   42,900 /  85  ->   8,250 / 16
+    (v7 script). v8 adds V8_SIZE_RATIO 0.20 of that: total prod 13.2k/26, 3.3k/8, 9.9k/19.
+    Max loss at a $0.30 credit (all cap at max_size, $14.70 loss): GROWS $38.2k, VS_MARKET
+    $11.8k, SHRINKS $28.0k v7+v8 combined (was ~$100k / $31k / $72k at the scaled sizes).
+  - algo_globals.py SIZE_KNOB comment updated (dial no longer touches the bumped layer).
+
+D:/agent_projects/eod_option_algos/bumped_spread_backtest.py
+  - Default strike selection now matches prod. --legacy-double-bump reproduces the old
+    method and writes bumped_spread_LEGACY_DOUBLE_BUMP_backtest_*.xlsx so the daily
+    review pack never picks it up.
+
+## Not changed / future option
+- CLOSER tolerances and strike rules unchanged. The premium the legacy backtest was
+  accidentally modeling (selling the strike nearest ATM on 1-lot days) is real and was
+  profitable in the flawed backtest, but prod never traded it. If we want to capture it
+  deliberately, the right vehicle is the CLOSER layer, not bumped: loosen the well_within
+  thresholds in closer_strike_config.py (VS_MARKET: market_ratio 0.7 / imbal 1.5B;
+  GROWS: imbal_340 < 1B / imbal_350 > 3B) and add an IMBAL_SHRINKS CLOSER variant. Would
+  need its own backtest first. Not doing this now.
+- Rebal veto, MAX_ATM_VOL 0.14, BUMP_STEP, SPREAD_WIDTH unchanged.

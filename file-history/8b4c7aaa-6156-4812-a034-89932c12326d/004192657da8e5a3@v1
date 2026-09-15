@@ -1,0 +1,108 @@
+"""
+call_breakeven.py
+-----------------
+Fast (~1 SR roundtrip) breakeven + Nx-payout calculator for a single LONG CALL,
+with optional $ slippage added on top of the SR mid.
+
+USAGE (CLI):
+    python call_breakeven.py <symbol> <expiry M/D[/Y]> <strike> [slippage]
+
+EXAMPLES:
+    python call_breakeven.py MRVL 6/18 330            # default slippage 0.10
+    python call_breakeven.py MRVL 6/18 330 0.05       # explicit slippage
+    python call_breakeven.py NVDA 7/3/26 175
+
+Defaults at the bottom of the Config block (used when no args). TARGET_PAYOUT_X
+is the Nx payout target reported on the last line; edit the constant to change.
+
+Payout math:
+    payout_x = profit / cost = N  ->  intrinsic = (N + 1) * cost
+    spot_for_target = strike + (N + 1) * cost
+"""
+
+import datetime as dt
+import sys
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+from spdr_rock_functions import run_query
+
+
+#%% Config defaults (used if no CLI args)
+SYMBOL   = "MRVL"
+EXPIRY   = dt.date(2026, 6, 18)
+STRIKE   = 330
+SLIPPAGE = 0.10
+TARGET_PAYOUT_X = 4
+
+
+#%% CLI parsing -- args override defaults
+def parse_expiry(s):
+    parts = s.split("/")
+    if len(parts) == 2:
+        m, d = int(parts[0]), int(parts[1])
+        y = dt.date.today().year
+    elif len(parts) == 3:
+        m, d, y = int(parts[0]), int(parts[1]), int(parts[2])
+        if y < 100:
+            y += 2000
+    else:
+        raise ValueError(f"Bad expiry format: {s!r}. Expected M/D, M/D/YY, or M/D/YYYY.")
+    return dt.date(y, m, d)
+
+
+USAGE = (
+    "Usage: python call_breakeven.py [<symbol>] <expiry M/D[/Y]> <strike> [slippage]\n"
+    "  Symbol is optional -- defaults to the SYMBOL constant at the top of the file.\n"
+    "Examples:\n"
+    "  python call_breakeven.py MRVL 6/18 330 0.05\n"
+    "  python call_breakeven.py 6/18 330 0.05         (uses default symbol)"
+)
+
+argv = sys.argv[1:]
+if argv:
+    # Detect whether user omitted symbol: a date arg always contains '/'.
+    if "/" in argv[0]:
+        if len(argv) < 2:
+            print(USAGE); sys.exit(1)
+        EXPIRY = parse_expiry(argv[0])
+        STRIKE = float(argv[1])
+        if len(argv) >= 3:
+            SLIPPAGE = float(argv[2])
+    else:
+        if len(argv) < 3:
+            print(USAGE); sys.exit(1)
+        SYMBOL = argv[0].upper()
+        EXPIRY = parse_expiry(argv[1])
+        STRIKE = float(argv[2])
+        if len(argv) >= 4:
+            SLIPPAGE = float(argv[3])
+
+
+#%% Single SR query
+sql = f"""
+    SELECT sprc, uprc FROM msgOptionImpliedQuote
+    WHERE okey_tk='{SYMBOL}' AND okey_xx={STRIKE} AND okey_cp='Call'
+      AND okey_yr={EXPIRY.year} AND okey_mn={EXPIRY.month} AND okey_dy={EXPIRY.day}
+    ORDER BY timestamp DESC LIMIT 1
+"""
+df = run_query(sql)
+if df is None or df.empty:
+    raise RuntimeError(f"No SR quote for {SYMBOL} {STRIKE:g} Call {EXPIRY:%m/%d/%Y}")
+sprc = float(df.iloc[0]['sprc'])
+uprc = float(df.iloc[0]['uprc'])
+
+
+#%% Compute + display
+mid = sprc
+cost = mid + SLIPPAGE
+breakeven_spot = STRIKE + cost
+breakeven_pct = (breakeven_spot / uprc - 1) * 100
+spot_for_target = STRIKE + (TARGET_PAYOUT_X + 1) * cost
+target_pct = (spot_for_target / uprc - 1) * 100
+
+print(f"{SYMBOL} {EXPIRY.month}/{EXPIRY.day} {STRIKE:g} call")
+print(f"  Spot:           ${uprc:.2f}")
+print(f"  Mid:            ${mid:.2f}")
+print(f"  Cost (+{SLIPPAGE:.2f}): ${cost:.2f}")
+print(f"  Breakeven:      ${breakeven_spot:.2f}  ({breakeven_pct:+.1f}%)")
+print(f"  Pays {TARGET_PAYOUT_X}x above: ${spot_for_target:.2f} ({target_pct:+.1f}%)")

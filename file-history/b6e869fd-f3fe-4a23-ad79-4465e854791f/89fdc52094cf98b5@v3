@@ -1,0 +1,105 @@
+"""
+Relative (vs SPY) cumulative returns of every regular-cycle S&P 500 add from the announcement
+close through the effective date.
+
+For each add in INDIVIDUAL_ADDS (regular quarterly cycles only): anchor = announcement Friday
+close (PX_LAST, adjust='all' -- splits + dividends). For each trading day t+1 .. eff date
+(t+10 normally, t+9 when a holiday falls in the window), cumulative return of the name minus
+the cumulative return of SPY over the same window, in %. Median row at the bottom.
+
+Standalone: Bloomberg only via bloomberg_helpers.my_bdh (adjust='all' pulls are never cached).
+Run standalone as  python -c "exec(open('add_relative_returns.py').read())"  (my_bdh spawns a
+child process; a plain `python file.py` re-executes the module under multiprocessing spawn).
+"""
+#%% Imports / config
+import ast
+import datetime as dt
+import sys
+
+import numpy as np
+import pandas as pd
+from IPython.display import display
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import bloomberg_helpers as bbg
+from calendar_utils import trading_range
+
+HELPERS_PATH = 'D:/agent_projects/sp500_adds/sp500_helpers.py'
+BENCH = 'SPY'
+TODAY = dt.date.today()
+pd.set_option('display.width', 250)
+
+
+def load_lists(path):
+    """Return (ANNOUNCEMENT_CYCLES, INDIVIDUAL_ADDS) from sp500_helpers.py via AST (no liberator import)."""
+    tree = ast.parse(open(path, encoding='utf-8').read())
+    ns = {'dt': dt}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in ('ANNOUNCEMENT_CYCLES', 'INDIVIDUAL_ADDS') for t in node.targets):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), path, 'exec'), ns)
+    return ns['ANNOUNCEMENT_CYCLES'], ns['INDIVIDUAL_ADDS']
+
+
+#%% Build (annc, symbol, eff) rows: each add mapped to the regular-cycle announcement before its eff date
+ANNOUNCEMENT_CYCLES, INDIVIDUAL_ADDS = load_lists(HELPERS_PATH)
+_anncs = sorted(a for a, _ in ANNOUNCEMENT_CYCLES)
+ADDS = []
+for eff, sym in sorted(INDIVIDUAL_ADDS):
+    annc = max(a for a in _anncs if a < eff)
+    assert (eff - annc).days <= 21, (sym, annc, eff)
+    ADDS.append({'annc': annc, 'symbol': sym, 'eff': eff})
+ADDS = pd.DataFrame(ADDS)
+print(f"{len(ADDS)} adds across {ADDS.annc.nunique()} cycles")
+
+#%% Cache: adjusted daily closes (PX_LAST, adjust='all') for the adds + SPY
+if 'PX' not in dir():
+    _tk = [f"{s} US Equity" for s in sorted(set(ADDS.symbol)) + [BENCH]]
+    PX = bbg.my_bdh(_tk, 'PX_LAST', ADDS.annc.min() - dt.timedelta(days=5), TODAY, adjust='all',
+                    timeout=300, verbose=True)
+    PX = PX.droplevel(1, axis=1)
+    PX.columns = [c.replace(' US Equity', '') for c in PX.columns]
+    PX.index = pd.to_datetime(PX.index).date
+
+
+#%% Cache: CUR_MKT_CAP on the announcement date ($mm) -> estimated index demand = INDEX_PCT x mkt cap
+INDEX_PCT = 0.12   # rough S&P 500 index-fund ownership share used to size the add
+if 'MKTCAP' not in dir():
+    MKTCAP = {}
+    for r in ADDS.itertuples():
+        m = bbg.my_bdh(f"{r.symbol} US Equity", 'CUR_MKT_CAP', r.annc, r.annc, adjust='-', timeout=120, verbose=True)
+        MKTCAP[(r.annc, r.symbol)] = float(m.iloc[0, 0]) if len(m) else np.nan
+ADDS['mkt_cap_bn'] = [MKTCAP[(r.annc, r.symbol)] / 1000 for r in ADDS.itertuples()]
+ADDS['est_size_bn'] = ADDS['mkt_cap_bn'] * INDEX_PCT
+
+
+#%% Relative cumulative returns t+1 .. eff
+def build_table():
+    """One row per add: cumulative return of the name minus cumulative SPY return (%, adjusted
+    PX_LAST) for each trading day after the announcement through the effective date."""
+    rows = []
+    for r in ADDS.itertuples():
+        days = trading_range(r.annc, r.eff)          # includes annc (t+0) .. eff
+        base_s, base_b = PX.at[r.annc, r.symbol], PX.at[r.annc, BENCH]
+        row = {'annc': r.annc, 'symbol': r.symbol, 'eff': r.eff, 'days_to_eff': len(days) - 1,
+               'mkt_cap_bn': r.mkt_cap_bn, 'est_size_bn': r.est_size_bn, 'annc_px': base_s, 'annc_spy': base_b}
+        for i, d in enumerate(days[1:], start=1):
+            if d in PX.index and pd.notna(PX.at[d, r.symbol]):
+                row[f't+{i}'] = ((PX.at[d, r.symbol] / base_s) - (PX.at[d, BENCH] / base_b)) * 100
+            else:
+                row[f't+{i}'] = np.nan
+        row['eff_rel'] = row.get(f't+{len(days) - 1}', np.nan)
+        rows.append(row)
+    tbl = pd.DataFrame(rows).sort_values('est_size_bn', ascending=False)   # largest estimated add first
+    tcols = [c for c in tbl.columns if c.startswith('t+')]
+    med = {c: tbl[c].median() for c in tcols + ['eff_rel', 'days_to_eff', 'mkt_cap_bn', 'est_size_bn']}
+    med.update({'annc': 'MEDIAN', 'symbol': f'n={len(tbl)}', 'eff': ''})
+    return pd.concat([tbl, pd.DataFrame([med])], ignore_index=True), tcols
+
+
+REL, TCOLS = build_table()
+show = REL[['annc', 'symbol', 'eff', 'mkt_cap_bn', 'est_size_bn', 'days_to_eff'] + TCOLS + ['eff_rel']].copy()
+print(f"Relative return vs {BENCH} (%), cumulative from announcement close, adjusted PX_LAST. "
+      f"eff_rel = value on the effective date (t+days_to_eff). est_size_bn = {INDEX_PCT:.0%} x CUR_MKT_CAP on the "
+      f"annc date ($bn). Sorted by est_size_bn. Data through {PX.index.max()}.")
+display(show.round(1).to_string(index=False))

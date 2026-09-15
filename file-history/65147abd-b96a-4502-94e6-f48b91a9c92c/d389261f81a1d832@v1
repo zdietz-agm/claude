@@ -1,0 +1,367 @@
+import datetime as dt
+import time
+import asyncio
+import pandas as pd
+import numpy as np
+
+import os
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+
+from google_chat_webhook import send_message, my_chat, aa
+from calendar_utils import getNowEst, SERIALS, wait_until
+from spdr_rock_functions import run_query, getLivePrices
+from xbbg import blp
+today = dt.date.today()
+
+# --- SpiderRock v8 migration toggle (per-script) --------------------------------------------
+# USE_V8=True -> DATA reads on v8 (SPY price via srlive.msgstockprint). SEND_V8=True -> stock
+# orders + fills on v8 too (MOC-retry chain + TWAP slices all route through the SEND_V8-gated
+# primitives in spdr_rock_stock_order_functions). No import-ordering constraint here: this
+# script imports no get_closest_* SQL strings. USE_V8=False -> v7, byte-for-byte.
+USE_V8  = True
+SEND_V8 = True
+if USE_V8:
+	import spdr_rock_functions as _srf_v8
+	_srf_v8.use_v8_connection(True, send=SEND_V8)
+
+from helpers import (get_350_imbal, get_355_imbal, NO_IMBAL_VAL, load_configs_from_directory_for_stock,
+                     get_market_measurements, likely_stale_calendars, TEST_ACCOUNTS, is_month_end,
+                     is_fed_day, LAST_HOUR, TIME_FORMAT, pretty_time)
+from helpers_stock import *
+# Fill-watch plumbing. Module imported by name too so IS_TEST can override the FILL_POLL_* knobs in
+# place -- rebinding star-imported copies would not affect the poller.
+import spdr_rock_stock_order_functions
+from spdr_rock_stock_order_functions import (register_fill_watch, wait_for_first_probes,
+                                            fill_warning_banner, _send_alert)
+seed = int(dt.datetime.now().strftime("%f")) % 10000
+counter = create_counter(seed)
+
+# --- Test-mode CLI ---------------------------------------------------------------------------
+# Prod runs with NO arguments. Passing ANY argument without --test is a hard error, so a prod
+# launch can never be silently overridden.
+import argparse as _argparse
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--test", action="store_true")
+_p.add_argument("--trigger-all", action="store_true")
+_p.add_argument("--send-trades", type=lambda s: s.strip().lower() == "true", default=None)
+_p.add_argument("--test-350pm-imbal", type=float, default=None)   # 3:50 SPX imbal
+_p.add_argument("--test-355pm-imbal", type=float, default=None)   # 3:55 SPX imbal
+_p.add_argument("--test-market-350", type=str, default=None)      # UP / DOWN / FLAT
+_p.add_argument("--test-spy-price-1550", type=float, default=None)
+_p.add_argument("--test-spy-price-1555", type=float, default=None)
+_p.add_argument("--test-spy-price-sr", type=float, default=None)   # SpiderRock 15:54:45 sizing price
+_p.add_argument("--test-skip-moc", action="store_true")           # force the TWAP fallback path
+_a = _p.parse_args()
+if len(sys.argv) > 1 and not _a.test:
+	raise AssertionError(f"CLI args are only allowed in test mode. Got {sys.argv[1:]}. Pass --test.")
+
+IS_TEST = False or _a.test
+TRIGGER_ALL = False or _a.trigger_all
+SEND_TRADES = True if _a.send_trades is None else _a.send_trades
+TEST_350PM_IMBAL = 0.2e9 if _a.test_350pm_imbal is None else _a.test_350pm_imbal
+TEST_355PM_IMBAL = 1.6e9 if _a.test_355pm_imbal is None else _a.test_355pm_imbal
+# None = use the live get_market_measurements() read. Set to force the market-type factors.
+TEST_MARKET_350 = _a.test_market_350
+TEST_SPY_PRICE_1550 = _a.test_spy_price_1550
+TEST_SPY_PRICE_1555 = _a.test_spy_price_1555
+# None = do the real getLivePrices() pull, which works at any time of day.
+TEST_SPY_PRICE_SR = _a.test_spy_price_sr
+# Testing only: skip every MOC attempt so the TWAP fallback runs end to end. False is the only
+# valid prod value; the assert below refuses to run with IS_TEST False.
+TEST_SKIP_MOC = False or _a.test_skip_moc
+
+# In test mode the exit schedule is compressed, since 15:55/15:59:30 will not arrive. Offsets are
+# seconds from just before prep_trades, so the whole exit resolves about 30 seconds after entry.
+# The MOC phase needs at least moc_attempts * MOC_STATUS_WAIT (6 * 2s = 12s) of room, so the
+# attempts run back to back inside their window rather than idling between them.
+TEST_MOC_FIRST_OFFSET_S = 5
+TEST_MOC_LAST_OFFSET_S = 15
+TEST_TWAP_START_OFFSET_S = 20
+TEST_TWAP_END_OFFSET_S = 30
+
+if __name__ == "__main__":
+	# _____________________________________________________________Preparation Logic_____________________________________________________________
+
+	if TRIGGER_ALL and not IS_TEST:
+		raise AssertionError("TRIGGER_ALL is set to True but IS_TEST is False. This is not allowed.")
+
+	if not SEND_TRADES and not IS_TEST:
+		raise AssertionError("SEND_TRADES is set to False but IS_TEST is False. This is not allowed.")
+
+	if TEST_SKIP_MOC and not IS_TEST:
+		raise AssertionError("TEST_SKIP_MOC is set to True but IS_TEST is False. This is not allowed.")
+
+	# load all config dictionaries
+	month_end = is_month_end()
+	fed_day = is_fed_day()
+	serial = today in SERIALS
+	configs = load_configs_from_directory_for_stock("./configs_stock", time="355PM", is_month_end=month_end, is_fed_day=fed_day, is_serial=serial)
+	print(f"Loaded configs (is_month_end={month_end}, is_fed_day={fed_day}, is_serial={serial}):")
+	for cfg in configs:
+		print(cfg["name"])
+
+	if IS_TEST:
+		for config in configs:
+			config["account"] = TEST_ACCOUNTS[config["account"]]
+			# Sending test orders to v8 -> route to the v8 test account (T.AGM* only exists on v7).
+			if SEND_V8 and str(config["account"]).startswith("T.AGM"):
+				config["account"] = "T.AGMV8.01"
+			# skip_moc forces the TWAP fallback. Without it a midday test gets its MOC ACCEPTED and
+			# the TWAP path is never exercised. The exit function refuses skip_moc on a non-T. account.
+			config["skip_moc"] = TEST_SKIP_MOC
+		# The exit schedule is compressed just before prep_trades, NOT here -- the Bloomberg and
+		# imbalance calls between here and there take tens of seconds, which would silently eat the
+		# offsets and fire every MOC attempt back to back.
+
+	if not IS_TEST:
+		print(f"{pretty_time()} -- Building start message")
+		start_msg = f"{getNowEst().time().strftime('%I:%M:%S %p')} Starting 355pm stock algo script."
+		stale_warning = likely_stale_calendars()
+		if stale_warning:
+			start_msg += f"\n{stale_warning}"
+		send_message(start_msg, my_chat)
+		print(f"{pretty_time()} -- Finished sending start message")
+	summary = f"{dt.date.today().strftime('%m/%d/%Y')} {'3:55 PM Stock Algo' if not IS_TEST else 'TEST'} RECAP:\n\n"
+
+	factor_dict = {}
+
+	# _____________________________________________________________3:50 Measurements_____________________________________________________________
+	# market_type for IMBAL_VS_MARKET comes from the 3:50 snap, NOT a 3:55 measurement. Calling
+	# get_market_measurements() here uses the live 3:50 SPY print (the bdh with end_date=today puts
+	# today's live PX_LAST at position -1), which is exactly the measurement the strategy wants.
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 50, 3), poll_interval=0.1)  # 3:50:03 PM
+
+	print(f"{pretty_time()} -- Starting get_market_measurements() (350pm)")
+	market_350, today_move_350, std_350 = get_market_measurements()
+	print(f"{pretty_time()} -- Finished get_market_measurements(): market={market_350}")
+	if IS_TEST and TEST_MARKET_350 is not None:
+		market_350 = TEST_MARKET_350.upper()
+		print(f"{pretty_time()} -- TEST: market_350 forced to {market_350}")
+	# market_ratio = raw return / std. get_market_measurements returns the RAW return as its 2nd
+	# element (it normalizes only internally), so the division is required. Reported for the recap
+	# only -- the factors below key off the market string, which thresholds at the same +/-0.5.
+	market_ratio_350 = (today_move_350 / std_350) if std_350 else 0.0
+
+	if IS_TEST and TEST_SPY_PRICE_1550 is not None:
+		spy_price_1550 = TEST_SPY_PRICE_1550
+	else:
+		spy_price_1550 = blp.bdp("SPY US Equity", "PX_LAST").iloc[0, 0]
+	print(f"{pretty_time()} -- SPY at 3:50: {spy_price_1550:.2f}")
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 51, 0), poll_interval=0.5)  # 3:51:00 PM
+
+	print(f"{pretty_time()} -- Starting get_350_imbal()")
+	imbal_350 = get_350_imbal(is_test=IS_TEST, test_imbal=TEST_350PM_IMBAL)
+	print(f"{pretty_time()} -- Finished get_350_imbal(): {imbal_350}")
+
+	if imbal_350 == NO_IMBAL_VAL:
+		summary += "No 3:50pm imbalance found. Exited (IMBAL_GROWS needs it).\n"
+		send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary, my_chat)
+		exit()
+
+	# _____________________________________________________________3:55 Measurements_____________________________________________________________
+	# SpiderRock SPY price for SIZING ONLY, pulled 18s ahead of the 15:55:03 entry. It does NOT feed
+	# any factor: the spy_chg_1550_1555_bps veto stays on the Bloomberg 3:50 and 3:55 prints so it
+	# matches 355pm_script.py and the backtest exactly. getLivePrices is not a raw last trade -- it
+	# uses the print price when the last print is >= 100 shares, else a size-weighted NBBO mid
+	# blended with it. 15:54:45 also lands ahead of 355pm_script.py's 15:54:50 pool warm.
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 54, 45), poll_interval=0.1)  # 3:54:45 PM
+
+	if IS_TEST and TEST_SPY_PRICE_SR is not None:
+		spy_price_sr = TEST_SPY_PRICE_SR
+	else:
+		print(f"{pretty_time()} -- Starting getLivePrices()")
+		spy_price_sr = getLivePrices(symbols=["SPY"])["SPY"].values[0]
+		print(f"{pretty_time()} -- Finished getLivePrices()")
+	print(f"{pretty_time()} -- SPY at 3:54:45 (SpiderRock, for sizing): {spy_price_sr:.2f}")
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 55, 0), poll_interval=0.1)  # 3:55:00 PM
+
+	if IS_TEST and TEST_SPY_PRICE_1555 is not None:
+		spy_price_1555 = TEST_SPY_PRICE_1555
+	else:
+		_m355, _tm355, _std355, spy_price_1555 = get_market_measurements(return_spy_price=True)
+	print(f"{pretty_time()} -- SPY at 3:55: {spy_price_1555:.2f}")
+
+	spy_chg_1550_1555_bps = (spy_price_1555 - spy_price_1550) / spy_price_1550 * 10000
+	print(f"{pretty_time()} -- SPY chg 3:50-3:55: {spy_chg_1550_1555_bps:.1f} bps")
+
+	# 15:55:01.5, NOT :01 -- 355pm_script.py pulls at :01, so this offset keeps the two scripts'
+	# imbal queries from hitting the DB at the same instant.
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 55, 1, 500000), poll_interval=0.05)  # 3:55:01.5 PM
+
+	print(f"{pretty_time()} -- Starting get_355_imbal()")
+	imbal_355 = get_355_imbal(is_test=IS_TEST, test_imbal=TEST_355PM_IMBAL, basket_name='.SPX',
+	                          sleep_between=0.1, max_attempts=40)
+	print(f"{pretty_time()} -- Finished get_355_imbal(): {imbal_355}")
+
+	if imbal_355 == NO_IMBAL_VAL:
+		summary += "No 3:55pm imbalance found. Exited.\n"
+		send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary, my_chat)
+		exit()
+
+	# _____________________________________________________________Factors_____________________________________________________________
+
+	print(f"{pretty_time()} -- Starting factor_dict construction")
+	# IMBAL_VS_MARKET. market == "UP"/"DOWN" is exactly market_ratio > 0.5 / < -0.5: inside
+	# get_market_measurements the test is (ret / (0.5 * std)) > 1, which is the same inequality.
+	factor_dict["factor_market_type_up"] = 1 if market_350 == "UP" else 0
+	factor_dict["factor_market_type_down"] = 1 if market_350 == "DOWN" else 0
+	factor_dict["factor_355_imbal_positive"] = 1 if imbal_355 > 0 else 0
+	factor_dict["factor_355_imbal_negative"] = 1 if imbal_355 < 0 else 0
+	# IMBAL_GROWS
+	factor_dict["factor_355_imbal_gte_1B"] = 1 if imbal_355 >= 1e9 else 0
+	factor_dict["factor_355_imbal_lte_neg1B"] = 1 if imbal_355 <= -1e9 else 0
+	factor_dict["factor_350_imbal_lt_400M"] = 1 if imbal_350 < 0.4e9 else 0
+	factor_dict["factor_350_imbal_gt_neg400M"] = 1 if imbal_350 > -0.4e9 else 0
+	# Shared don't-trade factors. Same names as 355pm_script.py so prod and backtest agree.
+	factor_dict["factor_spy_chg_1550_1555_lt_neg12bps"] = 1 if spy_chg_1550_1555_bps < -12 else 0
+	factor_dict["factor_spy_chg_1550_1555_gt_12bps"] = 1 if spy_chg_1550_1555_bps > 12 else 0
+	print(f"{pretty_time()} -- Finished factor_dict construction")
+	for k, v in factor_dict.items():
+		print(f"    {k} = {v}")
+
+	# _____________________________________________________________Opposite-Side Guard_____________________________________________________________
+	# The two strategies are nearly independent (4 overlap days historically, none on opposite
+	# sides), but if they ever disagree on direction we trade NEITHER rather than crossing ourselves.
+	# Evaluated here, before prep_trades builds any coroutine.
+
+	if not TRIGGER_ALL:
+		sides_firing = {}
+		for config in configs:
+			buy, _ = get_size(factor_dict, "Buy",
+			                  buy_triggers=config["buy_triggers"],
+			                  sell_triggers=config["sell_triggers"],
+			                  buy_dont_trade_triggers=config["buy_dont_trade_triggers"],
+			                  sell_dont_trade_triggers=config["sell_dont_trade_triggers"],
+			                  rule_descriptions=config.get("rule_descriptions"))
+			sell, _ = get_size(factor_dict, "Sell",
+			                   buy_triggers=config["buy_triggers"],
+			                   sell_triggers=config["sell_triggers"],
+			                   buy_dont_trade_triggers=config["buy_dont_trade_triggers"],
+			                   sell_dont_trade_triggers=config["sell_dont_trade_triggers"],
+			                   rule_descriptions=config.get("rule_descriptions"))
+			if buy:
+				sides_firing.setdefault("Buy", []).append(config["name"])
+			if sell:
+				sides_firing.setdefault("Sell", []).append(config["name"])
+		if "Buy" in sides_firing and "Sell" in sides_firing:
+			conflict_msg = (f"{'!' * 10} 355PM STOCK: OPPOSITE SIDES TRIGGERED. Trading NEITHER. "
+			                f"{'!' * 10}\nBuy: {sides_firing['Buy']}\nSell: {sides_firing['Sell']}")
+			_send_alert(conflict_msg)
+			summary += conflict_msg + "\n"
+			configs = []
+
+	# _____________________________________________________________Prep Trades_____________________________________________________________
+
+	# Sizing uses the SpiderRock 15:54:45 print, not the Bloomberg 3:55 snap.
+	price_dict = {"SPY": spy_price_sr}
+
+	if IS_TEST:
+		# Compressed here, after all the slow data calls, so the offsets are measured from a moment
+		# that is actually close to when the exit machinery starts running.
+		_now = getNowEst()
+		for config in configs:
+			config["end_time"] = (_now + dt.timedelta(seconds=TEST_TWAP_END_OFFSET_S + 20)).time()
+			config["moc_first_attempt"] = (_now + dt.timedelta(seconds=TEST_MOC_FIRST_OFFSET_S)).time()
+			config["moc_last_attempt"] = (_now + dt.timedelta(seconds=TEST_MOC_LAST_OFFSET_S)).time()
+			config["twap_start"] = (_now + dt.timedelta(seconds=TEST_TWAP_START_OFFSET_S)).time()
+			config["twap_end"] = (_now + dt.timedelta(seconds=TEST_TWAP_END_OFFSET_S)).time()
+		if configs:
+			print(f"TEST: exit schedule -- MOC x{configs[0]['moc_attempts']} from "
+			      f"{configs[0]['moc_first_attempt'].strftime('%H:%M:%S')} to "
+			      f"{configs[0]['moc_last_attempt'].strftime('%H:%M:%S')}, TWAP "
+			      f"{configs[0]['twap_start'].strftime('%H:%M:%S')} to "
+			      f"{configs[0]['twap_end'].strftime('%H:%M:%S')}, skip_moc={TEST_SKIP_MOC}")
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 55, 3), poll_interval=0.01)  # 3:55:03 PM
+
+	print(f"{pretty_time()} -- Starting prep_trades()")
+	trade_dict = prep_trades(
+		configs=configs,
+		factor_dict=factor_dict,
+		price_dict=price_dict,
+		trigger_all=TRIGGER_ALL,
+		poll_interval=0.1,
+		debug=True,
+		is_test=IS_TEST
+		)
+	print(f"{pretty_time()} -- Finished prep_trades()")
+
+	# _____________________________________________________________Summary_____________________________________________________________
+
+	summary += f"SPY 3:50: {spy_price_1550:,.2f}. SPY 3:55: {spy_price_1555:,.2f}. Chg: {spy_chg_1550_1555_bps:.1f} bps.\n"
+	summary += f"SPY 3:54:45 (SR, sizing): {spy_price_sr:,.2f}.\n"
+	summary += f"Market (3:50): {market_350}. Market Ratio: {market_ratio_350:.2f}.\n"
+	summary += f"350pm Imbal: {imbal_350:,.0f}. 355pm Imbal: {imbal_355:,.0f}.\n"
+
+	summary += "\n*Explanations:*"
+	for algo_name, explanations in trade_dict["explanations"]:
+		summary += f"""\n{algo_name}:\n"""
+		summary += explanations
+	if len(trade_dict["explanations"]) == 0:
+		summary += "\nNo trades triggerred."
+
+	# Register a fill watch per fired trade so the recap can report fill status. trades[] and
+	# explanations[] are appended in lockstep in prep_trades, so index i lines up -- but pair
+	# defensively so a mismatch can never drop a coroutine.
+	explanation_names = [algo_name for algo_name, _ in trade_dict["explanations"]]
+	fired_names = [explanation_names[i] if i < len(explanation_names) else f"UNKNOWN_ALGO_{i}"
+	               for i in range(len(trade_dict["trades"]))]
+	if len(explanation_names) != len(trade_dict["trades"]):
+		_send_alert(f"{'!' * 10} prep_trades returned {len(trade_dict['trades'])} trades but "
+		            f"{len(explanation_names)} explanations. Trades ARE still firing; fill-watch "
+		            f"names may be wrong for some. {'!' * 10}")
+	fill_events = [register_fill_watch(n) for n in fired_names]
+
+	async def send_summary():
+		# Bounded wait on probe 1 only -- never on the 60s poll loop or the exit schedule.
+		await wait_for_first_probes(fill_events)
+		body = fill_warning_banner() + summary
+		print(body)
+		send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + body, my_chat)
+
+	async def _safe_send(coro, trade_name):
+		"""Wrap a trade coroutine so one failure does not kill the other algos or the recap."""
+		try:
+			return await coro
+		except Exception as e:
+			_send_alert(f"{'!' * 10} {trade_name} TRADE FAILED: {type(e).__name__}: {e} {'!' * 10}\n"
+			            f"Check whether an opening order filled and needs manual flattening.")
+			return None
+
+	# _____________________________________________________________Send Trades_____________________________________________________________
+	# NOTE: these coroutines do not return until the exit is resolved -- a MOC acceptance by ~15:56:30
+	# or the TWAP finishing by ~16:00. The script stays alive until then by design.
+	print(f"{pretty_time()} -- Starting asyncio.run(send_trades())")
+	if SEND_TRADES:
+		async def send_trades():
+			results = await asyncio.gather(
+				*([_safe_send(c, n) for c, n in zip(trade_dict["trades"], fired_names)]
+				  + [send_summary()]),
+				return_exceptions=True
+			)
+			return results
+
+		all_results = asyncio.run(send_trades())
+
+		# Exit recap: how each algo actually got out. Sent separately because it cannot be known
+		# until ~16:00, long after the entry recap goes out.
+		exit_lines = []
+		for name, res in zip(fired_names, all_results):
+			if isinstance(res, dict):
+				line = f"{name}: exit={res.get('exit_method')}"
+				if res.get("twap") and res["twap"].get("avg_price") is not None:
+					line += (f", TWAP filled {res['twap']['filled']}/{res['twap']['requested']} "
+					         f"at {res['twap']['avg_price']:.4f}")
+				elif res.get("close_grouping_code") is not None:
+					line += f", groupingCode={res['close_grouping_code']}"
+				exit_lines.append(line)
+		if exit_lines:
+			exit_body = f"{dt.date.today().strftime('%m/%d/%Y')} 3:55 PM Stock Algo EXIT RECAP:\n\n" + "\n".join(exit_lines)
+			print(exit_body)
+			send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + exit_body, my_chat)
+	print(f"{pretty_time()} -- Finished asyncio.run(send_trades())")

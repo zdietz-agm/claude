@@ -1,0 +1,24 @@
+- [Never suppress call outputs](feedback_never_suppress_output.md) -- don't redirect/suppress stdout from library calls
+- [Prefers .txt over .md](prefers-txt-over-md.md) -- hand-edited files default to .txt (assistant tracker.txt)
+- [Spread recap process](spread_recap_process.md) -- how to build position recaps from for_claude.xlsx-style files (use Price column, sum YTD PnL legs, back out avg cost)
+- [Backtest imbal timing: use t not t-1](backtest_imbal_t_vs_tm1.md) -- BTIC backtest gate should look up imbal at t (not t-1); prod's cap_time aligns sub-$1M median with backtest DB at t
+- [PyCharm pinned to 2024.2](pycharm-version-2024-2.md) -- intentional rollback from 2026.1 (Jupyter display()-in-loop render bug); don't suggest upgrading; test loop-display before any future upgrade
+- [Reconcile-skill concise voice](reconcile_skill_concise_voice.md) -- verbatim example explanations for future reconcile-backtests skill
+- [SpiderRock enum links + cancel-terminal rule](spiderrock-enum-and-cancel-terminal.md) -- SpdrOrderStatus/SpdrCloseReason enums + doc links; terminal (safe to resize) = {Closed,Rejected,SendReject}, still-fills = {PendNew,New,PendClose}
+- [Gated link: stop and ask](feedback-gated-link-stop-and-ask.md) -- if a user-shared link is login/auth-gated, halt and ask the user to paste contents; don't guess/work around
+- [SpiderRock v8 migration](spiderrock-v8-migration.md) -- v7->v8 for 3 EOD algos, script-by-script; 340PM DONE+validated (2026-07-27), fast/stock scripts next; v8=192.81.231.66:3700; srlive GRANTED (stock prices=srlive.msgstockprint stream); USE_V8 toggle; stock fills still need msgsrstkbrkrstate->msgsrparentbrkrstate; full running notes in D:/PycharmProjects/scratch/algos/migration_to_v8.txt
+- [Zach's casual writing voice](casual-style-zach-voice.md) -- what "make it casual / match my style" means, with a verbatim mine-vs-his pair
+- [Support questions: conversational + trimmed](feedback-support-questions-conversational.md) -- SUPERSEDED by casual-style-zach-voice; keeps the "cut non-essential sub-questions" rule
+- [Concise code comments](feedback-concise-comments.md) -- keep comments short and to the point; user flagged long-comment tendency
+- [JPM quarterly collar research](jpm-quarterly-collar-research.md) -- lost in D-drive migration, recovered files in Dropbox collar_recovery_files; redo strike-inference from t_historical_options_snaps volume before Sept 2026 quarterly ME
+- [Algos venv migration](algos-venv-migration.md) -- prod launchers + test harness run on scratch/.venv (not global); never source its activate blindly; most .exe shims still dead, use python -m
+- [Reconciliation size diffs: check LossCap first](reconcile-size-diff-losscap-first.md) -- prod-smaller-than-backtest is usually the script/global loss-cap pro-rata (not config max_size or a v8 split); backtest doesn't model loss caps
+- [Automated daily algo review](algo-daily-review-project.md) -- algo-review task (weekdays 8:25) + the correction-loop file Zach edits for ~2 weeks
+- [W2 NBBO-anchor to-do](w2-nbbo-anchor-todo.md) -- OPEN: proposed-not-implemented fix for sprc-anchored spread-sale limits missing fills when SR surface dislocates from NBBO (8/4, 7/23); blocked on SR quote-latency answer from Saurav + optional srPrc-vs-NBBO study
+- [QYLD monthly roll](qyld-monthly-roll.md) -- monthly strike append + rerun of qyld/qyld_analysis.py; next expected ~2026-09-17 (Sept serial 2026-09-18); last entry ("2026-08-21", 28550)
+- [v7 vs v8 SPX/vol divergence](v7-v8-spx-price-divergence.md) -- $3 SPX gap at 15:55 8/24; compare scripts: compare_spx_v7_v8.py + adhoc/v8_atm_vol_compare.py
+- [Hacker >$2 debit days table](hack-max-price-over-2-backtest.md) -- 14 days/17 legs where uncapped hack debit > HACK_MAX_PRICE $2; pooled delta -$1.04M, cap is protective (8/27/26 backtest)
+- [Hacker backtest open items](hacker-backtest-open-items.md) -- daily task CreateBacktestsHacker 8:19 (run_backtest_hacker.py, cap regex-read from prod) + per-script hacker sub-block in the digest (9/3/26); OPEN: worse-than-cross fills, confirm cap; never run hacking_355_backtest.py bare/--help (no argparse, runs full history)
+- [Liberator decommissioned -> Snowflake](liberator-decommissioned-snowflake.md) -- helpers_improved renamed get_options_data_from_liberator -> _from_snowflake (9/8/26); V8 0DTE atmVol differs from stored Liberator data; my_bdh spawn gotcha for standalone #%% scripts
+- [large_index_flows project](large-index-flows-project.md) -- >$7B single-name index-flow events list done 9/10/26 (D:/agent_projects/large_index_flows); next: ThetaData 0DTE strangle test at 3pm on eff dates; AVGO/AAPL sizes still TBD from Zach
+- [SpiderRock locate upload](spiderrock-locate-upload.md) -- bulk locates via SRSE REPLACE INTO srcontrol.msgawaystocklocategateway (script: adhoc/upload_stock_locates.py); v8 works, v7 rows land in SQL but not SV GUI -- Zach does v7 manually, don't re-attempt

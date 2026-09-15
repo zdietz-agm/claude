@@ -1,0 +1,34 @@
+"""Configuration for bumped spread strategy (sell $5-wide spreads on 1-lot days)."""
+
+from algo_globals import *
+
+# Per-strategy config: account, dollar_target, max_size
+# 2026-09-11: all three sized down 50% after fixing the backtest's double-bump strike-selection
+# bug (backtest sold 2 strikes closer than prod on ~25% of legs); fixed backtests are materially
+# less attractive. See D:/agent_projects/eod_option_algos/prod_change_logs/9_11_2026.md.
+BUMPED_PARENT_CONFIGS = {
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS": {
+        "account": "EOD20_C42",
+        "dollar_target": scaled(11000),  # -50% on 2026-09-11 (was 22000); +10% on 2026-05-27 (was 20000)
+        "max_size": scaled(22),          # -50% on 2026-09-11 (was 44); +10% on 2026-05-27 (was 40)
+    },
+    # Re-added 2026-05-06 at quarter-size ($2.5k/5) in new account EOD28_C42 after retiring
+    # on 2026-04-23. Earlier bumped sizing ($10k/20) earned ~all PnL on overlap days with
+    # IMBAL_GROWS; this smaller standalone fire is a low-capital probe of standalone PnL.
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET": {
+        "account": "EOD28_C42",
+        "dollar_target": scaled(2750),   # -50% on 2026-09-11 (was 5500); +10% on 2026-05-27 (was 5000)
+        "max_size": scaled(7),           # -50% on 2026-09-11 (was 13, rounded up); +10% on 2026-05-27 (was 10) # 11 to 13 on 6/4
+    },
+    # IMBAL_SHRINKS added to bumped layer on 2026-04-23. 2-way overlap with IMBAL_GROWS:
+    # only 1 shared (date, side) out of 127, nearly orthogonal additive book.
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_SHRINKS": {
+        "account": "EOD25_C42",
+        "dollar_target": scaled(8250),   # -50% on 2026-09-11 (was 16500); +10% on 2026-05-27 (was 15000)
+        "max_size": scaled(16),          # -50% on 2026-09-11 (was 33, rounded down); +10% on 2026-05-27 (was 30)
+    },
+}
+
+BUMP_STEP = 5          # how far to bump the short strike toward ATM ($5 = 1 SPXW index)
+SPREAD_WIDTH = 15      # distance between short and long legs
+MAX_ATM_VOL = 0.14     # only trade when atmVol < this

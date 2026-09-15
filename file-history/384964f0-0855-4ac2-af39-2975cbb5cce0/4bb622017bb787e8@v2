@@ -1,0 +1,101 @@
+"""
+Large index flows -- 2x2 PNG of the top-N events by flow: 15:00 -> close price path
+(pct change vs the prior close) with the 15:40 strangle strikes as horizontal lines.
+
+Data: 10-sec trade prices from vbam.get_intraday_prices (DB; Liberator tick fallback
+resampled to 10s when the DB has no rows for that session), prior close + PX_LAST from
+Bloomberg (my_bdh, raw), strikes / fills / payout from backtest_strangle.run_backtest at
+the chart entry time.
+
+Run from Git Bash:  python /d/agent_projects/large_index_flows/chart_top4.py
+Output: Downloads/large_index_flows_top4_charts_YYYYMMDD_HHMM.png
+"""
+import datetime as dt
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import pandas as pd
+import vbam_utilities as vbam
+from sqlalchemy import create_engine
+from vbam_utilities.bloomberg import my_bdh
+
+import backtest_strangle as bs
+
+TOP_N = 4
+ENTRY_TIME = dt.time(15, 40)
+WINDOW = ('15:00:00', '16:00:00')
+BG = '#f5f5f5'
+
+
+def price_path(symbol, date):
+    """10-sec trade prices 15:00-16:00 as a Series indexed by timestamp (DB first, Liberator ticks fallback)."""
+    df = vbam.get_intraday_prices([symbol], date=date, window=WINDOW)
+    if len(df):
+        s = df.set_index(pd.to_datetime(df['capture_timestamp']))['trade_price'].astype(float)
+    else:
+        raw = vbam.get_intraday_prices([symbol], date=date, source='api')
+        ts = pd.to_datetime(raw['timestamp'])
+        d0 = pd.Timestamp(f'{date} {WINDOW[0]}')
+        d1 = pd.Timestamp(f'{date} {WINDOW[1]}')
+        s = raw.loc[(ts >= d0) & (ts <= d1)].set_index(ts[(ts >= d0) & (ts <= d1)])['trade_price'].astype(float)
+        s = s.resample('10s').last().ffill()
+    return s.sort_index()
+
+
+def prior_close(symbol, date):
+    """Bloomberg raw PX_LAST on the prior trading day."""
+    pdate = vbam.prev_trading_day(date)
+    return float(my_bdh(f'{symbol} US Equity', 'PX_LAST', pdate, pdate, adjust='-').iloc[0, 0])
+
+
+def plot_event(ax, r, path, pclose):
+    """One panel: pct-vs-prior-close price path, strike lines, entry marker, close marker."""
+    pct = (path / pclose - 1) * 100
+    ax.plot(pct.index, pct.values, color='#1f4e79', lw=1.4, label='Price (10s)')
+    close_t = pd.Timestamp(f'{r.eff_date} 16:00:00')
+    close_pct = (r.close / pclose - 1) * 100
+    ax.scatter([close_t], [close_pct], color='black', zorder=5, s=28, label=f'PX_LAST {r.close:.2f}')
+    for k, col, lab in [(r.call_strike, '#2e7d32', 'Call'), (r.put_strike, '#c62828', 'Put')]:
+        kp = (k / pclose - 1) * 100
+        ax.axhline(kp, color=col, ls='--', lw=1.1)
+        ax.text(pct.index[0], kp, f' {lab} {k:g}', color=col, va='bottom', fontsize=8.5)
+    entry_t = pd.Timestamp(f'{r.eff_date} {ENTRY_TIME}')
+    ax.axvline(entry_t, color='gray', ls=':', lw=1)
+    ax.text(entry_t, ax.get_ylim()[1], ' buy', color='gray', va='top', fontsize=8)
+    ax.set_title(
+        f"{r.symbol}  |  eff {r.eff_date}  |  est flow \\${r.est_flow_bn:.1f}B\n"
+        f"Strangle @{ENTRY_TIME:%H:%M}: {r.call_strike:g}C \\${r.call_px:.2f} + {r.put_strike:g}P \\${r.put_px:.2f}"
+        f" = \\${r.call_px + r.put_px:.2f} ({r.cost_bps:.0f} bps)  |  payout {r.payout:.2f}x  |  PnL {r.pnl_hold_bps:+.0f} bps",
+        fontsize=10)
+    ax.set_facecolor(BG)
+    ax.grid(alpha=0.3)
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    ax.set_ylabel(f'% chg vs prior close ({pclose:.2f})')
+    ax.legend(loc='best', fontsize=8, frameon=False)
+
+
+def main():
+    eng = create_engine(bs.vbam_helpers.dev_connection_string, pool_pre_ping=True)
+    events = bs.load_events(spot_col=ENTRY_TIME.strftime('%H:%M')).nlargest(TOP_N, 'est_flow_bn')
+    bt = bs.run_backtest(events, eng, entry_time=ENTRY_TIME).sort_values('est_flow_bn', ascending=False)
+    bt['payout'] = (bt['payoff_bps'] - bt['cost_bps']) / bt['cost_bps']   # net: -1 = expired worthless
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), facecolor=BG)
+    for ax, r in zip(axes.ravel(), bt.itertuples(index=False)):
+        plot_event(ax, r, price_path(r.symbol, r.eff_date), prior_close(r.symbol, r.eff_date))
+    fig.suptitle(f'Top {TOP_N} index-flow events: 15:00 -> close, 0DTE strangle bought at {ENTRY_TIME:%H:%M} '
+                 f'(>= {bs.OTM_BPS} bps OTM, {bs.SPREAD_PAID:.0%} of spread, hold to expiry)', fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    out = Path.home() / 'Downloads' / f'large_index_flows_top{TOP_N}_charts_{dt.datetime.now():%Y%m%d_%H%M}.png'
+    fig.savefig(out, dpi=150, facecolor=BG)
+    print(f'Saved: {out}')
+    return out
+
+
+if __name__ == '__main__':
+    main()

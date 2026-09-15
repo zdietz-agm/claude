@@ -1,0 +1,130 @@
+"""
+call_spread_breakeven.py
+------------------------
+Fast (~1 SR roundtrip) breakeven + max-payout calculator for a single long
+debit call spread, with optional $ slippage added on top of the SR mid.
+
+Two-strike consolidated into ONE SQL via UNION ALL -- one SR connection
+instead of two, so wall-clock typically 3-5s end-to-end.
+
+USAGE (CLI):
+    python call_spread_breakeven.py <symbol> <expiry M/D[/Y]> <long_K> <short_K> [slippage]
+
+EXAMPLES:
+    python call_spread_breakeven.py MRVL 6/12 275 295
+    python call_spread_breakeven.py MRVL 6/18 290 305 0.15
+    python call_spread_breakeven.py NVDA 7/3/26 175 195
+
+ALSO USABLE WITHOUT ARGS: edit the defaults in the "Config defaults" section
+below and just `python call_spread_breakeven.py`. Args override defaults.
+
+Expiry parsing:
+    "6/12"      -> 6/12 of the CURRENT calendar year
+    "6/12/26"   -> 6/12/2026
+    "6/12/2026" -> 6/12/2026
+
+Outputs: spot, spread mid, cost (mid + slippage), breakeven price + %,
+max payout + multiple, and the spot at which the spread caps out.
+"""
+
+import datetime as dt
+import sys
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+from spdr_rock_functions import run_query
+
+
+#%% Config defaults (used if no CLI args)
+SYMBOL   = "MRVL"
+EXPIRY   = dt.date(2026, 6, 12)
+LONG_K   = 275
+SHORT_K  = 295
+SLIPPAGE = 0.10
+
+
+#%% CLI parsing -- args override defaults
+def parse_expiry(s):
+    """Parse 'M/D', 'M/D/YY', or 'M/D/YYYY' into a dt.date."""
+    parts = s.split("/")
+    if len(parts) == 2:
+        m, d = int(parts[0]), int(parts[1])
+        y = dt.date.today().year
+    elif len(parts) == 3:
+        m, d, y = int(parts[0]), int(parts[1]), int(parts[2])
+        if y < 100:
+            y += 2000
+    else:
+        raise ValueError(f"Bad expiry format: {s!r}. Expected M/D, M/D/YY, or M/D/YYYY.")
+    return dt.date(y, m, d)
+
+
+USAGE = (
+    "Usage: python call_spread_breakeven.py [<symbol>] <expiry M/D[/Y]> "
+    "<long_K> <short_K> [slippage]\n"
+    "  Symbol is optional -- defaults to the SYMBOL constant at the top of the file.\n"
+    "Examples:\n"
+    "  python call_spread_breakeven.py MRVL 6/12 275 295\n"
+    "  python call_spread_breakeven.py 6/18 290 305 0.15   (uses default symbol)"
+)
+
+argv = sys.argv[1:]
+if argv:
+    if "/" in argv[0]:
+        if len(argv) < 3:
+            print(USAGE); sys.exit(1)
+        EXPIRY  = parse_expiry(argv[0])
+        LONG_K  = float(argv[1])
+        SHORT_K = float(argv[2])
+        if len(argv) >= 4:
+            SLIPPAGE = float(argv[3])
+    else:
+        if len(argv) < 4:
+            print(USAGE); sys.exit(1)
+        SYMBOL  = argv[0].upper()
+        EXPIRY  = parse_expiry(argv[1])
+        LONG_K  = float(argv[2])
+        SHORT_K = float(argv[3])
+        if len(argv) >= 5:
+            SLIPPAGE = float(argv[4])
+
+
+#%% Single SR roundtrip via UNION ALL
+sql = f"""
+    (SELECT okey_xx, sprc, uprc FROM msgOptionImpliedQuote
+     WHERE okey_tk='{SYMBOL}' AND okey_xx={LONG_K} AND okey_cp='Call'
+       AND okey_yr={EXPIRY.year} AND okey_mn={EXPIRY.month} AND okey_dy={EXPIRY.day}
+     ORDER BY timestamp DESC LIMIT 1)
+    UNION ALL
+    (SELECT okey_xx, sprc, uprc FROM msgOptionImpliedQuote
+     WHERE okey_tk='{SYMBOL}' AND okey_xx={SHORT_K} AND okey_cp='Call'
+       AND okey_yr={EXPIRY.year} AND okey_mn={EXPIRY.month} AND okey_dy={EXPIRY.day}
+     ORDER BY timestamp DESC LIMIT 1)
+"""
+df = run_query(sql)
+if df is None or len(df) < 2:
+    raise RuntimeError(
+        f"Could not find both legs of {SYMBOL} {EXPIRY:%m/%d/%Y} "
+        f"{LONG_K:g}/{SHORT_K:g} Call spread on SR."
+    )
+data = {float(r['okey_xx']): (float(r['sprc']), float(r['uprc'])) for _, r in df.iterrows()}
+sprc_L, uprc = data[LONG_K]
+sprc_S, _    = data[SHORT_K]
+
+
+#%% Compute + display
+mid = sprc_L - sprc_S
+cost = mid + SLIPPAGE
+width = SHORT_K - LONG_K
+max_payout = width - cost
+payout_x = max_payout / cost
+breakeven_spot = LONG_K + cost
+breakeven_pct = (breakeven_spot / uprc - 1) * 100
+cap_pct = (SHORT_K / uprc - 1) * 100
+
+print(f"{SYMBOL} {EXPIRY.month}/{EXPIRY.day} {LONG_K:g}/{SHORT_K:g} call spread")
+print(f"  Spot:           ${uprc:.2f}")
+print(f"  Spread mid:     ${mid:.2f}")
+print(f"  Cost (+{SLIPPAGE:.2f}): ${cost:.2f}")
+print(f"  Breakeven:      ${breakeven_spot:.2f}  ({breakeven_pct:+.1f}%)")
+print(f"  Max payout:     ${max_payout:.2f}  ({payout_x:.2f}x)")
+print(f"  Pays max above: ${SHORT_K:g}  ({cap_pct:+.1f}%)")

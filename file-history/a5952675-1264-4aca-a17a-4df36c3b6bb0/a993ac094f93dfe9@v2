@@ -1,0 +1,82 @@
+import glob, os
+import numpy as np
+import pandas as pd
+pd.set_option("display.width", 250)
+
+def newest(pat):
+    return max(glob.glob(pat), key=os.path.getmtime)
+
+reg_path = "C:/Users/zdietz/Downloads/bumped_spread_backtest_20260911_0817.xlsx"
+fix_path = newest("C:/Users/zdietz/Downloads/bumped_spread_NO_DOUBLE_BUMP_backtest_*.xlsx")
+print("regular:", reg_path)
+print("fixed:  ", fix_path)
+
+def load(path):
+    x = pd.ExcelFile(path)
+    out = {}
+    for s in x.sheet_names:
+        if "BUMP" not in s:
+            continue
+        df = pd.read_excel(x, s)
+        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
+        out[s.replace(" BUMP", "")] = df
+    return out
+
+def max_dd(pnl):
+    c = pnl.cumsum()
+    return (c - c.cummax()).min()
+
+def stats(df):
+    p = df["total_pnl"]
+    return dict(N=len(df), PnL=p.sum(), WR=(p > 0).mean() * 100,
+                Sharpe=p.mean() / p.std() if len(p) > 1 and p.std() > 0 else 0,
+                MaxDD=max_dd(p), MeanPnL=p.mean(), WorstDay=p.min())
+
+reg, fix = load(reg_path), load(fix_path)
+rows = []
+for k in reg:
+    for label, d in [("regular", reg[k]), ("fixed", fix.get(k, pd.DataFrame(columns=reg[k].columns)))]:
+        rows.append(dict(strategy=k, run=label, **stats(d)))
+allr = pd.concat([d.assign(strategy=k) for k, d in reg.items()])
+allf = pd.concat([d.assign(strategy=k) for k, d in fix.items()])
+for label, d in [("regular", allr), ("fixed", allf)]:
+    daily = d.groupby("trade_date")["total_pnl"].sum().reset_index()
+    rows.append(dict(strategy="COMBINED (daily)", run=label, **stats(daily)))
+summ = pd.DataFrame(rows)
+print("\n=== SUMMARY ===")
+print(summ.round(2).to_string(index=False))
+
+# per-leg join
+def legs(d, tag):
+    out = []
+    for k, df in d.items():
+        for _, r in df.iterrows():
+            if r.put_size > 0:
+                out.append(dict(strategy=k, trade_date=r.trade_date, cp="Put", **{f"size_{tag}": r.put_size, f"price_{tag}": r.put_price, f"pnl_{tag}": r.put_pnl}))
+            if r.call_size > 0:
+                out.append(dict(strategy=k, trade_date=r.trade_date, cp="Call", **{f"size_{tag}": r.call_size, f"price_{tag}": r.call_price, f"pnl_{tag}": r.call_pnl}))
+    return pd.DataFrame(out)
+lr, lf = legs(reg, "reg"), legs(fix, "fix")
+j = lr.merge(lf, on=["strategy", "trade_date", "cp"], how="outer", indicator=True)
+print("\n=== LEG COVERAGE ===")
+print(j["_merge"].value_counts().rename({"left_only": "regular only", "right_only": "fixed only"}))
+both = j[j["_merge"] == "both"].copy()
+both["changed"] = (both.price_reg != both.price_fix) | (both.size_reg != both.size_fix)
+print(f"\nlegs in both: {len(both)} | changed (price or size): {both.changed.sum()} ({both.changed.mean()*100:.0f}%)")
+ch = both[both.changed].copy()
+ch["pnl_delta"] = ch.pnl_fix - ch.pnl_reg
+print(f"PnL on changed legs: regular ${ch.pnl_reg.sum():,.0f} -> fixed ${ch.pnl_fix.sum():,.0f} (delta ${ch.pnl_delta.sum():,.0f})")
+print(f"changed legs WR: regular {(ch.pnl_reg>0).mean()*100:.0f}% -> fixed {(ch.pnl_fix>0).mean()*100:.0f}%")
+print(f"changed legs avg credit: regular {ch.price_reg.mean():.2f} -> fixed {ch.price_fix.mean():.2f}")
+print(f"changed legs avg size: regular {ch.size_reg.mean():.1f} -> fixed {ch.size_fix.mean():.1f}")
+print("\nchanged legs by strategy:")
+print(ch.groupby("strategy").agg(n=("pnl_delta", "size"), pnl_reg=("pnl_reg", "sum"), pnl_fix=("pnl_fix", "sum"), delta=("pnl_delta", "sum")).round(0).to_string())
+print("\nchanged legs by year:")
+ch["year"] = ch.trade_date.str[:4]
+print(ch.groupby("year").agg(n=("pnl_delta", "size"), pnl_reg=("pnl_reg", "sum"), pnl_fix=("pnl_fix", "sum"), delta=("pnl_delta", "sum")).round(0).to_string())
+print("\nlargest PnL deltas (abs):")
+print(ch.reindex(ch.pnl_delta.abs().sort_values(ascending=False).index).head(12)[["trade_date", "strategy", "cp", "size_reg", "price_reg", "pnl_reg", "size_fix", "price_fix", "pnl_fix", "pnl_delta"]].to_string(index=False))
+print("\nlegs only in one run:")
+print(j[j["_merge"] != "both"][["trade_date", "strategy", "cp", "pnl_reg", "pnl_fix", "_merge"]].to_string(index=False))
+print("\nrecent (2026-08+) legs:")
+print(j[j.trade_date >= "2026-08-01"][["trade_date", "strategy", "cp", "size_reg", "price_reg", "pnl_reg", "size_fix", "price_fix", "pnl_fix"]].to_string(index=False))

@@ -1,0 +1,166 @@
+# Try to recreate the 16-second first-call Bloomberg lag seen in
+# scratch/algos/logs/2026-09-11_save_spy_prices.txt (first bdp took 16464ms, the
+# rest ~150-200ms). Mimics save_spy_prices.py as closely as possible -- same
+# interpreter, same imports, the SAME getSPY / SCHEDULE / atomic-replace objects
+# (imported from the prod module) and the prod inter-fire cadence -- but writes
+# to a throwaway CSV in the temp dir. It NEVER touches scratch/algos/spy_data.csv.
+#
+# Run on the prod venv (cwd does not matter):
+#   /d/PycharmProjects/scratch/.venv/Scripts/python.exe /d/agent_projects/adhoc/spy_price_first_call_lag_test.py
+#   --idle 120   sit idle first (30s sleeps, like prod's "Waiting for the start time...")
+#   --split      time the first call's 3 pieces separately: session.start, openService, bdp
+#   --runs 5     spawn 5 fresh child processes (session start only happens once per
+#                process, so multiple samples need multiple processes) and summarise
+#   --warm       proposed fix: open the session + refdata service before idling, then
+#                confirm the scheduled calls no longer pay the session-start cost
+import argparse
+import datetime as dt
+import os
+import re
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+import pandas as pd
+from xbbg import blp
+
+sys.path.insert(1, "D:/PycharmProjects/utils")
+sys.path.insert(1, "D:/PycharmProjects/scratch/algos")
+from calendar_utils import getNowEst
+from save_spy_prices import getSPY, SCHEDULE, _atomic_replace_windows_safe
+
+CSV_FILE = os.path.join(tempfile.gettempdir(), "spy_data_lagtest.csv")
+REFDATA = "//blp/refdata"
+
+
+def _ms(t0, t1):
+    """Elapsed milliseconds between two perf_counter readings."""
+    return (t1 - t0) * 1000
+
+
+def first_call_split():
+    """First Bloomberg touch broken into session.start / openService / bdp request.
+    Sum of the three is what prod's single first bdp pays. Returns the bdp DataFrame."""
+    from xbbg.core import conn
+    t0 = time.perf_counter()
+    conn.bbg_session()
+    t1 = time.perf_counter()
+    conn.bbg_service(REFDATA)
+    t2 = time.perf_counter()
+    df = getSPY()
+    t3 = time.perf_counter()
+    print(f"  SPLIT session.start={_ms(t0, t1):.0f}ms  openService={_ms(t1, t2):.0f}ms  "
+          f"bdp={_ms(t2, t3):.0f}ms  total={_ms(t0, t3):.0f}ms")
+    return df
+
+
+def warm_session():
+    """The fix: call the prod helper (scratch/algos/helpers.py) that opens the blpapi
+    session + refdata service and does a dummy bdp, so the first scheduled bdp only
+    pays the ~150-200ms request cost."""
+    from helpers import warm_up_bloomberg_connection
+    ms = warm_up_bloomberg_connection()
+    print(f"WARM-UP: helpers.warm_up_bloomberg_connection returned {ms if ms is None else round(ms)}ms")
+
+
+def run_child(idle_s, split, warm):
+    """One fresh-process mimic of save_spy_prices.py. idle_s: seconds to sit idle before
+    the schedule starts; split: break the first call into its 3 pieces; warm: open the
+    Bloomberg session before idling (the proposed fix)."""
+    import blpapi
+    import xbbg
+    print(f"interpreter={sys.executable}")
+    print(f"xbbg={xbbg.__version__} blpapi={blpapi.__version__} pid={os.getpid()}")
+    print(f"start {getNowEst():%H:%M:%S.%f} ET  idle={idle_s}s  split={split}  warm={warm}")
+
+    if os.path.exists(CSV_FILE):
+        os.remove(CSV_FILE)
+
+    if warm:
+        warm_session()
+
+    # Prod idles in 30s sleeps until PRE_START_TIME; reproduce that dead time.
+    if idle_s > 0:
+        print("Waiting for the start time...")
+        idle_until = time.monotonic() + idle_s
+        while time.monotonic() < idle_until:
+            time.sleep(min(30, max(0.0, idle_until - time.monotonic())))
+
+    # Same offset logic as prod's IS_TEST branch: shift the schedule into the current
+    # clock window, preserving the inter-fire cadence.
+    current_sec = dt.datetime.now().second
+    while dt.datetime.now().second == current_sec:
+        time.sleep(.05)
+    target_start = dt.datetime.combine(dt.date.today(), SCHEDULE[0][0])
+    time_offset = target_start - getNowEst().replace(tzinfo=None)
+    print(f"TEST MODE: running with prod cadence, offset={time_offset}")
+
+    today = dt.date.today()
+    all_data = []
+    latencies = []
+    for i, (fire_time, label_time) in enumerate(SCHEDULE):
+        target_wall = pd.Timestamp.combine(today, fire_time) - time_offset
+        while getNowEst().replace(tzinfo=None) < target_wall:
+            time.sleep(.01)
+        try:
+            df = first_call_split() if (i == 0 and split) else getSPY()
+            df["label"] = pd.Timestamp.combine(today, label_time)
+            df["request_ts"] = df["request_ts"] + time_offset
+            df["return_ts"] = df["return_ts"] + time_offset
+            df = df[["SPY", "label", "request_ts", "return_ts"]]
+            all_data.append(df)
+            latency_ms = (df["return_ts"].iloc[0] - df["request_ts"].iloc[0]).total_seconds() * 1000
+            latencies.append(latency_ms)
+            print(f"Queried SPY label={df['label'].iloc[0]}: {df['SPY'].iloc[0]:.2f} (took {latency_ms:.0f}ms)")
+
+            full_df = pd.concat(all_data, ignore_index=True)
+            tmp = CSV_FILE + ".tmp"
+            full_df.to_csv(tmp, index=False)
+            _atomic_replace_windows_safe(tmp, CSV_FILE)
+        except Exception as e:
+            print(f"Error querying SPY: {e}")
+
+    print(f"Saved {len(all_data)} rows to {CSV_FILE}")
+    if latencies:
+        rest = latencies[1:]
+        rest_med = statistics.median(rest) if rest else float("nan")
+        # Machine-readable line for the --runs parent to parse.
+        print(f"FIRST_CALL_MS={latencies[0]:.0f} REST_MEDIAN_MS={rest_med:.0f}")
+
+
+def run_parent(n_runs, idle_s, split, warm):
+    """Spawn n_runs fresh child processes (one session start each) and summarise."""
+    child_args = [sys.executable, os.path.abspath(__file__), "--idle", str(idle_s)]
+    if split:
+        child_args.append("--split")
+    if warm:
+        child_args.append("--warm")
+    firsts = []
+    for k in range(n_runs):
+        print(f"\n===== run {k + 1}/{n_runs} =====")
+        out = subprocess.run(child_args, capture_output=True, text=True)
+        print(out.stdout, end="")
+        if out.stderr.strip():
+            print(out.stderr, end="")
+        m = re.search(r"FIRST_CALL_MS=(\d+)", out.stdout)
+        if m:
+            firsts.append(int(m.group(1)))
+    if firsts:
+        print(f"\nfirst-call ms over {len(firsts)} fresh processes: "
+              f"min={min(firsts)} median={statistics.median(firsts):.0f} max={max(firsts)}  all={firsts}")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--idle", type=float, default=0, help="seconds to idle before the schedule (prod-style 30s sleeps)")
+    ap.add_argument("--split", action="store_true", help="time session.start / openService / bdp separately on the first call")
+    ap.add_argument("--runs", type=int, default=1, help="number of fresh child processes to sample")
+    ap.add_argument("--warm", action="store_true", help="open the Bloomberg session before idling (proposed fix)")
+    args = ap.parse_args()
+
+    if args.runs > 1:
+        run_parent(args.runs, args.idle, args.split, args.warm)
+    else:
+        run_child(args.idle, args.split, args.warm)

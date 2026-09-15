@@ -1,0 +1,288 @@
+import datetime as dt
+import time
+import asyncio
+import pandas as pd
+import numpy as np
+
+import os
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+from google_chat_webhook import send_message, my_chat, aa
+from calendar_utils import getNowEst
+from spdr_rock_functions import run_query
+today = dt.date.today()
+
+from helpers import *
+
+# --- SpiderRock v8 migration toggle (per-script) --------------------------------------------
+# Flip to v8 BEFORE `from spdr_rock_order_functions import *` so the rebuilt get_closest_* SQL
+# (sranalytics.msgliveimpliedquoteadj) is what binds into this module -- `import *` copies the
+# string values, so calling use_v8() after it would leave stale v7 SQL bound here. use_v8() also
+# points run_query at the v8 host/port and switches getCashIndex/get_prints to their v8 tables.
+# USE_V8 = False -> everything stays on v7, byte-for-byte.
+USE_V8  = True     # pull DATA (option chains, refresh, equivalents) from v8
+SEND_V8 = True    # send ORDERS + read fills from... False=v7 (staged test), True=v8
+if USE_V8:
+	from spdr_rock_order_functions import use_v8 as _use_v8
+	_use_v8(True, send=SEND_V8)
+from spdr_rock_order_functions import *
+seed = int(dt.datetime.now().strftime("%f")) % 10000
+counter = create_counter(seed)
+
+# --- Test-mode CLI (fed by test_run_algos.sh) ------------------------------------------------
+# Prod runs with NO arguments and behaves exactly as before. Passing ANY argument without
+# --test is a hard error, so a prod launch can never be silently overridden.
+import argparse as _argparse
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--test", action="store_true")
+_p.add_argument("--trigger-all", action="store_true")
+_p.add_argument("--trigger-all-size", type=int, default=None)
+_p.add_argument("--send-trades", type=lambda s: s.strip().lower() == "true", default=None)
+_p.add_argument("--test-imbal", type=float, default=None)
+_p.add_argument("--test-realized-change", type=int, choices=range(10), default=None)
+_a = _p.parse_args()
+if len(sys.argv) > 1 and not _a.test:
+	raise AssertionError(f"CLI args are only allowed in test mode. Got {sys.argv[1:]}. Pass --test.")
+
+IS_TEST = False or _a.test
+TRIGGER_ALL = False or _a.trigger_all
+TRIGGER_ALL_SIZE = 4 if _a.trigger_all_size is None else _a.trigger_all_size
+SEND_TRADES = True if _a.send_trades is None else _a.send_trades
+TEST_IMBAL = 2.1e9 if _a.test_imbal is None else _a.test_imbal
+# Overrides the BINNED factor_realized_change (0-9 percentile bin), not the raw vol change.
+TEST_REALIZED_CHANGE = None if _a.test_realized_change is None else _a.test_realized_change
+
+if IS_TEST:
+	MAX_BUY_PRICE_SPREAD = 10
+	# EDGE_TARGET_4_LEGGED_1 *= 3
+	# MAX_EDGE_4_LEGGED_1 *= 3
+	# EDGE_TARGET_4_LEGGED_2 *= 3
+	# MAX_EDGE_4_LEGGED_2 *= 3
+	# EDGE_TARGET_2_LEGGED_1 *= 3
+	# MAX_EDGE_2_LEGGED_1 *= 3
+	# EDGE_TARGET_2_LEGGED_2 *= 3
+	# MAX_EDGE_2_LEGGED_2 *= 3
+
+	from position_logging_helper import clear_log_of_test_trades
+	clear_log_of_test_trades()
+
+
+if __name__ == "__main__":
+	# _____________________________________________________________Preparation Logic_____________________________________________________________
+	if is_month_end():
+		send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")} Not running 340pm script because it is month end.", my_chat)
+		exit()
+
+	if TRIGGER_ALL and not IS_TEST:
+		raise AssertionError("TRIGGER_ALL is set to True but IS_TEST is False. This is not allowed.")
+
+	if not SEND_TRADES and not IS_TEST:
+		raise AssertionError("SEND_TRADES is set to False but IS_TEST is False. This is not allowed.")
+
+	# load all config dictionaries
+	configs = load_configs_from_directory("./configs", time="340PM")
+	print("Loaded configs:")
+	for cfg in configs:
+		print(cfg["name"])
+
+	print(f"{pretty_time()} -- Starting checkForIconStrikes")
+	icon_strikes, extra_magnets = checkForIconStrikes()
+	print(f"{pretty_time()} -- Finished checkForIconStrikes")
+	magnets = []
+	if icon_strikes:
+		magnets += [icon_strikes[1], icon_strikes[2]]  # only get the dealer long strikes
+	if extra_magnets:
+		magnets += extra_magnets
+
+	if not IS_TEST:
+		print(f"{pretty_time()} -- Building start message")
+		start_msg = f"{getNowEst().time().strftime("%I:%M:%S %p")} Starting 340pm algo script."
+		if magnets:
+			start_msg += f"\nSPX magnets today: {magnets}"
+		print(f"{pretty_time()} -- Sending start message")
+		send_message(start_msg, my_chat)
+		print(f"{pretty_time()} -- Finished sending start message")
+	summary = f"{dt.date.today().strftime('%m/%d/%Y')} {'3:40 PM Algo' if not IS_TEST else 'TEST'} RECAP:\n\n"
+	if magnets:
+		summary += f"\nSPX magnets today: {magnets}\n"
+
+	while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 38, 1): # 3:38 PM
+		time.sleep(30)  # wait 30 seconds
+	while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 40, 3, 500000): # 3:40 PM
+		time.sleep(.5)  # wait .5 second
+
+	# _____________________________________________________________Entering Trade Logic_____________________________________________________________
+
+	print(f"{pretty_time()} -- Starting get_340_imbal()")
+	imbal = get_340_imbal(is_test=IS_TEST, test_imbal=TEST_IMBAL)
+	print(f"{pretty_time()} -- Finished get_340_imbal()")
+
+	print(f"{pretty_time()} -- Starting get_market_measurements()")
+	market, today_move, std = get_market_measurements()
+	print(f"{pretty_time()} -- Finished get_market_measurements()")
+	# if IS_TEST:
+	# 	today_move=0.016
+	# 	market="UP"
+	print(f"{pretty_time()} -- Starting imbal calculations")
+	imbal_mag = get_imbal_mag(imbal)
+	imbal_signed = get_imbal_signed(imbal)
+	print(f"{pretty_time()} -- Finished imbal calculations")
+	print(f"{pretty_time()} -- Starting get_high_low()")
+	hl_raw = get_high_low()
+	print(f"{pretty_time()} -- Finished get_high_low()")
+	hl = hl_raw / std
+	print(f"{pretty_time()} -- Starting get_rsi()")
+	rsi = get_rsi(today_move)
+	print(f"{pretty_time()} -- Finished get_rsi()")
+	print(f"{pretty_time()} -- Starting get_vix()")
+	vix = get_vix()
+	print(f"{pretty_time()} -- Finished get_vix()")
+	print(f"{pretty_time()} -- Starting get_change_in_realized()")
+	change_in_realized = get_change_in_realized()
+	print(f"{pretty_time()} -- Finished get_change_in_realized()")
+	print(f"{pretty_time()} -- Starting run_query(get_closest_calls_sql)")
+	calls = run_query(get_closest_calls_sql)
+	print(f"{pretty_time()} -- Finished run_query(get_closest_calls_sql)")
+	print(f"{pretty_time()} -- Starting run_query(get_closest_puts_sql)")
+	puts = run_query(get_closest_puts_sql)
+	print(f"{pretty_time()} -- Finished run_query(get_closest_puts_sql)")
+	spx = puts.uprc[0]
+	today_vol = puts.satm.iloc[0]
+
+	print(f"{pretty_time()} -- Starting factor_dict construction")
+	factor_dict = {
+		"factor_imbal_mag": bin_imbal_mag(imbal_mag),
+		"factor_imbal_signed": bin_imbal_signed(imbal_signed),
+		"factor_vol": bin_today_vol(today_vol),
+		"factor_vix": bin_vix(vix),
+		"factor_rsi": bin_rsi(rsi),
+		"factor_high_low": bin_high_low(hl),
+		"factor_market_type": 1 if market == "UP" else -1 if market == "DOWN" else 0,
+		"factor_realized_change": bin_realized_change(change_in_realized),
+	}
+	if IS_TEST and TEST_REALIZED_CHANGE is not None:
+		factor_dict["factor_realized_change"] = TEST_REALIZED_CHANGE
+		print(f"{pretty_time()} -- TEST override: factor_realized_change = {TEST_REALIZED_CHANGE}")
+	print(f"{pretty_time()} -- Finished factor_dict construction")
+
+	if imbal == NO_IMBAL_VAL:
+		imbal = "*Not Found*"
+
+	if isinstance(imbal, str):
+		summary += "No 3:40pm imbalance found. Exited.\n"
+		send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")}\n" + summary, my_chat)
+		exit()
+
+	# _____________________________________________________________Prep Trades_____________________________________________________________
+
+	print(f"{pretty_time()} -- Starting prep_trades()")
+	option_chains = {
+		"SPXW": {"puts": puts, "calls": calls, "underlying": spx},
+	}
+	# Live-reload SIZE_MULT_340_PUTS/CALLS from algo_globals so mid-run edits take effect.
+	from algo_globals import get_live_size_mults
+	_puts_mult_340, _calls_mult_340 = get_live_size_mults("340")
+	print(f"{pretty_time()} -- Live size mults (340): puts={_puts_mult_340}, calls={_calls_mult_340}")
+	trade_dict, explanations_dict = prep_trades(configs=configs,
+												factor_dict=factor_dict,
+												option_chains=option_chains,
+												today=today,
+												trigger_all=TRIGGER_ALL,
+												trigger_all_size=TRIGGER_ALL_SIZE,
+												magnets=magnets,
+												puts_size_mult=_puts_mult_340,
+												calls_size_mult=_calls_mult_340,
+												)
+	print(f"{pretty_time()} -- Finished prep_trades()")
+
+	# Apply size limits
+	try:
+		from position_logging_helper import apply_size_limits
+		print(f"{pretty_time()} -- Starting size limit check (340PM)")
+		apply_size_limits(trade_dict, is_test=IS_TEST, explanations_dict=explanations_dict, max_loss_cap=MAX_LOSS_CAP_340)
+		print(f"{pretty_time()} -- Finished size limit check (340PM)")
+	except Exception as e:
+		print(f"{pretty_time()} -- ERROR in size limit check (340PM): {e}")
+
+	# _____________________________________________________________Send Trades_____________________________________________________________
+	trades = []
+
+	if IS_TEST:
+		for trade in trade_dict["trades"]:
+			trade["account"] = TEST_ACCOUNTS[trade["account"]]
+			# Sending test orders to v8 -> route them to the v8 test account (T.AGM* only exists on v7).
+			if SEND_V8 and str(trade["account"]).startswith("T.AGM"):
+				trade["account"] = "T.AGMV8.01"
+
+	for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+		if trade_type == "complex":
+			order = send_complex_two_waves(trade["symbol"], trade["size"], trade["short_legs"], trade["long_legs"], trade["exp"],
+										  trade["account"], edge_target1=trade["edge_target1"], max_edge1=trade["max_edge1"],
+										  edge_target2=trade["edge_target2"], max_edge2=trade["max_edge2"], is_sale=trade["is_sale"], userData=trade["name"], orderDuration=45, min_price=trade.get("min_price", .3))
+		else:
+			order = send_outright_limit_order(trade["symbol"], trade["option"], trade["size"], DIRECTION=trade["direction"],
+											 ACCOUNT=trade["account"], offset=trade["offset"], userData=trade["name"], orderDuration=45, min_price=trade.get("min_price", .3))
+		trades.append(order)
+
+	print(f"{pretty_time()} -- Starting asyncio.run(send_trades())")
+	if SEND_TRADES:
+		async def send_trades():
+			await asyncio.gather(
+				*trades
+			)
+
+		asyncio.run(send_trades())
+	print(f"{pretty_time()} -- Finished asyncio.run(send_trades())")
+
+	# Log net option positions
+	try:
+		from position_logging_helper import log_positions
+		print(f"{pretty_time()} -- Starting position logging (340PM)")
+		log_positions(trade_dict, script_name="340PM", is_test=IS_TEST)
+		print(f"{pretty_time()} -- Finished position logging (340PM)")
+	except Exception as e:
+		print(f"{pretty_time()} -- ERROR in position logging (340PM): {e}")
+
+	# _____________________________________________________________Summary_____________________________________________________________
+
+	summary += f"SPX: {spx:,.2f}. Imbal: {imbal if isinstance(imbal, str) else f'{imbal:,.0f}'}. Market: {market} since current SPY move is {today_move:.4f} and {LOOKBACK} day std dev is {std:.4f}.\n"
+	summary += f"Imbal: {imbal_mag}. Imbal signed: {imbal_signed}.\n"
+	summary += f"Today's Vol: {today_vol:.3f} ({to_percentile_string(bin_today_vol(today_vol))}).\n"
+	summary += f"RSI: {rsi} ({to_percentile_string(bin_rsi(rsi))}). Chg 3M Realized: {'+' if change_in_realized > 0 else '-'}{abs(change_in_realized * 100):.2f} Vol Points. ({to_percentile_string(bin_realized_change(change_in_realized), n=10)})\n"
+
+	summary_dict = {}
+
+	for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+		if not trade["name"] in summary_dict:
+			summary_dict[trade["name"]] = f"""\n*{trade["name"]}* ({trade["account"]}):\n"""
+		if trade_type == "complex":
+			if trade["direction"] == "Sell":
+				summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["short_legs"][0].okey_xx} {trade["long_legs"][0].okey_xx} {trade["structure"]} for {trade["price"]}. (Equivalents: {myGetSpyEquivalent(trade["short_legs"][0].okey_xx):.2f} - {myGetSpyEquivalent(trade["long_legs"][0].okey_xx):.2f})\n"""
+			else:
+				summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["long_legs"][0].okey_xx} {trade["short_legs"][0].okey_xx} {trade["structure"]} for {trade["price"]}. (Equivalents: {myGetSpyEquivalent(trade["long_legs"][0].okey_xx):.2f} - {myGetSpyEquivalent(trade["short_legs"][0].okey_xx):.2f})\n"""
+		else:
+			summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["option"].okey_xx} {trade["structure"]} for {trade["price"]}. (Equivalents: {myGetSpyEquivalent(trade["option"].okey_xx):.2f})\n"""
+		
+	for single_algo_summary in summary_dict.values():
+		summary += single_algo_summary
+
+	summary += "\n*Explanations:*"
+	for algo_name, explanations in explanations_dict.items():
+		summary += f"""\n{algo_name}:\n"""
+		summary += explanations["put"]
+		summary += explanations["call"]
+
+	# Prepend any loud send-phase warnings (e.g. FULL-SIZE-NOT-SENT 4-order-cap drops from
+	# trade_complex) so they sit at the TOP of the chat message.
+	_warns = drain_send_warnings()
+	_warn_block = ("\n".join(_warns) + "\n\n") if _warns else ""
+	print(summary)
+	send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")}\n" + _warn_block + summary, my_chat)
+
+
+
+
+
+
+
+

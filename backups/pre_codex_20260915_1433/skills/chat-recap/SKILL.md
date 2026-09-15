@@ -1,0 +1,28 @@
+---
+name: chat-recap
+description: Save the current chat's analysis work to D:/agent_projects/chat_recaps/ as a self-contained directory with the final scripts and a structured README. Use when the user says "save down this chat", "save down this chat to chat_recaps", "archive this work", "save this analysis to recaps", or any close variant.
+---
+
+# Saving Chat Recaps
+
+When the user asks to save down the chat, do this:
+
+1. **Create a directory** under `D:/agent_projects/chat_recaps/<descriptive_name>/`. Pick a name that captures the work topic concisely (e.g. `spy_eod_residual_analysis`, `option_skew_calibration`, `vix_term_structure`). No timestamps in directory names -- the README dates the work.
+
+2. **Save the relevant scripts** into that directory:
+   - Include reusable analysis scripts and any helper/probe scripts that document data sources or schemas.
+   - Skip one-off `python -c` invocations and stale debug snippets. If the chat included parameter sweeps done inline, distill them into a single parameterized script.
+   - Use the **final** definitions / sign conventions / parameters that the chat settled on -- not the intermediate versions that were superseded.
+
+3. **Write a `README.md`** at the directory root covering:
+   - **Date** and **what was investigated** (1 short paragraph)
+   - **Data sources** table (tables, hosts, Bloomberg fields, library helpers)
+   - **Methodology** (definitions, filters, exclusions -- anything not obvious from reading the scripts)
+   - **Key findings** (bulleted, with effect sizes / p-values where applicable)
+   - **Caveats** (sample size, regime, known limitations)
+   - **File listing** (one row per script, what it does)
+   - **Reproduction** (run order, dependencies, where outputs land)
+
+4. **Confirm the directory path** back to the user when done, so it can be pasted into a future chat's first message for context.
+
+Purpose: future chats can rediscover prior work by reading the README rather than re-running discovery. The recap should be self-contained -- anyone (the user, a future Claude) should be able to reproduce the work from just that directory + `data-sources` skill.

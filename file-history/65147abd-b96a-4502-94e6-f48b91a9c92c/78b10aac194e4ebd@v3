@@ -1,0 +1,600 @@
+import datetime as dt
+import time
+import asyncio
+import pandas as pd
+import numpy as np
+import traceback
+
+import os
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+from google_chat_webhook import send_message, my_chat, aa
+from calendar_utils import getNowEst, SERIALS, wait_until
+from spdr_rock_functions import run_query
+from xbbg import blp
+today = dt.date.today()
+
+import helpers
+from helpers import *
+from spdr_rock_order_functions import *
+from spdr_rock_functions import ConnPool
+from hacker_trades import query_closer_fills, fire_hackers
+seed = int(dt.datetime.now().strftime("%f")) % 10000
+counter = create_counter(seed)
+
+# Knobs are defined below the test-mode CLI block (search "Test-mode CLI") so the CLI
+# overrides sit on the same lines as their prod defaults.
+HACKING_350_ENABLED = True
+
+# Month-end trading. Normally this script exits on month end. Set TRADE_ON_MONTHEND=True
+# to intentionally run it, at MONTHEND_SIZE_MULT of normal size, and only for configs
+# carrying allowed_on_month_end=True. Both the filter and the sizing are additionally
+# gated on is_month_end(), so a stale TRADE_ON_MONTHEND=True cannot shrink a normal day.
+# TRADE_ON_QUARTEREND additionally carves out the four quarter-ends (last trading day of
+# Mar/Jun/Sep/Dec), which carry index-rebalance flow on top of normal month-end flow and
+# historically hold the worst month-end day in the sample (6/30/25).
+# NOTE: the backtest does NOT model any of this yet (it reaches month-ends only via the
+# month_end_only override, at full size, with no quarter-end split) -- see the
+# eod_355_option_algos README TODO.
+TRADE_ON_MONTHEND = True
+TRADE_ON_QUARTEREND = False
+MONTHEND_SIZE_MULT = 0.10
+
+# Pre-warmed connection pools for 355PM. Same sizes as 350PM for consistency; overflow-to-fresh
+# handles unexpected bursts. Warm 5s before 3:55 fire -- single-phase (no separate Warm B) since
+# idle-to-use window is under 10s.
+SRTRADE_POOL_SIZE_355     = 16
+SRANALYTICS_POOL_SIZE_355 = 4
+
+# --- Test-mode CLI (fed by test_run_algos.sh) ------------------------------------------------
+# Prod runs with NO arguments and behaves exactly as before. Passing ANY argument without
+# --test (or --simulation) is a hard error, so a prod launch can never be silently overridden.
+# --simulation is set only when running under simulate_prod.py via runpy, which passes
+# ["--simulation"] in sys.argv.
+import argparse as _argparse
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--test", action="store_true")
+_p.add_argument("--simulation", action="store_true")
+_p.add_argument("--trigger-all", action="store_true")
+_p.add_argument("--trigger-all-size", type=int, default=None)
+_p.add_argument("--send-trades", type=lambda s: s.strip().lower() == "true", default=None)
+_p.add_argument("--test-350pm-imbal", type=float, default=None)
+_p.add_argument("--test-355pm-imbal", type=float, default=None)
+_p.add_argument("--test-355pm-ndx-imbal", type=float, default=None)
+_p.add_argument("--test-spy-price-1540", type=float, default=None)
+_p.add_argument("--test-spy-price-1550", type=float, default=None)
+_p.add_argument("--test-spy-price-1555", type=float, default=None)
+_p.add_argument("--test-realized-change", type=int, choices=range(10), default=None)
+_a = _p.parse_args()
+if len(sys.argv) > 1 and not (_a.test or _a.simulation):
+	raise AssertionError(f"CLI args are only allowed in test mode. Got {sys.argv[1:]}. Pass --test.")
+
+IS_TEST = False or _a.test
+IS_SIMULATION = _a.simulation
+TRIGGER_ALL = False or _a.trigger_all
+TRIGGER_ALL_SIZE = 4 if _a.trigger_all_size is None else _a.trigger_all_size
+SEND_TRADES = True if _a.send_trades is None else _a.send_trades
+
+TEST_350PM_IMBAL = 1.54e9 if _a.test_350pm_imbal is None else _a.test_350pm_imbal
+TEST_355PM_IMBAL = -4.4e9 if _a.test_355pm_imbal is None else _a.test_355pm_imbal
+TEST_355PM_NDX_IMBAL = None if _a.test_355pm_ndx_imbal is None else _a.test_355pm_ndx_imbal
+TEST_SPY_PRICE_1540 = None if _a.test_spy_price_1540 is None else _a.test_spy_price_1540
+TEST_SPY_PRICE_1550 = None if _a.test_spy_price_1550 is None else _a.test_spy_price_1550
+TEST_SPY_PRICE_1555 = None if _a.test_spy_price_1555 is None else _a.test_spy_price_1555
+# Overrides the BINNED factor_realized_change (0-9 percentile bin), not the raw vol change.
+TEST_REALIZED_CHANGE = None if _a.test_realized_change is None else _a.test_realized_change
+
+# TEST_HACK = [("ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET_CLOSER", 100, "Put", 7435, 7430), ("ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_CLOSER", 50, "Call", 7395, 7400)]
+TEST_HACK = []
+
+if IS_TEST:
+	# 2-legged IS_TEST 3x multiplier removed -- 355PM now uses regime-aware edges
+	# via compute_edge_mult, which reads dict configs not module-level scalars.
+
+	# clear_log_of_test_trades removed so 355PM in sequential test runs (340 -> 350 -> 355)
+	# can see prior scripts' test positions when computing the loss cap.
+	# from position_logging_helper import clear_log_of_test_trades
+	# clear_log_of_test_trades()
+	pass
+
+
+if __name__ == "__main__":
+	# _____________________________________________________________Preparation Logic_____________________________________________________________
+	if is_month_end() and not TRADE_ON_MONTHEND:
+		send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')} Not running 355pm script because it is month end.", my_chat)
+		exit()
+
+	if TRIGGER_ALL and not IS_TEST:
+		raise AssertionError("TRIGGER_ALL is set to True but IS_TEST is False. This is not allowed.")
+
+	if not SEND_TRADES and not IS_TEST and not IS_SIMULATION:
+		raise AssertionError("SEND_TRADES is set to False but IS_TEST is False (and not in simulation). This is not allowed.")
+
+	# Load all 355PM config dictionaries
+	configs = load_configs_from_directory("./configs", time="355PM")
+	print("Loaded configs:")
+	for cfg in configs:
+		print(cfg["name"])
+
+	# Month-end run: keep only configs that opted in via allowed_on_month_end=True
+	# (absent key -> not allowed, so a new config must opt in explicitly), then scale
+	# them down. dollar_target AND max_size must both be scaled
+	if TRADE_ON_MONTHEND and is_month_end():
+		# Quarter-ends (last trading day of Mar/Jun/Sep/Dec) are excluded separately:
+		# index-rebalance flow on top of month-end flow. Checked before the config
+		# filter so the exit reason in the log is unambiguous.
+		if is_quarter_end() and not TRADE_ON_QUARTEREND:
+			send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')} Not running 355pm script: "
+						 f"month end is also a QUARTER end.", my_chat)
+			exit()
+
+		_dropped = [c["name"] for c in configs if not c.get("allowed_on_month_end", False)]
+		configs = [c for c in configs if c.get("allowed_on_month_end", False)]
+		for cfg in configs:
+			if cfg.get("dollar_target"):
+				cfg["dollar_target"] = cfg["dollar_target"] * MONTHEND_SIZE_MULT
+			if cfg.get("size_target"):
+				cfg["size_target"] = max(1, int(round(cfg["size_target"] * MONTHEND_SIZE_MULT)))
+			if cfg.get("max_size"):
+				cfg["max_size"] = max(1, int(round(cfg["max_size"] * MONTHEND_SIZE_MULT)))
+		print(f"MONTH END RUN at {MONTHEND_SIZE_MULT:.0%} size. Trading {len(configs)} configs; "
+			  f"dropped {len(_dropped)}: {_dropped}")
+		send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')} MONTH END RUN at "
+					 f"{MONTHEND_SIZE_MULT:.0%} of normal size. {len(configs)} configs trading, "
+					 f"{len(_dropped)} excluded by allowed_on_month_end.", my_chat)
+
+	# VIX edge-mult mutation block removed -- 2-legged edges now sized per-trade by
+	# helpers.compute_edge_mult (vix + atm_vol + abs_imbal + per-trade spread srprc).
+	# Early VIX pull kept (renamed startup_vix -> vix) and passed into prep_trades below.
+	vix = get_vix()
+	print(f"{pretty_time()} -- VIX: {vix:.2f}")
+
+	if not IS_TEST:
+		print(f"{pretty_time()} -- Building start message")
+		start_msg = f"{getNowEst().time().strftime('%I:%M:%S %p')} Starting 355pm algo script. (VIX: {vix:.1f})"
+		print(f"{pretty_time()} -- Sending start message")
+		send_message(start_msg, my_chat)
+		print(f"{pretty_time()} -- Finished sending start message")
+	summary = f"{dt.date.today().strftime('%m/%d/%Y')} {'3:55 PM Algo' if not IS_TEST else 'TEST'} RECAP:\n\n"
+
+	factor_dict = {}
+
+	# _____________________________________________________________Capturing 340pm SPY Price_____________________________________________________________
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 39, 1), poll_interval=30)   # 3:39 PM
+	# Bloomberg warm-up 45s before the 3:40:00 SPY snap (staggered vs other scripts; see helpers)
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 39, 15), poll_interval=1)
+	warm_up_bloomberg_connection()
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 40, 0), poll_interval=0.2)  # 3:40:00 PM
+
+	print(f"{pretty_time()} -- Getting SPY price at 3:40 (for bps calc)")
+	if IS_TEST and TEST_SPY_PRICE_1540 is not None:
+		spy_price_1540 = TEST_SPY_PRICE_1540
+	else:
+		spy_price_1540 = blp.bdp("SPY US Equity", "PX_LAST").iloc[0, 0]
+	print(f"{pretty_time()} -- SPY at 3:40: {spy_price_1540:.2f}")
+
+	# _____________________________________________________________Capturing 350pm SPY Price_____________________________________________________________
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 50, 3), poll_interval=0.1)  # 3:50:03 PM. Slowed to avoid slowing other scripts
+
+	print(f"{pretty_time()} -- Getting SPY price at 3:50 (for bps calc)")
+	if IS_TEST and TEST_SPY_PRICE_1550 is not None:
+		spy_price_1550 = TEST_SPY_PRICE_1550
+	else:
+		spy_price_1550 = blp.bdp("SPY US Equity", "PX_LAST").iloc[0, 0]
+	print(f"{pretty_time()} -- SPY at 3:50: {spy_price_1550:.2f}")
+
+	# 350PM market type: get_market_measurements naturally uses the live 3:50 SPY snap when called here
+	market_350, _, _ = get_market_measurements()
+	factor_dict["factor_market_type350"] = 1 if market_350 == "UP" else -1 if market_350 == "DOWN" else 0
+	print(f"{pretty_time()} -- Market type 350PM: {factor_dict['factor_market_type350']}")
+
+	# _____________________________________________________________Capturing 350pm SPX Imbalance (at 3:51, after 350PM script)_____________________________________________________________
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 51, 0), poll_interval=0.5)  # 3:51:00 PM
+
+	print(f"{pretty_time()} -- Starting get_350_imbal() (350PM imbal for 355PM factors)")
+	imbal_350 = get_350_imbal(is_test=IS_TEST, test_imbal=TEST_350PM_IMBAL)
+	print(f"{pretty_time()} -- Finished get_350_imbal(): {imbal_350}")
+
+	if imbal_350 == NO_IMBAL_VAL:
+		imbal_350 = "*Not Found*"
+
+	if isinstance(imbal_350, str):
+		summary += "No 3:50pm imbalance found. Exited.\n"
+		send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary, my_chat)
+		exit()
+
+	# Build 350PM-based factors
+	factor_dict["factor_350_imbal_greater_than_1b"] = 1 if imbal_350 > 1e9 else 0
+	factor_dict["factor_350_imbal_greater_than_1p5b"] = 1 if imbal_350 > 1.5e9 else 0
+	factor_dict["factor_350_imbal_less_than_neg_1b"] = 1 if imbal_350 < -1e9 else 0
+	factor_dict["factor_350_imbal_greater_than_700"] = 1 if imbal_350 > 0.7e9 else 0
+	factor_dict["factor_350_imbal_less_than_neg_700"] = 1 if imbal_350 < -0.7e9 else 0
+	factor_dict["factor_350_imbal_less_than_300M"] = 1 if imbal_350 < 0.3e9 else 0
+	factor_dict["factor_350_imbal_greater_than_neg_300M"] = 1 if imbal_350 > -0.3e9 else 0
+	factor_dict["factor_350_imbal_less_than_400M"] = 1 if imbal_350 < 0.4e9 else 0
+	factor_dict["factor_350_imbal_greater_than_neg_400M"] = 1 if imbal_350 > -0.4e9 else 0
+	factor_dict["factor_350_imbal_less_than_neg_500m"] = 1 if imbal_350 < -0.5e9 else 0
+	factor_dict["factor_350_imbal_greater_than_500m"] = 1 if imbal_350 > 0.5e9 else 0
+	print(f"{pretty_time()} -- 350PM imbal factors built")
+
+	# _____________________________________________________________Realized-vol-change factor (at ~3:51:05, before 3:52)_____________________________________________________________
+	# Same helper + binning as 350pm_script (get_change_in_realized -> bin_realized_change).
+	# Pulled here, well before the 3:55 fire, because it is a Bloomberg bdh call. Fail-open:
+	# on any failure the factor is set to -1 so bin-8/9 dont-trade rules simply never match.
+	print(f"{pretty_time()} -- Starting get_change_in_realized() (355PM factors)")
+	try:
+		change_in_realized = get_change_in_realized()
+		factor_dict["factor_realized_change"] = bin_realized_change(change_in_realized)
+	except Exception as e:
+		print(f"WARNING: get_change_in_realized failed ({e}) -- factor_realized_change = -1 (dont-trade rules disabled)")
+		factor_dict["factor_realized_change"] = -1
+	if IS_TEST and TEST_REALIZED_CHANGE is not None:
+		factor_dict["factor_realized_change"] = TEST_REALIZED_CHANGE
+		print(f"{pretty_time()} -- TEST override: factor_realized_change = {TEST_REALIZED_CHANGE}")
+	print(f"{pretty_time()} -- Finished get_change_in_realized(): factor_realized_change = {factor_dict['factor_realized_change']}")
+
+	# _____________________________________________________________Pre-fetch Option Chains at 3:54:50_____________________________________________________________
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 54, 50), poll_interval=0.5)  # 3:54:50 PM
+
+	# Warm: 5s before 3:55 fire. Single-phase (no separate Warm A/B) because idle-to-use
+	# window is only ~5-10s -- no meaningful stale-conn risk.
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 54, 55), poll_interval=0.5)  # 3:54:55 PM
+	print(f"{pretty_time()} -- Warm: opening srtrade pool ({SRTRADE_POOL_SIZE_355}) + sranalytics pool ({SRANALYTICS_POOL_SIZE_355})")
+	try:
+		_t_warm = time.perf_counter()
+		srtrade_pool_355     = ConnPool("srtrade",     SRTRADE_POOL_SIZE_355)
+		sranalytics_pool_355 = ConnPool("sranalytics", SRANALYTICS_POOL_SIZE_355)
+		print(f"{pretty_time()} -- Warm done in {(time.perf_counter()-_t_warm)*1000:.0f}ms")
+	except Exception as e:
+		print(f"{pretty_time()} -- Warm FAILED ({e}); falling back to fresh conns for 355PM")
+		srtrade_pool_355 = None
+		sranalytics_pool_355 = None
+
+	print(f"{pretty_time()} -- Pre-fetching SPXW option chains")
+	# Wider chain (includes up to 1$ ITM strike) so the CLOSER variants
+	# (msd=-1) can pick a near-ATM short leg. Regular configs (msd>=1) drop
+	# the ITM row in helpers.py's filter, so their behavior is unchanged.
+	calls = run_query(get_closest_and_slightly_itm_calls_sql, verbose=True, tag="prefetch_calls")
+	puts = run_query(get_closest_and_slightly_itm_puts_sql, verbose=True, tag="prefetch_puts")
+	today_vol = puts.satm.iloc[0]
+	print(f"{pretty_time()} -- Pre-fetch complete. ATM vol: {today_vol:.3f}")
+
+	# Hacker Stage 1: query algo_trade_log for today's 350PM CLOSER fills. Runs at 3:54:50 so
+	# the (potentially slow) DB touch happens well before 3:55 fire time. Adversarial gate is
+	# applied later inside fire_hackers when factor_355_imbal_* are populated.
+	# Gated by HACKING_350_ENABLED failsafe -- flip to False to skip entirely.
+	if HACKING_350_ENABLED:
+		print(f"{pretty_time()} -- [hacker] Querying algo_trade_log for CLOSER fills")
+		try:
+			hacker_fills = query_closer_fills(
+				today=today, is_test=IS_TEST, test_hack_rows=TEST_HACK,
+				log_fn=lambda msg: print(f"{pretty_time()} -- [hacker] {msg}"),
+			)
+		except Exception as e:
+			print(f"{pretty_time()} -- [hacker] query FAILED ({e}); no hackers today")
+			traceback.print_exc()
+			hacker_fills = []
+		print(f"{pretty_time()} -- [hacker] found {len(hacker_fills)} candidate fill(s)")
+	else:
+		print(f"{pretty_time()} -- [hacker] DISABLED via HACKING_350_ENABLED=False; skipping query")
+		hacker_fills = []
+
+	# _____________________________________________________________Capturing 355pm Data_____________________________________________________________
+
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 55, 0), poll_interval=0.1)  # 3:55:00 PM
+
+	# SPY price at 3:55 and market type
+	print(f"{pretty_time()} -- Getting SPY price at 3:55 and market measurements")
+	# One BBG call instead of two: get_market_measurements(return_spy_price=True) returns
+	# the current SPY price from the same bdh SPY historicals it already fetches
+	# (close.iloc[-1] == today's live PX_LAST at 3:55). Test mode overrides only when
+	# TEST_SPY_PRICE_1555 is explicitly set (None => fall through to real fetch).
+	if IS_TEST and TEST_SPY_PRICE_1555 is not None:
+		market_355, today_move_355, std_355 = get_market_measurements()
+		spy_price_1555 = TEST_SPY_PRICE_1555
+	else:
+		market_355, today_move_355, std_355, spy_price_1555 = get_market_measurements(return_spy_price=True)
+	print(f"{pretty_time()} -- SPY at 3:55: {spy_price_1555:.2f}")
+	print(f"{pretty_time()} -- Market type at 3:55: {market_355}")
+
+	# SPY bps changes
+	spy_chg_1540_1550_bps = (spy_price_1550 - spy_price_1540) / spy_price_1540 * 10000
+	spy_chg_1550_1555_bps = (spy_price_1555 - spy_price_1550) / spy_price_1550 * 10000
+	print(f"{pretty_time()} -- SPY chg 3:40-3:50: {spy_chg_1540_1550_bps:.1f} bps, 3:50-3:55: {spy_chg_1550_1555_bps:.1f} bps")
+
+	# SPY bps factors
+	factor_dict["factor_spy_chg_1540_1550_lt_neg13bps"] = 1 if spy_chg_1540_1550_bps < -13 else 0
+	factor_dict["factor_spy_chg_1540_1550_gt_13bps"] = 1 if spy_chg_1540_1550_bps > 13 else 0
+	factor_dict["factor_spy_chg_1550_1555_lt_neg12bps"] = 1 if spy_chg_1550_1555_bps < -12 else 0
+	factor_dict["factor_spy_chg_1550_1555_gt_12bps"] = 1 if spy_chg_1550_1555_bps > 12 else 0
+	factor_dict["factor_spy_chg_1550_1555_gt_8bps"] = 1 if spy_chg_1550_1555_bps > 8 else 0
+	factor_dict["factor_spy_chg_1540_1550_lt_neg7bps"] = 1 if spy_chg_1540_1550_bps < -7 else 0
+
+	# 355PM market type factor (350PM market type was computed earlier, right after the 3:50 SPY snap)
+	factor_dict["factor_market_type"] = 1 if market_355 == "UP" else -1 if market_355 == "DOWN" else 0
+
+	# _____________________________________________________________Poll 355PM SPX Imbalance_____________________________________________________________
+
+	# Gate to 3:55:01. Nasdaq published imbal at 3:55:00.000, DB replication lag pushes visibility to ~3:55:01
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 55, 1), poll_interval=0.05)
+
+	print(f"{pretty_time()} -- Starting get_355_imbal('.SPX')")
+	imbal_355 = (
+		get_355_imbal(is_test=IS_TEST, test_imbal=TEST_355PM_IMBAL, basket_name='.SPX', sleep_between=0.1, max_attempts=40))
+	print(f"{pretty_time()} -- SPX 355PM imbal: {imbal_355 / 1e9:.2f}B" if imbal_355 != NO_IMBAL_VAL else f"{pretty_time()} -- SPX 355PM imbal: NOT FOUND")
+
+	# NDX 355PM imbal - uncomment when adding NDX confirmation factors
+	# print(f"{pretty_time()} -- Starting get_355_imbal('.NDX')")
+	# ndx_imbal_355 = get_355_imbal(is_test=IS_TEST, test_imbal=TEST_355PM_NDX_IMBAL, basket_name='.NDX')
+	# print(f"{pretty_time()} -- NDX 355PM imbal: {ndx_imbal_355 / 1e9:.2f}B" if ndx_imbal_355 != NO_IMBAL_VAL else f"{pretty_time()} -- NDX 355PM imbal: NOT FOUND")
+	ndx_imbal_355 = None
+
+	if imbal_355 == NO_IMBAL_VAL:
+		summary += "No 3:55pm SPX imbalance found. Exited.\n"
+		send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary, my_chat)
+		exit()
+
+	# 355PM imbal factors
+	factor_dict["factor_355_imbal_greater_than_0"] = 1 if imbal_355 > 0 else 0
+	factor_dict["factor_355_imbal_less_than_0"] = 1 if imbal_355 < 0 else 0
+	factor_dict["factor_355_imbal_greater_than_1b"] = 1 if imbal_355 > 1e9 else 0
+	factor_dict["factor_355_imbal_less_than_neg_1B"] = 1 if imbal_355 < -1e9 else 0
+	# Hacker-gate-only factors (8/21/26): 950M = 1B minus a live-vs-T+1 jitter buffer.
+	# Strategy configs keep using the 1B factors above -- do not swap those.
+	factor_dict["factor_355_imbal_greater_than_950m"] = 1 if imbal_355 > 0.95e9 else 0
+	factor_dict["factor_355_imbal_less_than_neg_950m"] = 1 if imbal_355 < -0.95e9 else 0
+	factor_dict["factor_355_imbal_less_than_minus_1p5b"] = 1 if imbal_355 < -1.5e9 else 0
+	factor_dict["factor_355_imbal_greater_than_1p5B"] = 1 if imbal_355 > 1.5e9 else 0
+	factor_dict["factor_355_imbal_less_than_500M"] = 1 if imbal_355 < 0.5e9 else 0
+	factor_dict["factor_355_imbal_greater_than_neg_500M"] = 1 if imbal_355 > -0.5e9 else 0
+
+	# 350PM -> 355PM imbal delta factor (used by ALGO_42_355PM_SPREAD_SALES_SPX_IMBAL_GROWS_SML)
+	factor_dict["factor_355_minus_350_imbal_gt_2p5b"] = 1 if (imbal_355 - imbal_350) > 2.5e9 else 0
+
+	# ATM vol factors (from pre-fetched option chain)
+	factor_dict["factor_355_atmVol_lt_15"] = 1 if today_vol < 0.15 else 0
+	factor_dict["factor_355_atmVol_gt_12"] = 1 if today_vol > 0.12 else 0
+	factor_dict["factor_355_atmVol_gt_18"] = 1 if today_vol > 0.18 else 0
+
+	# SPY change bps factor for debit spread buys (skip if SPY already dropped)
+	factor_dict["factor_spy_chg_1550_1555_lt_neg2bps"] = 1 if spy_chg_1550_1555_bps < -2 else 0
+
+	# NDX 355PM imbal factors
+	factor_dict["factor_355_ndx_imbal_greater_than_0"] = 1 if (ndx_imbal_355 is not None and ndx_imbal_355 > 0) else 0
+	factor_dict["factor_355_ndx_imbal_less_than_0"] = 1 if (ndx_imbal_355 is not None and ndx_imbal_355 < 0) else 0
+
+	print(f"{pretty_time()} -- All 355PM factors built")
+
+	# _____________________________________________________________Refresh Option Chains & Prep Trades_____________________________________________________________
+
+	# Gate to 3:55:01.2 (was 3:55:01.7) before chain refresh -- imbal_355 usually returns
+	# by ~01.15-01.25, so this gate is effectively a no-op on fast days.
+	wait_until(dt.time(8 if IS_TEST else LAST_HOUR, 55, 1, 200000), poll_interval=0.05)
+
+	print(f"{pretty_time()} -- Refreshing SPXW option chains at 355PM")
+	# Wider chain (includes up to 1$ ITM strike) so the CLOSER variants
+	# (msd=-1) can pick a near-ATM short leg. Regular configs (msd>=1) drop
+	# the ITM row in helpers.py's filter, so their behavior is unchanged.
+	calls = run_query(get_closest_and_slightly_itm_calls_sql, verbose=True, tag="refresh355_calls")
+	puts = run_query(get_closest_and_slightly_itm_puts_sql, verbose=True, tag="refresh355_puts")
+	spx = puts.uprc[0]
+	# Log each side's own uprc and its nearest-to-ATM strike: the ITM window in these SQLs
+	# gates on each ROW's own uprc, not on the puts.uprc[0] used as spot downstream, so when
+	# the two diverge the CLOSER (msd=-1) can silently lose its near-ATM strike (observed
+	# 8/24/26 on v8: puts uprc 7655.83 but 7655C absent -> CLOSER landed on its parent's
+	# 7660/7665). Highest put / lowest call returned make that visible per side.
+	calls_uprc = calls.uprc[0] if len(calls) else float("nan")
+	lowest_call = calls.okey_xx[0] if len(calls) else float("nan")
+	highest_put = puts.okey_xx[0] if len(puts) else float("nan")
+	print(f"{pretty_time()} -- Finished refreshing. SPX: {spx:,.2f} (puts uprc, highest put "
+		  f"strike returned: {highest_put:,.0f}); calls uprc: {calls_uprc:,.2f}, lowest call "
+		  f"strike returned: {lowest_call:,.0f}")
+
+	# helpers.py now applies min_strike_distance natively (literal-$ semantics
+	# after the May 2026 migration). No script-level pre-filter needed -- each
+	# config's own min_strike_distance controls its strike filtering. CLOSER
+	# variants (msd=-1) require seeing strikes within $1 of spot to pick the
+	# closest-to-ATM short leg, so any blanket script-level filter would block
+	# them. Reset index for defensive correctness so iloc[0] in prep_trades
+	# still hits the closest OTM strike.
+	puts_filtered = puts.reset_index(drop=True)
+	calls_filtered = calls.reset_index(drop=True)
+
+	option_chains = {
+		"SPXW": {"puts": puts_filtered, "calls": calls_filtered, "underlying": spx},
+	}
+
+	print(f"{pretty_time()} -- Starting prep_trades() 355PM")
+	# Compute 4th regime factor: abs change in SPX imbal from 3:50 to 3:55. 355PM only.
+	# Falls back to None (-> 3-factor edges) if either snap failed.
+	abs_chg_imbal = None
+	if (isinstance(imbal_350, (int, float)) and isinstance(imbal_355, (int, float))
+	    and imbal_350 != NO_IMBAL_VAL and imbal_355 != NO_IMBAL_VAL):
+		abs_chg_imbal = abs(imbal_355 - imbal_350)
+	_chg_str = f"{abs_chg_imbal/1e9:.2f}B" if abs_chg_imbal is not None else "None"
+	print(f"{pretty_time()} -- Regime edge inputs: VIX={vix:.2f}, atmVol={today_vol:.3f}, absImbal={abs(imbal_355)/1e9:.2f}B, absChgImbal={_chg_str}")
+	# Live-reload SIZE_MULT_355_PUTS/CALLS from algo_globals so mid-run edits take effect.
+	from algo_globals import get_live_size_mults
+	_puts_mult_355, _calls_mult_355 = get_live_size_mults("355")
+	print(f"{pretty_time()} -- Live size mults (355): puts={_puts_mult_355}, calls={_calls_mult_355}")
+	trade_dict, explanations_dict = prep_trades(configs=configs,
+												factor_dict=factor_dict,
+												option_chains=option_chains,
+												today=today,
+												trigger_all=TRIGGER_ALL,
+												trigger_all_size=TRIGGER_ALL_SIZE,
+												magnets=[],
+												vix=vix,
+												atm_vol_0dte=today_vol,
+												abs_imbal=abs(imbal_355),
+												abs_chg_imbal=abs_chg_imbal,
+												abs_chg_stats=helpers.ABS_CHG_IMBAL_STATS_355PM,  # intentionally-low 355 set (see helpers.py)
+												is_test=IS_TEST,
+												puts_size_mult=_puts_mult_355,
+												calls_size_mult=_calls_mult_355,
+												)
+	print(f"{pretty_time()} -- Finished prep_trades() 355PM")
+
+	# _____________________________________________________________Resize Trades_____________________________________________________________
+	# 355pm-specific: when a CLOSER variant trades, decrement its parent's size by the CLOSER's size.
+	# Parent floors at 1 lot. Defined in helpers.apply_closer_resize so simulate_prod.py
+	# can call the exact same function (no copy-paste drift).
+	# Runs BEFORE apply_size_limits so the loss-cap sees post-resize sizes.
+	apply_closer_resize(trade_dict, log_fn=lambda msg: print(f"{pretty_time()} -- {msg}"))
+
+	# Apply size limits (loss-cap pro-rata) -- AFTER apply_closer_resize so resizes are reflected.
+	try:
+		from position_logging_helper import apply_size_limits
+		print(f"{pretty_time()} -- Starting size limit check (355PM)")
+		apply_size_limits(trade_dict, is_test=IS_TEST, explanations_dict=explanations_dict, max_loss_cap=MAX_LOSS_CAP_355)
+		print(f"{pretty_time()} -- Finished size limit check (355PM)")
+	except Exception as e:
+		print(f"{pretty_time()} -- ERROR in size limit check (355PM): {e}")
+
+	# _____________________________________________________________Send Trades_____________________________________________________________
+	if IS_TEST:
+		for trade in trade_dict["trades"]:
+			trade["account"] = TEST_ACCOUNTS[trade["account"]]
+
+	print(f"{pretty_time()} -- Starting orchestrate_batched_send() 355PM (+ fire_hackers concurrently)")
+	if SEND_TRADES:
+		# Run orchestrator and hackers CONCURRENTLY in a single event loop. Hackers wait
+		# ~100ms so orchestrator's wave-1 hits SR first, then fire during orchestrator's
+		# Phase-3 3s sleep. Wall-time added by hackers: 0s (they fit inside orchestrator's
+		# ~3-4s window). Hackers append themselves to trade_dict so log_trades sees them.
+		async def _fire_all_355():
+			tasks = [orchestrate_batched_send(
+				trade_dict, orderDuration=30,
+				srtrade_pool=srtrade_pool_355,
+				sranalytics_pool=sranalytics_pool_355,
+			)]
+			if HACKING_350_ENABLED and hacker_fills:
+				tasks.append(fire_hackers(
+					trade_dict=trade_dict,
+					hacker_fills=hacker_fills,
+					factor_355_imbal_less_than_neg_950m=factor_dict.get("factor_355_imbal_less_than_neg_950m", 0),
+					factor_355_imbal_greater_than_950m=factor_dict.get("factor_355_imbal_greater_than_950m", 0),
+					today=today, is_test=IS_TEST,
+					delay_start_seconds=0.05,   # 50ms head start for orchestrator wave-1 -- sranalytics SELECT adds another ~20-50ms of implicit buffer
+					log_fn=lambda msg: print(f"{pretty_time()} -- [hacker] {msg}"),
+					# Regime inputs for the floored 355-methodology edge blend (same set 355PM uses).
+					vix=vix, atm_vol_0dte=today_vol, abs_imbal=abs(imbal_355), abs_chg_imbal=abs_chg_imbal,
+				))
+			await asyncio.gather(*tasks, return_exceptions=True)
+		asyncio.run(_fire_all_355())
+	print(f"{pretty_time()} -- Finished orchestrate_batched_send() 355PM (+ hackers)")
+
+	# Log net option positions
+	try:
+		from position_logging_helper import log_positions
+		print(f"{pretty_time()} -- Starting position logging (355PM)")
+		log_positions(trade_dict, script_name="355PM", is_test=IS_TEST)
+		print(f"{pretty_time()} -- Finished position logging (355PM)")
+	except Exception as e:
+		print(f"{pretty_time()} -- ERROR in position logging (355PM): {e}")
+
+	# ================= 355 EXTRA-SPREADS LIMIT LADDER (added 2026-08-24/25) =====================
+	# Rest $5-wide sell limits until 15:59:30 ET when the GROWS / VS_MKT_LOW_VOL parents fire.
+	# Mirrors the 350 hook: try/except so a ladder failure can never crash the 3:55 run; orders
+	# send in a background thread. Config: configs_extra_spreads/extra_spread_config_355.py.
+	# (The recap block for extra_spread_summary_355 sits after *Explanations:* below -- the only
+	# other line this feature touches in this file.)
+	extra_spread_summary_355 = ""
+	try:
+		from extra_spread_trader_355 import send_extra_spread_orders_355
+		print(f"{pretty_time()} -- Starting 355 extra spread orders")
+		extra_spread_summary_355 = send_extra_spread_orders_355(
+			trade_dict=trade_dict, puts=puts_filtered, calls=calls_filtered,
+			today=today, counter=counter, is_test=IS_TEST, send_trades=SEND_TRADES,
+		)
+		print(f"{pretty_time()} -- Finished 355 extra spread orders")
+	except Exception as e:
+		extra_spread_summary_355 = f"ERROR in 355 extra spread trader: {e}"
+		print(f"{pretty_time()} -- ERROR in 355 extra spread trader: {e}")
+	# ============================ END 355 EXTRA-SPREADS LADDER ==================================
+
+	# _____________________________________________________________Summary_____________________________________________________________
+
+	summary += f"SPX: {spx:,.2f}. 350PM Imbal: {imbal_350:,.0f}. 355PM Imbal: {imbal_355:,.0f}.\n"
+	summary += f"Market at 3:55: {market_355}.\n"
+	summary += f"SPY 3:40-3:50: {spy_chg_1540_1550_bps:.1f}bps. SPY 3:50-3:55: {spy_chg_1550_1555_bps:.1f}bps.\n"
+	if ndx_imbal_355 is not None:
+		summary += f"NDX 355PM Imbal: {ndx_imbal_355 / 1e9:.2f}B.\n"
+	else:
+		summary += "NDX 355PM Imbal: N/A.\n"
+	summary += f"Today's Vol: {today_vol:.3f}.\n"
+	summary += f"Regime inputs: VIX={vix:.2f}, atmVol={today_vol:.3f}, absImbal={abs(imbal_355)/1e9:.2f}B.\n"
+
+	summary_dict = {}
+
+	for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+		if not trade["name"] in summary_dict:
+			summary_dict[trade["name"]] = f"""\n*{trade["name"]}* ({trade["account"]}):\n"""
+		if trade_type == "complex":
+			if trade["direction"] == "Sell":
+				summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["short_legs"][0].okey_xx} {trade["long_legs"][0].okey_xx} {trade["structure"]} for {trade["price"]}.\n"""
+			else:
+				summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["long_legs"][0].okey_xx} {trade["short_legs"][0].okey_xx} {trade["structure"]} for {trade["price"]}.\n"""
+		else:
+			summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["option"].okey_xx} {trade["structure"]} for {trade["price"]}.\n"""
+
+	for single_algo_summary in summary_dict.values():
+		summary += single_algo_summary
+
+	summary += "\n*Explanations:*"
+	for algo_name, explanations in explanations_dict.items():
+		summary += f"""\n{algo_name}:\n"""
+		summary += explanations["put"]
+		summary += explanations["call"]
+
+	if extra_spread_summary_355:   # 355 extra-spreads ladder recap (hook above, before Summary)
+		summary += f"\n*355 Extra Spreads:*\n{extra_spread_summary_355}\n"
+
+	# Prepend any loud send-phase warnings (wave-1 not confirmed terminal -> hedged wave-2 from the
+	# orchestrator; FULL-SIZE-NOT-SENT 4-order-cap drops from trade_complex) so they sit at the TOP.
+	_warns = (trade_dict.get("send_warnings") or []) + drain_send_warnings()
+	_warn_block = ("\n".join(_warns) + "\n\n") if _warns else ""
+	print(summary)
+	send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + _warn_block + summary, my_chat)
+
+	# Log per-algo trade attempts to optionsResearch.algo_trade_log (60s wait for SR fills to settle).
+	# Wrapped in try/except so logging failure never affects trading (trading is already done at this point).
+	# Skipped entirely in test mode -- we don't want test trades polluting the prod log table.
+	# Note: 355PM doesn't capture rsi / high_low / 3m_realized_chg / qqq_imbal / paired_imbal -> logged NULL.
+	if IS_TEST:
+		print(f"{pretty_time()} -- algo_trade_logger SKIPPED (IS_TEST=True)")
+	else:
+		try:
+			from algo_trade_logger import log_trades
+			factors_for_log = {
+				"spx_price":       float(spx) if spx is not None else None,
+				"vix":             float(vix) if vix is not None else None,
+				"atm_vol":         float(today_vol) if today_vol is not None else None,
+				"market_ratio":    float(today_move_355 / std_355) if std_355 else None,
+				"rsi":             None,
+				"high_low_ratio":  None,
+				"realized_3m_chg": None,
+				"imbal_340":       None,
+				"imbal_350":       int(imbal_350) if (not isinstance(imbal_350, str) and imbal_350 is not None) else None,
+				"imbal_355":       int(imbal_355) if (not isinstance(imbal_355, str) and imbal_355 is not None) else None,
+				"qqq_imbal":       None,
+				"paired_imbal":    None,
+			}
+			print(f"{pretty_time()} -- Starting algo_trade_logger (60s wait for SR fills)")
+			log_trades(trade_dict, factors_for_log, wait_seconds=60, script_name="355PM")
+			print(f"{pretty_time()} -- Finished algo_trade_logger")
+			# Second pass for wave-3 resting hackers (fills can land up to 16:00, after the
+			# 60s snapshot above). Fast no-op on non-hack days; sleeps to ~16:00:30 otherwise.
+			from hacker_trades import refresh_hacker_fills
+			refresh_hacker_fills(trade_dict, factors_for_log, script_name="355PM",
+			                     log_fn=lambda msg: print(f"{pretty_time()} -- [hacker] {msg}"))
+		except Exception as _log_e:
+			print(f"{pretty_time()} -- ERROR in algo_trade_logger (non-fatal): {_log_e}")
+			traceback.print_exc()
+
+	if srtrade_pool_355 is not None:     srtrade_pool_355.close()
+	if sranalytics_pool_355 is not None: sranalytics_pool_355.close()

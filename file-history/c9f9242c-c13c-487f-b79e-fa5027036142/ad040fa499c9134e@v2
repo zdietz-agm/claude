@@ -1,0 +1,59 @@
+PROD PNL 33.5k, Backtest PNL 55.0k
+
+v7 fill-quality table unreadable: srtrade_agm_2026_09_10 at 198.102.4.55:3307 failed 6 attempts in the pack build. A
+  manual SHOW DATABASES on that host (connect took over 2 minutes) returns 11 databases -- information_schema,
+  sranalytics(009), srcontrol(009), srlive(009), srrisk(009), srtrade(009) -- and NO srtrade_agm_* database for any
+  date. Access needs updating. All prod fills were still covered by v8's srtrade_2026_09_10 (100 algo fills, 1,872
+  lots), none flagged.
+
+350pm_script:
+- No notable slow data issues.
+- Sold the 7585/7570 put spread, 258/258 filled on wave 1 at 0.45 against a 0.35 net mid and a 0.30 net cross. 7585P
+  sprc 0.550 sat 0.10 above its own 0.40/0.45 NBBO. A full instant wave-1 fill 0.10 through the mid does not point to
+  a need for more aggressive edge targets.
+- 350PM put family aggregate prod 6,036 vs backtest 33,565 (EOD_OPTION_ALGOS_20260911_0813.xlsx; same 7585/7570 at
+  0.35, idx_close 7591.70, expired worthless). Of the -27,529 gap, -24,535 is the script loss cap ($380,000/side
+  against $1,409,730 demand, 959 lots pro-rata'd to 258 at 0.27x, 701 removed at $35/lot) and -4,480 is the 355
+  hacker buying back 128 of the 258 lots at 0.45 against the 0.45 sale (backtest hacker triggered=False at imbal_355
+  -0.98B vs its $1B gate). Residual +1,486 is prod's 0.45 credit vs the backtest's 0.35.
+- IMBAL GROWS EXTRA PUTS filled 14 lots in prod but has no PNL LOG NEW row, on this or any date. Its dollars are
+  consistent with sitting inside IMBAL GROWS' 2,280 (42 + 7 unhacked lots at 0.45 plus the fast/v8 1-lots = 2,295).
+
+355pm_script:
+- No notable slow data issues.
+- IMBAL_FLIPS sold 356 of the 7595/7600 call spread. Wave 1 filled 0/356 at a 0.92 limit against a 0.70 net cross:
+  7600C sprc 0.157 vs its own 0.25/0.30 NBBO (0.093 below the bid) pushed net sprc to 1.005, 0.13 above the 0.875 net
+  mid. Wave-1 underfill triggered on the Call side (0/356; IMBAL_FLIPS was the only Call order), adding +0.021 to W2
+  edges. Wave 2 filled all 356 at a 0.45 limit, avg 0.60.
+- Sized down to 356 by config max size on a +26,287 day, the third straight up day (+60,246 across the three).
+  Size-up candidate; no prod_change_log entry touches FLIPS.
+- Prod 26,287 vs backtest 21,360 is the v8 book's extra 71 lots: v7 356 x $60 = 21,360 exactly, v8 71 at 0.70.
+- Hacker bought back 128 lots of the 350 put spread at 0.45 debit across five parents, all on wave 1, each
+  floor(half) of its filled parent. Backtest modeled no hack (imbal_355 -0.98B, inside the 0.9-1.1B buffer). No
+  hacker flags.
+- Almost fired:
+  - 355PM IMBAL_GROWS calls missed by $24M. factor_355_imbal_less_than_neg_1B needed -1.0B and the imbal read
+    -975.9M; the 350 gate (>-400M) passed at +1.61B. A 3:55 call sale expired worthless, so it would have made money.
+
+350pm_script_v8:
+- Traded IMBAL_VS_MARKET_BUMPED 6 lots at 1.20 net on 7590/7575. The bumped layer only fires on parents sized 1, so
+  the V8_SIZE_RATIO floor makes v8 eligible on days v7 is not: v7 printed "No bumped trades triggered" at parent
+  sizes 426/312. The bumped backtest has no row on 9/10.
+- IMBAL_GROWS_BUMPED Put VETOED on the projected 355 levered rebal of -8.97B. CSV row and the 15:49:55 log context
+  line agree, and algo_trade_log shows no GROWS BUMPED or CLOSER fill.
+
+355pm_script_v8:
+- IMBAL_FLIPS 71 lots, same mechanism as v7: 0/71 on wave 1 at a 0.86 limit vs a 0.85 cross, all 71 on wave 2 at a
+  0.47 limit, avg 0.70.
+- Hacker bought back 3 of the 6 bumped lots at 1.40 debit against the 1.20 sale, on wave 2; the backtest models no
+  BUMP leg. Prod BUMPED row of 299 is the 3 kept lots at 1.20 less that -0.20 unwind.
+
+340pm_script:
+- Backtest and prod agree (prod 40 vs backtest 35 on the 1-lot 7605/7615 call spread).
+
+Refresh the backtest-side rebal projection history so 9/10 can be checked against the backtest's 5.0B veto model
+  (parquet ends 2026-09-08):
+  cd /d/vbam-data-oracle/projects/levered_rebal && python run_levered_rebal.py 2026-09-09 2026-09-10
+
+Didn't trade/does not need human review: 350pm_script_fast.py, 350pm_ss_script.py, 350pm_stock_script.py,
+  350PM_stock_script_fast.py, 355pm_stock_script.py, 4pm_script_v3.py, btic_and_imbal_script.py, save_spy_prices.py

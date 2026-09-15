@@ -1,0 +1,2619 @@
+"""Build the deterministic "review pack" that the daily algo-review task reads.
+
+One command gathers every number the review needs for a single trade date and writes
+them to packs/<YYYY_MM_DD>/:
+
+    digest.txt          -- all facts: freshness, fills by wave, prod vs backtest, streaks,
+                           sprc-vs-NBBO flags, slowness flags, per-script findings
+    <script>_clean.txt  -- each prod log with SQL/run_query noise stripped, so the review
+                           can actually read the log and catch what no rule anticipated
+
+Nothing here interprets. Interpretation is the review task's job; this file only
+collects and flags.
+
+Usage:
+    python build_review_pack.py                  # prior trading day
+    python build_review_pack.py 2026-08-18       # explicit date
+    python build_review_pack.py --regen          # try to rebuild stale/missing backtests
+    python build_review_pack.py 2026-08-18 --regen
+
+Exit codes: 0 = pack written (read digest.txt for input problems), 2 = fatal.
+"""
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(1, "D:/PycharmProjects/utils")
+
+import pandas as pd
+import calendar_utils
+
+# ---------------------------------------------------------------- paths / config
+
+LOG_DIR = "D:/PycharmProjects/scratch/algos/logs"
+ALGOS_DIR = "D:/PycharmProjects/scratch/algos"
+PACK_ROOT = "D:/agent_projects/algo_daily_review/packs"
+SCHED_DIR = "D:/agent_projects/scheduled_tasks"
+STATUS_DIR = os.path.join(SCHED_DIR, "status")
+DOWNLOADS = "C:/Users/zdietz/Downloads"
+PNL_LOG = ("C:/Users/zdietz/White Bay Dropbox/Zach Dietz/VBAM Options/"
+           "PNL LOG NEW.xlsx")
+
+# Scripts prod launches every trade day (run_algos.sh SCRIPTS array). A missing log for
+# one of these is itself a finding.
+EXPECTED_SCRIPTS = [
+    "340pm_script", "350pm_script", "save_spy_prices", "350pm_stock_script",
+    "350pm_stock_script_fast", "350pm_ss_script", "350pm_script_fast",
+    "btic_and_imbal_script", "355pm_script", "355pm_stock_script", "4pm_script_v3",
+    # v8 parallel-run scripts, added to run_algos.sh for the overlapped run.
+    "350pm_script_v8", "355pm_script_v8",
+]
+# Reviewed in depth; everything else gets the short treatment.
+DEEP_SCRIPTS = ["350pm_script", "355pm_script"]
+
+# Slowness thresholds (seconds / ms).
+GAP_WARN_S = 2.0            # timestamp gap worth showing
+QUERY_WARN_MS = 200.0       # run_query TOTAL
+CONN_WARN_MS = 50.0         # run_query conn= (fresh connection cost)
+BBG_WARN_S = 1.5            # a single Bloomberg price pull
+RETRY_WARN = 5              # imbal poll attempts
+
+# Clock times the scripts deliberately wait for -- a gap that crosses one of these is a
+# scheduled wait, not slowness.
+#
+# These are only a FALLBACK. The real marks are parsed out of each prod script at run time
+# by wait_marks_for_script(), so changing a fire time in the prod script updates the review
+# automatically. A hardcoded list is worse than useless once it drifts: a stale mark keeps
+# suppressing gaps that cross that second, which would hide a genuine slowdown.
+FALLBACK_SCHEDULED_TIMES = [
+    (15, 32, 0), (15, 38, 0), (15, 40, 0), (15, 45, 30), (15, 49, 0), (15, 49, 55),
+    (15, 50, 0), (15, 50, 1), (15, 50, 5), (15, 51, 0), (15, 53, 0), (15, 54, 50),
+    (15, 54, 55), (15, 55, 0), (15, 55, 1), (15, 56, 0), (15, 58, 0),
+    (15, 59, 0), (16, 0, 0), (16, 0, 15), (16, 1, 0),
+]
+# Lines after which a pause is the code's own designed wait, not latency: the two-wave
+# senders sleep between waves, the async send blocks while SR works the orders, etc.
+WAIT_LINE_PAT = re.compile(
+    r"sleep|sleeping|wait_until|waiting|wait until|60s wait|"
+    r"send_complex_two_waves|asyncio\.run|orchestrate_batched_send", re.I)
+# Announced sleep durations: "[orchestrator] Phase 3: sleeping 3s for SR to work orders",
+# "Starting algo_trade_logger (60s wait for SR fills)". A gap that sits entirely inside
+# [t_sleep, t_sleep + dur + SLEEP_SLACK_S] is that sleep no matter which line happens to
+# print inside it. The concurrent hacker task logs mid-sleep ("[hacker] no adversarial
+# hackers survived gate", 9/2/26), so the line-before-the-gap test above missed the sleep
+# and flagged it UNEXPLAINED. Bounded by the announced duration: a hacker send that
+# overruns the sleep (9/1/26, 2.78s after Phase 6) still shows.
+SLEEP_DUR_PAT = re.compile(
+    r"sleep(?:ing)?\s+(\d+(?:\.\d+)?)\s*s\b|\b(\d+(?:\.\d+)?)s wait\b", re.I)
+SLEEP_SLACK_S = 1.0
+# The hacker's post-wave-2 working window (hacker_trades.py:347) sleeps
+# WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE silently -- no announce line, and the last stamped
+# line before it belongs to the CONCURRENT main orchestrator (9/9/26: "Phase 6 done" ->
+# 2.89s -> the hacker's fill-check), so both gap tests above miss it. The window's reliable
+# signature is the line AFTER the gap: it always ends in the batched fill-check SELECT.
+# Bounded by the sleep duration so a genuine stall longer than the window still flags.
+WAVE_WORK_S = 3.0   # mirrors spdr_rock_order_functions.py:15 WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE
+WAVE_WORK_NEXT_PAT = re.compile(r"batched_fill_check_and_cancel: one SELECT")
+
+MAX_CLEAN_LINES = 1500
+
+# ---------------------------------------------------------------- backtest sources
+
+# shape:
+#   wide_stats   -- create_backtests output: sheet "All" has one row per trading day and
+#                   pnl_<short> columns; sheet "Stats" maps short name -> Full Name.
+#                   Covers the full calendar, so a stale max trade_date is meaningful.
+#   long_all     -- sheet "All" is one row per FIRE day with a `strategy` column. Only
+#                   fire days are present, so max trade_date proves nothing; trust mtime.
+#   daily_total  -- sheet "Daily" is a single blended PnL series (the extras ladder).
+BACKTEST_SOURCES = [
+    {
+        "key": "eod",
+        "label": "340/350 main backtest",
+        "glob": "EOD_OPTION_ALGOS_*.xlsx",
+        "exclude": ["INCLUDE_FEDS"],
+        "shape": "wide_stats",
+        "full_calendar": True,
+        "generator": "run_backtests_eod.py",
+        "manual_cmd": "python D:/agent_projects/eod_option_algos/create_backtests.py",
+    },
+    {
+        "key": "equity",
+        "label": "EOD equity stock backtest",
+        "glob": "EOD_EQUITY_ALGOS_*.xlsx",
+        "exclude": [],
+        "shape": "wide_stats",
+        "full_calendar": True,
+        # The workbook carries TEST_* research configs alongside the prod ones; without
+        # this filter every TEST_ fire day becomes a phantom "backtest traded, prod did
+        # not" Cat 1 row.
+        "skip_strategy_prefixes": ["TEST_"],
+        "generator": "run_backtests_equity.py",
+        "manual_cmd": "python D:/agent_projects/eod_equity_algos/create_backtests.py",
+    },
+    {
+        "key": "355",
+        "label": "355 main backtest",
+        "glob": "EOD_355_OPTION_ALGOS_*.xlsx",
+        "exclude": ["INCLUDE_FEDS"],
+        "shape": "wide_stats",
+        "full_calendar": True,
+        "generator": "run_backtests_355.py",
+        "manual_cmd": "python D:/agent_projects/eod_355_option_algos/create_backtests.py",
+    },
+    {
+        "key": "bumped",
+        "label": "350 BUMPED layer backtest",
+        "glob": "bumped_spread_backtest_*.xlsx",
+        "exclude": [],
+        "shape": "long_all",
+        "pnl_col": "total_pnl",
+        "name_suffix": "BUMPED",
+        "strip_token": " BUMP",
+        "full_calendar": False,
+        "generator": "run_backtests_extra_layers.py",
+        "manual_cmd": "python D:/agent_projects/eod_option_algos/bumped_spread_backtest.py",
+    },
+    {
+        "key": "closer",
+        "label": "350 CLOSER layer backtest",
+        "glob": "closer_strike_backtest_*.xlsx",
+        "exclude": [],
+        "shape": "long_all",
+        "pnl_col": "pnl",
+        "name_suffix": "CLOSER",
+        "strip_token": " CLOSER",
+        "full_calendar": False,
+        "generator": "run_backtests_extra_layers.py",
+        "manual_cmd": "python D:/agent_projects/eod_option_algos/closer_strike_backtest.py",
+    },
+    {
+        "key": "extras",
+        "label": "350 EXTRAS ladder backtest",
+        "glob": "limit_spread_*_strategies_*.xlsx",
+        "exclude": [],
+        "shape": "daily_total",
+        "prod_name": "ALGO_42 350PM SPREAD SALES SPX EXTRAS",
+        "full_calendar": False,
+        "generator": "run_backtests_extra_layers.py",
+        "manual_cmd": "python D:/agent_projects/eod_option_algos/limit_spread_backtest.py",
+    },
+    {
+        # 355PM hacker model, pinned to prod policy by run_backtest_hacker.py (cap read from
+        # hacker_trades.py, --all-parents, --last-days 5). Carries NO PnL into the
+        # reconciliation table: prod's PNL LOG already blends hack PnL into the parent
+        # strategy row, so pnl_with_hacking would double count. Its rows feed only the
+        # per-script hacker line in the 355pm_script / 355pm_script_v8 blocks.
+        "key": "hacker",
+        "label": "355 HACKER backtest (last 5d)",
+        "glob": "hacking_355_backtest_cap*_last5_*.xlsx",
+        "exclude": ["slip", "fullsize", "uncapped"],
+        "shape": "hacker_detail",
+        "full_calendar": False,
+        "generator": "run_backtest_hacker.py",
+        "manual_cmd": "python D:/agent_projects/scheduled_tasks/run_backtest_hacker.py",
+    },
+]
+
+# Prod hacker rows in algo_trade_log carry this prefix; they are reconciled in the per-script
+# hacker line, not in FILL VERDICTS or the v8 size-ratio check (which would double-flag them).
+HACK_PREFIX = "HACK_"
+# Backtest gates at |imbal_355| > 1B on T+1 data, prod at 950M on the live feed. Inside this
+# band a trigger difference is by design, not a discrepancy.
+HACK_IMBAL_BUFFER = (0.9e9, 1.1e9)
+
+# Prod PnL-log strategy names are the config name with underscores swapped for spaces,
+# except for these suffix rewrites.
+PROD_NAME_ALIASES = {" SML": " SMALL"}
+
+# Full-name exceptions: strategies whose PnL-log name is NOT the space-separated form.
+# IMBAL_AND_TICK kept its underscores when Zach created it (naming nomenclature error,
+# confirmed by him 8/25/26) -- without this exception the reconciliation verdict splits it
+# into a phantom Cat 1 pair (backtest-only space name + prod-only underscore name).
+PROD_NAME_EXACT = {
+    "ALGO_42_350PM_SPREAD_IMBAL_AND_TICK": "ALGO_42_350PM_SPREAD_IMBAL_AND_TICK",
+}
+
+OUT = []
+# Sections are emitted in reading order, but regen and input-load problems are discovered
+# BEFORE the report header exists. Those write to a redirected sink and get replayed inside
+# the INPUT FRESHNESS section where they belong.
+_SINK = OUT
+
+
+def emit(line=""):
+    _SINK.append(str(line))
+
+
+def redirect(buf):
+    """Send emit() to buf until restore() is called."""
+    global _SINK
+    _SINK = buf
+
+
+def restore():
+    global _SINK
+    _SINK = OUT
+
+
+def hdr(title):
+    emit()
+    emit("=" * 78)
+    emit(title)
+    emit("=" * 78)
+
+
+def sub(title):
+    emit()
+    emit("-- " + title)
+
+
+# ---------------------------------------------------------------- date helpers
+
+def is_trading_day(d):
+    """True if d is an NYSE trading day (holiday-aware, via calendar_utils)."""
+    window = calendar_utils._trading_range(d - dt.timedelta(days=10), d)
+    return d in window
+
+
+def prior_trading_day(d):
+    """Most recent trading day strictly before d."""
+    window = calendar_utils._trading_range(d - dt.timedelta(days=15), d)
+    before = [x for x in window if x < d]
+    if not before:
+        raise RuntimeError(f"no trading day found before {d}")
+    return before[-1]
+
+
+def trailing_trading_days(end, n):
+    """The n trading days ending at (and including) end."""
+    window = calendar_utils._trading_range(end - dt.timedelta(days=3 * n + 15), end)
+    window = [x for x in window if x <= end]
+    return window[-n:]
+
+
+# ---------------------------------------------------------------- log parsing
+
+TS_PAT = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s+(AM|PM)\s+--\s*(.*)$")
+QUERY_PAT = re.compile(r"run_query \[(\w+)\].*?tag=(\S+).*?TOTAL=\s*([\d.]+)ms")
+CONN_PAT = re.compile(r"conn=\s*([\d.]+)ms")
+QUOTES_PAT = re.compile(r"\[quotes (W\d) ([A-Za-z0-9_]+)\]\s*(.*)$")
+LEG_PAT = re.compile(
+    r"(\d+(?:\.\d+)?)([CP])\s+sprc=(-?[\d.]+)\s+nbbo=(-?[\d.]+)/(-?[\d.]+)")
+CLAMP_PAT = re.compile(r"Limit price (-?[\d.]+) below min_price (-?[\d.]+), clamping")
+RETRY_PAT = re.compile(r"(\w+)\((.*?)\):\s*(?:no data on|got value(?: from \S+)? on) attempt (\d+)/(\d+)")
+TRADED_PAT = re.compile(r"~+\s*([A-Za-z0-9_]+)\s+(.*?)\s+ALGO TRADED\s*~+")
+EDGE_PAT = re.compile(
+    r"ET1 = ([\d.]+)\s+ME1 = ([\d.]+)\s+ET2 = ([\d.]+)\s+ME2 = ([\d.]+)\s+"
+    r"\(price=([\d.]+), size=(\d+)\)")
+ERROR_PAT = re.compile(
+    r"Traceback \(most recent call last\)|^\s*ERROR|ERROR in|FATAL|"
+    r"Exception|CRITICAL|failed|FAILED|could not|Could not|refus", re.I)
+# Lines that say "failed" as normal narration, not a problem.
+ERROR_IGNORE_PAT = re.compile(
+    r"no target CLOSER fills|no hackers today|failed=0|0 failed", re.I)
+
+SQL_PAT = re.compile(r"(REPLACE INTO|INSERT INTO)\s+\w+\.\w+.*?\);", re.S)
+
+# The SPX / uPrc the script actually traded off. 355 prints it on a timestamped refresh line;
+# 350 only prints it in the recap, so its snap timestamp comes from the refresh line instead.
+SPX_REFRESH_PAT = re.compile(r"Finished refreshing\.\s*SPX:\s*([\d,]+\.?\d*)")
+SPX_RECAP_PAT = re.compile(r"^SPX:\s*([\d,]+\.?\d*)\.")
+SNAP_350_PAT = re.compile(r"Finished refreshing SPXW data at 350PM")
+
+# --- Raw trade-gate inputs, for the MARKET STATE section (correction #16) -----------------
+# A prod log's "*Don't trade X* because <veto>" line proves only that the veto matched FIRST
+# (helpers.py:1250 returns on the first hit), NOT that a trade trigger would otherwise have
+# fired. These patterns pull the raw values behind the TRADE side so near-ness can be
+# measured instead of assumed.
+MKT_MOVE_PAT = re.compile(
+    r"Market:\s*(UP|DOWN|FLAT)\s+since current SPY move is\s*(-?\d+(?:\.\d+)?)\s+"
+    r"and 90 day std dev is\s*(\d+(?:\.\d+)?)")
+MKT_355_PAT = re.compile(r"Market type at 3:55:\s*(UP|DOWN|FLAT)")
+MKT_350_IN_355_PAT = re.compile(r"Market type 350PM:\s*(-?\d+)")
+SPY_355_PAT = re.compile(r"SPY at 3:55:\s*(\d+(?:\.\d+)?)")
+SPY_BPS_PAT = re.compile(
+    r"SPY chg 3:40-3:50:\s*(-?\d+(?:\.\d+)?)\s*bps,\s*3:50-3:55:\s*(-?\d+(?:\.\d+)?)\s*bps")
+QQQ_RATIO_PAT = re.compile(r"get_market_measurements_qqq\(\):\s*ratio=(-?\d+(?:\.\d+)?)")
+ATM_VOL_PAT = re.compile(r"ATM vol:\s*(\d+(?:\.\d+)?)")
+TODAY_VOL_PAT = re.compile(r"Today's Vol:\s*(\d+(?:\.\d+)?)")
+VIX_STATE_PAT = re.compile(r"VIX:\s*(\d+(?:\.\d+)?)")
+REALIZED_PAT = re.compile(r"factor_realized_change\s*=\s*(-?\d+)")
+IMBAL_350_PAT = re.compile(r"Finished get_350_imbal\(\):\s*(-?\d+(?:\.\d+)?)")
+# The 350 script prints its own imbal only in the recap, comma-formatted.
+IMBAL_RECAP_PAT = re.compile(r"^SPX:.*?Imbal:\s*(-?[\d,]+)", re.M)
+
+# v8's own pre-ratio size, printed under "Applying V8_SIZE_RATIO = x" as
+# "ALGO_42_...: 23 --> 4". The ratio applies to v8's OWN size, which is not always v7's
+# traded size (loss-cap pro-rata and CLOSER resize hit the two books differently), so
+# comparing v8 against v7 produces false mismatches -- correction #19.
+V8_RESIZE_PAT = re.compile(r"^(ALGO_[A-Z0-9_]+):\s*(\d+)\s*-+>\s*(\d+)\s*$", re.M)
+IMBAL_355_PAT = re.compile(r"SPX 355PM imbal:\s*(-?\d+(?:\.\d+)?)B")
+
+# market_ratio boundary. Prod compares today_move = ret/(std*0.5) against +-1
+# (helpers.py:866-872), which is algebraically ret/std vs +-0.5 -- the same bar the CLAUDE.md
+# convention states. FLAT is |ratio| < 0.5.
+MKT_RATIO_BOUND = 0.5
+# Bars for reporting a gate as near. Set by Zach 2026-08-26 (correction #17) and deliberately
+# TIGHT: anything wider is a general recap he has to read for nothing. A gate outside these
+# bars is not mentioned in the digest at all, so it cannot leak into the review.
+NEAR_BPS = 5.0               # price/bps gates: strictly under 5 bps from the boundary
+NEAR_VOL = 0.01              # vol gates: under one vol point (0.05 vs 0.06)
+NEAR_IMBAL = 100e6           # imbal gates: under $100M from the threshold
+
+# today_vol bins (helpers.py:1075-1086) and realized_change bins (helpers.py:997+). Mirrored
+# here, NOT imported: helpers.py pulls spdr_rock_functions at import and needs the SR VPN, so
+# importing it would make the review pack fail on exactly the days the VPN is down. If prod's
+# cutoffs move, update these and say so in the digest.
+TODAY_VOL_EDGES = [0.09737, 0.1237328, 0.1579, 0.21151]
+REALIZED_EDGES = [-0.00272, -0.00123, -0.00055, -0.00016, -0.00001,
+                  0.00011, 0.00043, 0.00108, 0.00248]
+# Extra vol gate that is a plain threshold, not a bin: the BUMPED layer.
+BUMPED_VOL_MAX = 0.14
+
+# Imbalance thresholds actually referenced by trade triggers in configs/ (inventoried
+# 2026-08-26). Used only to report distance-to-threshold, never to decide a trade.
+IMBAL_THRESHOLDS_350 = [0.2e9, 0.4e9, 0.5e9, 1.0e9, 1.5e9, 2.0e9, 2.5e9]
+IMBAL_THRESHOLDS_355 = [0.0, 0.5e9, 1.0e9, 1.5e9]
+IMBAL_DELTA_THRESHOLD = 2.5e9   # factor_355_minus_350_imbal_gt/lt_2p5b
+
+# Where the canonical market-metric CSVs live (same files the backtests read).
+DAILY_MOVES_355 = "D:/agent_projects/eod_355_option_algos/data/spy_daily_moves_55_00.csv"
+DAILY_MOVES_350 = "D:/agent_projects/eod_355_option_algos/data/spy_daily_moves_50_01.csv"
+
+# v7-vs-v8 SPX comparison runs until this date, then retire it (Zach, 2026-08-21: the books
+# run overlapped through 9/1/26).
+V8_PARALLEL_RUN_ENDS = dt.date(2026, 9, 1)
+SPX_DIFF_WARN_PTS = 1.00   # a $5 strike grid means ~1pt can flip a knife-edge selection
+
+# IMBAL_GROWS CLOSER/BUMPED adverse levered-rebal veto (live 9/9/26; prod 4.5B, backtest
+# 5.0B). CSV is written by btic_and_imbal_script at ~15:49:03; see REVIEW_GUIDE WATCH ITEM 4.
+REBAL_VETO_LIVE_DATE = dt.date(2026, 9, 9)
+REBAL_CSV = "D:/PycharmProjects/scratch/algos/levered_rebal_355_daily.csv"
+REBAL_PARQUET_GLOB = "D:/vbam-data-oracle/outputs/levered_rebal_by_stock_*.parquet"
+REBAL_VETO_PROD_B = 4.5        # prod veto threshold, $B adverse to the sold side
+REBAL_RERUN_RECO_B = 3.0       # |rebal| above this + adverse -> recommend parquet refresh
+REBAL_CONSTITUENCY_MAX_AGE = 30  # trading days; above this, recommend constituency refresh
+
+# Order-attempt / fill / skip idioms. Every script family prints these differently, so the
+# review gets one uniform "did it try, did it fill" view for the stock, btic, 4pm and
+# extras paths too -- none of which write to algo_trade_log.
+ORDER_ACTIVITY_PATS = [
+    re.compile(r"send_complex_two_waves called for strategy (.+?) with"),
+    re.compile(r"Resending order for \d+ remaining \(filled \d+/\d+\)"),
+    re.compile(r"Fully filled \(\d+/\d+\)"),
+    re.compile(r"contracts filled across \d+ grouping_codes"),
+    re.compile(r"opening (?:Buy|Sell) [\d,]+ \w+ in \S+"),
+    re.compile(r"fill probe \d+ for .*?: [\d,]+ of [\d,]+"),
+    re.compile(r"Would skip - .*"),
+    re.compile(r"Trigger condition met"),
+    re.compile(r"Extra spread: .*"),
+    re.compile(r"No trades fired today"),
+    re.compile(r"size_to_send: \d+"),
+    re.compile(r"exiting|No 0DTE"),
+]
+
+
+def parse_ts(hh, mm, ss, ms, ampm):
+    hh = int(hh)
+    if ampm == "PM" and hh != 12:
+        hh += 12
+    if ampm == "AM" and hh == 12:
+        hh = 0
+    return dt.time(hh, int(mm), int(ss), int(ms) * 1000)
+
+
+def secs(t):
+    return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+
+
+def _shape(msg):
+    """A log line with every number removed -- two lines of the same shape are the same
+    statement from a loop, not two different events."""
+    return re.sub(r"[\d.,+\-]", "", msg)[:30]
+
+
+def _sod(h, m, s, us=0):
+    """Seconds-of-day, fractional."""
+    return h * 3600 + m * 60 + s + us / 1e6
+
+
+FALLBACK_MARKS = {_sod(*t) for t in FALLBACK_SCHEDULED_TIMES}
+
+# dt.time(8 if IS_TEST else LAST_HOUR, 50, 5, 200000)   <- spin-wait / wait_until target
+# _v8_gate(8 if IS_TEST else LAST_HOUR, 50, 5, 200000)  <- same, plus V8_GATE_DELAY_S
+_SPIN_PAT = re.compile(
+    r"while\s+getNowEst\(\)\.time\(\)\s*<=\s*(dt\.time|_v8_gate)\(([^()]*)\)")
+_WAIT_LITERAL_PAT = re.compile(r"wait_until\(\s*dt\.time\(([^()]*)\)")
+_WAIT_NAMED_PAT = re.compile(r"wait_until\(\s*([A-Z_][A-Z0-9_]*)\s*[,)]")
+_NAMED_TIME_PAT = re.compile(r"^([A-Z_][A-Z0-9_]*)\s*=\s*dt\.time\(([^()]*)\)", re.M)
+_LAST_HOUR_BUMP_PAT = re.compile(r"^LAST_HOUR\s*=\s*LAST_HOUR\s*\+\s*1", re.M)
+_V8_DELAY_PAT = re.compile(r"^V8_GATE_DELAY_S\s*=\s*([\d.]+)", re.M)
+
+_MARK_CACHE = {}
+
+
+def _parse_time_args(argstr, base_hour):
+    """dt.time argument list -> seconds-of-day, or None if it cannot be resolved.
+
+    The hour is an expression, not a literal: "8 if IS_TEST else LAST_HOUR" in the EOD
+    scripts, "LAST_HOUR - 1" in 4pm_script_v3. Take the prod branch (after "else"),
+    substitute this file's LAST_HOUR, and evaluate only if what remains is arithmetic on
+    digits -- never eval arbitrary text out of a source file.
+    """
+    parts = [p.strip() for p in argstr.split(",") if p.strip()]
+    if not parts:
+        return None
+    hour_expr = parts[0].split("else")[-1].strip().replace("LAST_HOUR", str(base_hour))
+    if not re.fullmatch(r"[\d\s+\-*]+", hour_expr):
+        return None
+    try:
+        hour = int(eval(hour_expr, {"__builtins__": {}}, {}))  # digits/operators only
+    except Exception:
+        return None
+    nums = []
+    for p in parts[1:]:
+        p = p.split("=")[-1].strip()   # handles microsecond=100000
+        if re.fullmatch(r"\d+", p):
+            nums.append(int(p))
+    minute = nums[0] if len(nums) > 0 else 0
+    second = nums[1] if len(nums) > 1 else 0
+    micro = nums[2] if len(nums) > 2 else 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return None
+    return _sod(hour, minute, second, micro)
+
+
+def wait_marks_for_script(stem):
+    """Wait targets parsed out of the prod script that produced this log.
+
+    Reading them from the source is the point: if a fire time changes in the prod script,
+    the review picks the new time up on the next run instead of reporting the designed wait
+    as unexplained slowness. Falls back to FALLBACK_MARKS when the script cannot be found.
+    """
+    if stem in _MARK_CACHE:
+        return _MARK_CACHE[stem]
+    path = None
+    for cand in os.listdir(ALGOS_DIR):
+        if cand.lower() == f"{stem.lower()}.py":
+            path = os.path.join(ALGOS_DIR, cand)
+            break
+    if path is None:
+        _MARK_CACHE[stem] = (set(FALLBACK_MARKS), None)
+        return _MARK_CACHE[stem]
+
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    base_hour = 16 if _LAST_HOUR_BUMP_PAT.search(text) else 15
+    v8_delay = float(_V8_DELAY_PAT.search(text).group(1)) if _V8_DELAY_PAT.search(text) else 0.0
+
+    named = {}
+    for name, args in _NAMED_TIME_PAT.findall(text):
+        mark = _parse_time_args(args, base_hour)
+        if mark is not None:
+            named[name] = mark
+
+    marks = set()
+    for fn, args in _SPIN_PAT.findall(text):
+        mark = _parse_time_args(args, base_hour)
+        if mark is None:
+            continue
+        marks.add(mark)
+        if fn == "_v8_gate" and v8_delay:
+            marks.add(mark + v8_delay)
+    for args in _WAIT_LITERAL_PAT.findall(text):
+        mark = _parse_time_args(args, base_hour)
+        if mark is not None:
+            marks.add(mark)
+    for name in _WAIT_NAMED_PAT.findall(text):
+        if name in named:
+            marks.add(named[name])
+
+    # Union with the fallback so a script whose waits are expressed some other way (a
+    # helper, a constant imported from another module) does not regress to noise.
+    _MARK_CACHE[stem] = (marks | FALLBACK_MARKS, os.path.basename(path))
+    return _MARK_CACHE[stem]
+
+
+def crosses_scheduled_time(t0, t1, marks):
+    return any(secs(t0) < mark <= secs(t1) for mark in marks)
+
+
+def clean_log_text(raw):
+    """Strip the SQL blobs and per-query timing lines that make prod logs unreadable.
+
+    A REPLACE INTO statement sometimes has the next timestamped line concatenated onto
+    its tail (no newline), so the SQL is cut out of the line rather than the line being
+    dropped -- otherwise real log content disappears.
+    """
+    text = SQL_PAT.sub("[sql]", raw)
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped == "[sql]":
+            continue
+        if "run_query [" in line:
+            continue
+        if stripped.startswith("REPLACE INTO") or stripped.startswith("INSERT INTO"):
+            continue
+        out.append(line.rstrip())
+    if len(out) > MAX_CLEAN_LINES:
+        keep_head = 400
+        keep_tail = MAX_CLEAN_LINES - keep_head
+        elided = len(out) - MAX_CLEAN_LINES
+        out = (out[:keep_head]
+               + [f"", f"... [{elided} lines elided by build_review_pack] ...", ""]
+               + out[-keep_tail:])
+    return "\r\n".join(out) + "\r\n"
+
+
+def parse_log(path, stem):
+    """Extract every reviewable fact from one prod script log."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        raw = f.read()
+    marks, source_script = wait_marks_for_script(stem)
+
+    f_out = {
+        "path": path,
+        "bytes": len(raw),
+        "raw": raw,
+        "first_ts": None, "last_ts": None,
+        "gaps": [], "queries": [], "slow_queries": [], "fresh_conns": [],
+        "quotes": [], "sprc_outside_nbbo": [],
+        "clamps": [], "clamp_floors": set(), "retries": [], "traded": [],
+        "losscap": [], "underfill": [], "premium_addon": [],
+        "errors": [], "notable": [], "orders": [], "last_line": "",
+        "wait_marks": marks, "wait_source": source_script,
+        "spx": None, "spx_ts": None,
+        "state": {},
+    }
+
+    lines = raw.splitlines()
+    f_out["last_line"] = next((l.strip()[:160] for l in reversed(lines) if l.strip()), "")
+
+    stamped = []   # (idx, time, message)
+    for i, line in enumerate(lines):
+        m = TS_PAT.match(line.strip())
+        if m:
+            stamped.append((i, parse_ts(*m.groups()[:5]), m.group(6)))
+
+    if stamped:
+        f_out["first_ts"] = stamped[0][1]
+        f_out["last_ts"] = stamped[-1][1]
+
+    # SPX the script traded off, plus the moment it snapped it.
+    for _, t, msg in stamped:
+        m = SPX_REFRESH_PAT.search(msg)
+        if m:
+            f_out["spx"] = float(m.group(1).replace(",", ""))
+            f_out["spx_ts"] = t
+        elif SNAP_350_PAT.search(msg) and f_out["spx_ts"] is None:
+            f_out["spx_ts"] = t   # 350 prints the value only in the recap, below
+    if f_out["spx"] is None:
+        for line in lines:
+            m = SPX_RECAP_PAT.match(line.strip())
+            if m:
+                f_out["spx"] = float(m.group(1).replace(",", ""))
+                break
+
+    # Raw trade-gate inputs. Scanned over the whole file (some print inside the recap block,
+    # which carries no timestamp). First match wins for values printed once per run.
+    st = f_out["state"]
+    for pat, key, cast in [
+        (MKT_355_PAT, "mkt_355", str), (MKT_350_IN_355_PAT, "mkt_350_bin", int),
+        (SPY_355_PAT, "spy_355", float), (QQQ_RATIO_PAT, "qqq_ratio", float),
+        (ATM_VOL_PAT, "atm_vol", float), (TODAY_VOL_PAT, "today_vol", float),
+        (VIX_STATE_PAT, "vix", float), (REALIZED_PAT, "realized_bin", int),
+        (IMBAL_350_PAT, "imbal_350", float),
+    ]:
+        m = pat.search(raw)
+        if m:
+            st[key] = cast(m.group(1))
+    m = IMBAL_355_PAT.search(raw)
+    if m:
+        st["imbal_355"] = float(m.group(1)) * 1e9
+    if "imbal_350" not in st:
+        m = IMBAL_RECAP_PAT.search(raw)
+        if m:
+            st["imbal_350"] = float(m.group(1).replace(",", ""))
+
+    # v8's pre-ratio size per algo, so the size-ratio check compares v8 against its own
+    # intended size rather than against v7's (correction #19).
+    f_out["v8_resize"] = {m.group(1): (int(m.group(2)), int(m.group(3)))
+                          for m in V8_RESIZE_PAT.finditer(raw)}
+    m = MKT_MOVE_PAT.search(raw)
+    if m:
+        st["mkt_type_log"], st["spy_move"], st["spy_std"] = (
+            m.group(1), float(m.group(2)), float(m.group(3)))
+    m = SPY_BPS_PAT.search(raw)
+    if m:
+        st["bps_1540_1550"], st["bps_1550_1555"] = float(m.group(1)), float(m.group(2))
+
+    sleep_windows = []   # (start_s, end_s) per announced sleep, see SLEEP_DUR_PAT
+    for _, t, msg in stamped:
+        ms = SLEEP_DUR_PAT.search(msg)
+        if ms:
+            dur = float(ms.group(1) or ms.group(2))
+            sleep_windows.append((secs(t), secs(t) + dur + SLEEP_SLACK_S))
+
+    for (i0, t0, msg0), (i1, t1, msg1) in zip(stamped, stamped[1:]):
+        gap = secs(t1) - secs(t0)
+        if gap < GAP_WARN_S:
+            continue
+        # Two consecutive lines of the same shape are a polling loop's own cadence
+        # (btic polls every ~4s, concurrent orders each print the same completion line).
+        # Compare with digits stripped so "poll BTIC=20.15" and "poll BTIC=20.10" match.
+        same_shape = _shape(msg0) == _shape(msg1)
+        in_sleep = any(lo <= secs(t0) and secs(t1) <= hi for lo, hi in sleep_windows)
+        wave_work = (gap <= WAVE_WORK_S + SLEEP_SLACK_S
+                     and bool(WAVE_WORK_NEXT_PAT.search(msg1)))
+        scheduled = (bool(WAIT_LINE_PAT.search(msg0))
+                     or crosses_scheduled_time(t0, t1, marks)
+                     or same_shape
+                     or in_sleep
+                     or wave_work)
+        f_out["gaps"].append({
+            "gap_s": round(gap, 2),
+            "after": t0.strftime("%H:%M:%S.%f")[:-3],
+            "before": t1.strftime("%H:%M:%S.%f")[:-3],
+            "prev_line": msg0[:110],
+            "next_line": msg1[:110],
+            "likely_scheduled": scheduled,
+        })
+
+    for line in lines:
+        mq = QUERY_PAT.search(line)
+        if mq:
+            db, tag, total = mq.group(1), mq.group(2), float(mq.group(3))
+            f_out["queries"].append(total)
+            if total > QUERY_WARN_MS:
+                f_out["slow_queries"].append(f"{db} tag={tag} TOTAL={total:.1f}ms")
+            mc = CONN_PAT.search(line)
+            if mc and float(mc.group(1)) > CONN_WARN_MS:
+                f_out["fresh_conns"].append(
+                    f"{db} tag={tag} conn={float(mc.group(1)):.1f}ms")
+
+        mquo = QUOTES_PAT.search(line)
+        if mquo:
+            wave, algo, rest = mquo.group(1), mquo.group(2), mquo.group(3)
+            legs = []
+            for lm in LEG_PAT.finditer(rest):
+                strike, cp, sprc, bid, ask = lm.groups()
+                sprc, bid, ask = float(sprc), float(bid), float(ask)
+                outside = 0.0
+                if sprc > ask:
+                    outside = round(sprc - ask, 4)
+                elif sprc < bid:
+                    outside = round(sprc - bid, 4)
+                legs.append({"strike": float(strike), "cp": cp, "sprc": sprc,
+                             "bid": bid, "ask": ask, "outside": outside})
+            if legs:
+                rec = {"wave": wave, "algo": algo, "legs": legs}
+                if len(legs) >= 2:
+                    rec["net_sprc"] = round(legs[0]["sprc"] - legs[1]["sprc"], 3)
+                    rec["net_cross"] = round(legs[0]["bid"] - legs[1]["ask"], 3)
+                    rec["net_mid"] = round(
+                        (legs[0]["bid"] + legs[0]["ask"]) / 2
+                        - (legs[1]["bid"] + legs[1]["ask"]) / 2, 3)
+                    rec["sprc_minus_cross"] = round(rec["net_sprc"] - rec["net_cross"], 3)
+                f_out["quotes"].append(rec)
+                for leg in legs:
+                    if leg["outside"]:
+                        f_out["sprc_outside_nbbo"].append({
+                            "wave": wave, "algo": algo,
+                            "leg": f"{leg['strike']:.0f}{leg['cp']}",
+                            "sprc": leg["sprc"], "nbbo": f"{leg['bid']}/{leg['ask']}",
+                            "outside_by": leg["outside"],
+                            "side": "above ask" if leg["outside"] > 0 else "below bid",
+                            "is_short_leg": leg is legs[0],
+                        })
+
+        mcl = CLAMP_PAT.search(line)
+        if mcl:
+            f_out["clamps"].append(
+                f"limit {mcl.group(1)} -> min_price {mcl.group(2)}")
+            f_out["clamp_floors"].add(round(float(mcl.group(2)), 4))
+
+        mr = RETRY_PAT.search(line)
+        if mr:
+            f_out["retries"].append({
+                "fn": f"{mr.group(1)}({mr.group(2)})",
+                "attempt": int(mr.group(3)), "of": int(mr.group(4)),
+                "got": "got value" in line,
+            })
+
+        mt = TRADED_PAT.search(line)
+        if mt:
+            f_out["traded"].append({"algo": mt.group(1), "structure": mt.group(2),
+                                    "edges": None})
+        me = EDGE_PAT.search(line)
+        if me and f_out["traded"]:
+            f_out["traded"][-1]["edges"] = {
+                "et1": float(me.group(1)), "me1": float(me.group(2)),
+                "et2": float(me.group(3)), "me2": float(me.group(4)),
+                "price": float(me.group(5)), "size": int(me.group(6)),
+            }
+
+        if "[LossCap]" in line:
+            f_out["losscap"].append(line.split("-- ", 1)[-1].strip()[:200])
+        if "WAVE1 UNDERFILL" in line or "WAVE1_UNDERFILL" in line:
+            f_out["underfill"].append(line.split("-- ", 1)[-1].strip()[:200])
+        if "PREMIUM ADD-ON" in line:
+            f_out["premium_addon"].append(line.split("-- ", 1)[-1].strip()[:200])
+        if "MOC" in line or "month end" in line.lower() or "MONTH END" in line:
+            f_out["notable"].append(line.strip()[:200])
+
+        for pat in ORDER_ACTIVITY_PATS:
+            if pat.search(line):
+                f_out["orders"].append(line.split("-- ", 1)[-1].strip()[:180])
+                break
+
+        if ERROR_PAT.search(line) and not ERROR_IGNORE_PAT.search(line):
+            if not line.strip().startswith(("REPLACE INTO", "INSERT INTO")):
+                f_out["errors"].append(line.strip()[:220])
+
+    # De-dupe while preserving order.
+    for key in ("clamps", "losscap", "underfill", "premium_addon", "errors",
+                "slow_queries", "fresh_conns", "notable", "orders"):
+        seen, keep = set(), []
+        for item in f_out[key]:
+            if item not in seen:
+                seen.add(item)
+                keep.append(item)
+        f_out[key] = keep
+    return f_out
+
+
+# ---------------------------------------------------------------- data loads
+
+def short_algo(name):
+    """Trim the fixed ALGO_42_<time>PM_SPREAD_SALES_SPX_ prefix for readable tables."""
+    return (str(name)
+            .replace("ALGO_42_340PM_SPREAD_SALES_SPX_", "340.")
+            .replace("ALGO_42_350PM_SPREAD_SALES_SPX_", "350.")
+            .replace("ALGO_42_355PM_SPREAD_SALES_SPX_", "355.")
+            .replace("ALGO_42_350PM_OUTRIGHT_SALES_SPX_", "350o.")
+            .replace("ALGO_42_", ""))
+
+
+def load_algo_trade_log(review_date):
+    """Per-algo prod fill detail from optionsResearch.algo_trade_log (VBAM, no VPN)."""
+    import vbam_helpers
+    from sqlalchemy import create_engine
+    eng = create_engine(vbam_helpers.connection_string)
+    sql = ("SELECT * FROM optionsResearch.algo_trade_log "
+           f"WHERE trade_date = '{review_date.isoformat()}'")
+    df = pd.read_sql(sql, eng)
+    return df
+
+
+def load_prod_pnl():
+    df = pd.read_excel(PNL_LOG, sheet_name="by_strategy")
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    return df
+
+
+def prod_name_for(config_name):
+    """Config name (underscores) -> PNL LOG NEW strategy name (spaces)."""
+    if config_name in PROD_NAME_EXACT:
+        return PROD_NAME_EXACT[config_name]
+    name = config_name.replace("_", " ")
+    name = name.replace("ALGO 42", "ALGO_42", 1)
+    # Equity configs keep the underscore between EQUITY and ALGO in the PnL log
+    # ("EQUITY_ALGO_42 350PM FIRST TICK"), so restore it after the swap above.
+    name = name.replace("EQUITY ALGO_42", "EQUITY_ALGO_42", 1)
+    for src, dst in PROD_NAME_ALIASES.items():
+        if name.endswith(src):
+            name = name[: -len(src)] + dst
+    return name
+
+
+def _f(v):
+    """float or None."""
+    try:
+        return None if pd.isna(v) else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_cp(v):
+    """'C'/'Call' -> 'Call', 'P'/'Put' -> 'Put', anything else -> None."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip().upper()
+    if v.startswith("C"):
+        return "Call"
+    if v.startswith("P"):
+        return "Put"
+    return None
+
+
+def _strikes_from_row(r):
+    """Backtest strikes for one traded row -> {"Put": (sh, lg), "Call": (sh, lg)}.
+
+    Only sides that ACTUALLY TRADED are returned. Two traps in these sheets:
+      - `cp` is a single letter ("C"/"P"), not "Call"/"Put".
+      - sh_strike_2/lg_strike_2 are populated even when the second side did NOT trade, and
+        cp_2 is NaN in that case. Inferring a side for that pair overwrites the real one --
+        on 8/19 IMBAL_GROWS_SML that turned a correct 7715/7730 into 7700/7685 and produced
+        a phantom strike disagreement. So never infer a side for pair 2.
+    """
+    put_size, call_size = _f(r.get("put_size")), _f(r.get("call_size"))
+    out = {}
+    for idx, (cp_col, sh_col, lg_col) in enumerate(
+            (("cp", "sh_strike", "lg_strike"),
+             ("cp_2", "sh_strike_2", "lg_strike_2"))):
+        if sh_col not in r.index:
+            continue
+        sh, lg = _f(r.get(sh_col)), _f(r.get(lg_col))
+        if sh is None or lg is None:
+            continue
+        cp = _norm_cp(r.get(cp_col))
+        if cp is None:
+            if idx > 0:
+                continue   # pair 2 with no cp = that side did not trade
+            # bumped/closer sheets have no cp column; infer only if exactly one side traded.
+            if put_size and not call_size:
+                cp = "Put"
+            elif call_size and not put_size:
+                cp = "Call"
+            else:
+                continue
+        size = put_size if cp == "Put" else call_size
+        if not size:
+            continue   # side named but never traded
+        out[cp] = (sh, lg)
+    return out
+
+
+def _read_sheet_strikes(path, sheet, review_date):
+    try:
+        df = pd.read_excel(path, sheet_name=sheet)
+    except Exception:
+        return {}
+    if "trade_date" not in df.columns:
+        return {}
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    row = df[df["trade_date"] == review_date]
+    return _strikes_from_row(row.iloc[0]) if len(row) else {}
+
+
+def newest_workbook(spec):
+    hits = sorted(glob.glob(os.path.join(DOWNLOADS, spec["glob"])))
+    hits = [h for h in hits
+            if not any(x in os.path.basename(h) for x in spec["exclude"])]
+    if not hits:
+        return None
+    return max(hits, key=os.path.getmtime)
+
+
+def workbook_status(spec, review_date, today):
+    """Freshness + the per-strategy PnL map for one backtest workbook."""
+    path = newest_workbook(spec)
+    st = {"key": spec["key"], "label": spec["label"], "path": path,
+          "mtime": None, "max_date": None, "fresh": False, "pnl": {},
+          "strikes": {}, "note": "", "hacker_rows": []}
+    if path is None:
+        st["note"] = "MISSING -- no workbook matching " + spec["glob"]
+        return st
+
+    st["mtime"] = dt.datetime.fromtimestamp(os.path.getmtime(path))
+    try:
+        if spec["shape"] == "wide_stats":
+            all_df = pd.read_excel(path, sheet_name="All")
+            all_df["trade_date"] = pd.to_datetime(all_df["trade_date"]).dt.date
+            st["max_date"] = max(all_df["trade_date"])
+            stats = pd.read_excel(path, sheet_name="Stats")
+            short_to_full = dict(zip(stats["Strategy"], stats["Full Name"]))
+            skip = tuple(spec.get("skip_strategy_prefixes", ()))
+            if skip:
+                short_to_full = {s: f for s, f in short_to_full.items()
+                                 if not str(s).startswith(skip)}
+            row = all_df[all_df["trade_date"] == review_date]
+            if len(row):
+                r = row.iloc[0]
+                for short, full in short_to_full.items():
+                    col = f"pnl_{short}"
+                    if col in all_df.columns and pd.notna(r[col]):
+                        st["pnl"][full] = float(r[col])
+                # Strikes live on the per-strategy sheets, not the All sheet. Only open the
+                # sheets for strategies that actually have PnL on the review date -- opening
+                # all ~16 costs seconds for nothing.
+                for short, full in short_to_full.items():
+                    if full not in st["pnl"] or st["pnl"][full] == 0:
+                        continue
+                    st["strikes"][full] = _read_sheet_strikes(path, short, review_date)
+        elif spec["shape"] == "long_all":
+            all_df = pd.read_excel(path, sheet_name="All")
+            all_df["trade_date"] = pd.to_datetime(all_df["trade_date"]).dt.date
+            st["max_date"] = max(all_df["trade_date"]) if len(all_df) else None
+            row = all_df[all_df["trade_date"] == review_date]
+            for _, r in row.iterrows():
+                short = str(r["strategy"])
+                if spec["strip_token"] and short.endswith(spec["strip_token"]):
+                    short = short[: -len(spec["strip_token"])]
+                full = (f"ALGO_42_350PM_SPREAD_SALES_SPX_{short.strip()}"
+                        f"_{spec['name_suffix']}")
+                st["pnl"][full] = float(r[spec["pnl_col"]])
+                st["strikes"][full] = _strikes_from_row(r)
+        elif spec["shape"] == "daily_total":
+            daily = pd.read_excel(path, sheet_name="Daily")
+            daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
+            st["max_date"] = max(daily["trade_date"]) if len(daily) else None
+            row = daily[daily["trade_date"] == review_date]
+            if len(row):
+                st["pnl"][spec["prod_name"]] = float(row.iloc[0]["pnl"])
+        elif spec["shape"] == "hacker_detail":
+            # One detail sheet per strategy (sheet name = backtest label, e.g.
+            # "IMBAL_VS_MARKET CLOSER"), one row per modeled leg. Collect the review date's
+            # rows; --last-days 5 means a date with no parent fire has no row at all, so
+            # max_date is informational and freshness is mtime-only (full_calendar False).
+            xl = pd.ExcelFile(path)
+            for sh in xl.sheet_names:
+                if sh == "Summary":
+                    continue
+                d = xl.parse(sh)
+                if "trade_date" not in d.columns or d.empty:
+                    continue
+                d["trade_date"] = pd.to_datetime(d["trade_date"]).dt.date
+                mx = max(d["trade_date"])
+                st["max_date"] = mx if st["max_date"] is None else max(st["max_date"], mx)
+                for _, r in d[d["trade_date"] == review_date].iterrows():
+                    rec = {c: r[c] for c in d.columns}
+                    rec["strategy"] = sh
+                    st["hacker_rows"].append(rec)
+    except Exception as e:
+        st["note"] = f"UNREADABLE -- {type(e).__name__}: {e}"
+        return st
+
+    built_today = st["mtime"].date() == today
+    covers = (not spec["full_calendar"]) or (
+        st["max_date"] is not None and st["max_date"] >= review_date)
+    st["fresh"] = built_today and covers
+    if not built_today:
+        st["note"] = (f"STALE -- written {st['mtime'].date()}, not today "
+                      f"({today}); T+1 backtest generation did not run or failed")
+    elif not covers:
+        st["note"] = (f"STALE -- built today but max trade_date {st['max_date']} "
+                      f"< review date {review_date}; upstream data is behind")
+    return st
+
+
+# ---------------------------------------------------------------- regen self-heal
+
+def read_status(name):
+    path = os.path.join(STATUS_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def probe_connections():
+    sys.path.insert(1, SCHED_DIR)
+    import check_connections
+    out = {}
+    for name in ("bbg", "spiderrock", "thetadata"):
+        try:
+            out[name] = bool(check_connections.PROBES[name]())
+        except Exception as e:
+            out[name] = False
+            emit(f"   probe {name} raised {type(e).__name__}: {e}")
+    return out
+
+
+def already_running(script):
+    """True if a python process is already running `script`.
+
+    The review can fire at 8:25-8:35 while CreateBacktestsExtraLayers (8:16) is still going
+    on a cold file cache. Launching a second copy of the same three backtests would waste
+    ~10 minutes and have two processes writing workbooks at once, so wait for the in-flight
+    run instead.
+    """
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+          "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }")
+    try:
+        p = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return False
+    mine = os.getpid()
+    for line in (p.stdout or "").splitlines():
+        pid, _, cmdline = line.partition("|")
+        if not pid.strip().isdigit() or int(pid) == mine:
+            continue   # never match this process's own command line
+        if script in cmdline:
+            return True
+    return False
+
+
+def wait_for_workbook(spec, today, minutes):
+    """Poll for a workbook written today, up to `minutes`. Returns True if it appeared."""
+    deadline = time.time() + minutes * 60
+    while time.time() < deadline:
+        path = newest_workbook(spec)
+        if path and dt.datetime.fromtimestamp(os.path.getmtime(path)).date() == today:
+            return True
+        time.sleep(20)
+    return False
+
+
+def run_wrapper(script, timeout_s):
+    path = os.path.join(SCHED_DIR, script)
+    emit(f"   running {script} (timeout {timeout_s}s)")
+    try:
+        p = subprocess.run([sys.executable, path], cwd=SCHED_DIR,
+                           capture_output=True, text=True, timeout=timeout_s)
+        tail = "\n".join((p.stdout or "").strip().splitlines()[-12:])
+        emit(f"   exit={p.returncode}")
+        for line in tail.splitlines():
+            emit(f"     | {line[:150]}")
+        if p.returncode != 0 and p.stderr:
+            for line in (p.stderr or "").strip().splitlines()[-8:]:
+                emit(f"     ! {line[:150]}")
+        return p.returncode
+    except subprocess.TimeoutExpired:
+        emit(f"   TIMEOUT after {timeout_s}s")
+        return 124
+
+
+def attempt_regen(stale_specs, today):
+    """Try to rebuild stale/missing backtests; say plainly when it cannot be done.
+
+    A stale workbook nearly always means the T+1 pipeline failed, and the usual cause is a
+    connection this script cannot fix. Two distinct gates:
+
+    1. SpiderRock VPN is required by EVERY generator regardless of upstream status, because
+       create_backtests.py imports scratch/algos/helpers.py, which imports
+       spdr_rock_functions, which calls getVols("EEM") at MODULE IMPORT time. With the VPN
+       down that raises MySQLdb.OperationalError (2002) before any backtest logic runs, and
+       the upstream status file cannot predict it -- observed 2026-08-19, where
+       UpdateDataEOD was green at 07:56 but CreateBacktestsEOD died on this import at 08:12.
+    2. Bloomberg + ThetaData are required only if update_data itself has to be re-run.
+
+    When blocked we do not thrash: name the down connection and the exact commands to run
+    once it is back, so the review can hand Zach an actionable line.
+    """
+    log = []
+    redirect(log)
+    sub("REGEN ATTEMPT")
+    try:
+        result = _regen_body(stale_specs, today)
+    finally:
+        restore()
+    result["log"] = log
+    return result
+
+
+def _regen_body(stale_specs, today):
+    eod_st = read_status("UpdateDataEOD")
+    st355 = read_status("UpdateData355")
+
+    def ok(st):
+        return bool(st and st.get("date") == today.isoformat()
+                    and st.get("all_steps_ran"))
+
+    emit(f"   UpdateDataEOD status : {'ran all steps today' if ok(eod_st) else eod_st}")
+    emit(f"   UpdateData355 status : {'ran all steps today' if ok(st355) else st355}")
+
+    needs_update = not (ok(eod_st) and ok(st355))
+    emit(f"   update_data re-run needed: {'YES' if needs_update else 'no'}")
+    emit("   probing connections (SpiderRock is required by the create_backtests import "
+         "chain even when upstream is green)")
+    probes = probe_connections()
+    for k, v in probes.items():
+        emit(f"     {k}: {'UP' if v else 'DOWN'}")
+
+    required = {"spiderrock"}
+    if needs_update:
+        required |= {"bbg", "thetadata"}
+    blocked = sorted(r for r in required if not probes.get(r, False))
+
+    if blocked:
+        emit(f"   REGEN BLOCKED -- {', '.join(blocked)} down.")
+        if "spiderrock" in blocked:
+            emit("     SpiderRock/VPN down: every backtest generator dies at import "
+                 "(helpers.py -> spdr_rock_functions -> getVols). Nothing can be rebuilt "
+                 "until the corp VPN is back.")
+        if "bbg" in blocked:
+            emit("     Bloomberg down: update_data steps 3a/3b/4 cannot run, so the "
+                 "market-metric CSVs stay stale.")
+        if "thetadata" in blocked:
+            emit("     ThetaData down: update_data step 5a cannot refresh the OPRA cache.")
+        emit("   ACTION FOR ZACH -- fix the connection(s) above, then run:")
+        if needs_update:
+            emit("     python D:/agent_projects/scheduled_tasks/run_update_eod.py")
+            emit("     python D:/agent_projects/scheduled_tasks/run_update_355.py")
+        for spec in stale_specs:
+            emit(f"     {spec['manual_cmd']}")
+        return {"attempted": True, "blocked": blocked, "regen_ok": False}
+
+    if needs_update:
+        run_wrapper("run_update_eod.py", 3000)
+        run_wrapper("run_update_355.py", 3000)
+
+    wrappers = []
+    for spec in stale_specs:
+        if spec["generator"] not in wrappers:
+            wrappers.append(spec["generator"])
+    for w in wrappers:
+        if already_running(w):
+            emit(f"   {w} is ALREADY RUNNING (the scheduled task has not finished) -- "
+                 "waiting for it rather than starting a duplicate")
+            for spec in stale_specs:
+                if spec["generator"] != w:
+                    continue
+                got = wait_for_workbook(spec, today, minutes=12)
+                emit(f"     {spec['label']}: "
+                     f"{'appeared' if got else 'still missing after 12 min'}")
+            continue
+        run_wrapper(w, 1800)
+    return {"attempted": True, "blocked": blocked, "regen_ok": True}
+
+
+# ---------------------------------------------------------------- digest sections
+
+def section_inputs(review_date, today, statuses, regen_info, load_notes):
+    hdr(f"REVIEW PACK -- trade date {review_date} (built {dt.datetime.now():%Y-%m-%d %H:%M})")
+    emit(f"review_date      : {review_date} "
+         f"({'MONTH END' if calendar_utils.is_month_end(review_date) else 'regular'}"
+         f"{', FED DAY' if review_date in calendar_utils.FEDS else ''}"
+         f"{', SERIAL' if review_date in calendar_utils.SERIALS else ''})")
+    emit(f"built_on         : {today}")
+
+    sub("INPUT FRESHNESS")
+    for st in statuses:
+        flag = "OK  " if st["fresh"] else "BAD "
+        emit(f"   {flag} {st['label']:<28} {os.path.basename(st['path'] or '-')}")
+        if st["mtime"] and st["key"] == "hacker":
+            n_att = sum(1 for r in st["hacker_rows"] if bool(r.get("attempted_hacked")))
+            emit(f"        written {st['mtime']:%Y-%m-%d %H:%M}  max trade_date "
+                 f"{st['max_date']}  modeled legs on {review_date}: {len(st['hacker_rows'])}, "
+                 f"attempted hacks: {n_att}")
+        elif st["mtime"]:
+            emit(f"        written {st['mtime']:%Y-%m-%d %H:%M}  max trade_date "
+                 f"{st['max_date']}  strategies with pnl on {review_date}: {len(st['pnl'])}")
+        if st["note"]:
+            emit(f"        {st['note']}")
+    for line in load_notes:
+        emit(line)
+    if regen_info:
+        for line in regen_info.get("log", []):
+            emit(line)
+        if regen_info.get("blocked"):
+            emit(f"   *** REGEN WAS BLOCKED by: {', '.join(regen_info['blocked'])} -- "
+                 "the review must tell Zach which connection to fix; see REGEN ATTEMPT "
+                 "above for the exact commands ***")
+        elif regen_info.get("regen_ok"):
+            emit("   regen ran; freshness above reflects the state AFTER the rebuild")
+    stale = [s for s in statuses if not s["fresh"]]
+    if stale:
+        emit(f"   *** {len(stale)} input(s) stale/missing. A stale workbook means T+1 "
+             "backtest generation failed. The usual cause is the SpiderRock VPN being "
+             "down: create_backtests.py imports scratch/algos/helpers.py, which calls "
+             "getVols at import time, so it dies before running. Check "
+             "scheduled_tasks/logs/<today>_*_run_backtests_*.txt for the traceback. ***")
+
+
+def section_prod_pnl(prod_df, review_date, statuses):
+    hdr("PROD PNL vs BACKTEST PNL")
+    day = prod_df[prod_df["trade_date"] == review_date]
+    if day.empty:
+        emit(f"   PNL LOG NEW.xlsx has NO rows for {review_date}. "
+             "Prod PnL is unavailable -- say so rather than estimating.")
+        return {}
+
+    algo_mask = day["strategy"].str.contains("ALGO_42|EQUITY_ALGO|BTIC", case=False,
+                                            na=False)
+    algo_rows = day[algo_mask].copy()
+    other = day[~algo_mask]
+
+    bt_pnl = {}
+    for st in statuses:
+        for full, v in st["pnl"].items():
+            bt_pnl[prod_name_for(full)] = (v, st["key"])
+            bt_pnl[full] = (v, st["key"])
+
+    emit(f"   prod total (algo rows only)     : "
+         f"${algo_rows['pnl'].sum():,.0f} over {len(algo_rows)} strategies")
+    emit(f"   prod total (whole day, all book): ${day['pnl'].sum():,.0f}")
+    emit()
+    emit(f"   {'strategy':<56}{'prod':>12}{'backtest':>12}  source")
+    emit("   " + "-" * 88)
+    matched_bt = set()
+    for _, r in algo_rows.sort_values("pnl").iterrows():
+        name = str(r["strategy"])
+        hit = bt_pnl.get(name)
+        bt_str = f"{hit[0]:>12,.0f}" if hit else f"{'no bt row':>12}"
+        src = hit[1] if hit else "-"
+        if hit:
+            matched_bt.add(name)
+        emit(f"   {name[:56]:<56}{r['pnl']:>12,.0f}{bt_str}  {src}")
+        if isinstance(r.get("notes"), str) and r["notes"].strip():
+            emit(f"      prod note: {r['notes'].strip()[:150]}")
+
+    # Backtest fired where prod has no row = Cat 1 discrepancy.
+    prod_names = set(algo_rows["strategy"].astype(str))
+    cat1 = []
+    for st in statuses:
+        for full, v in st["pnl"].items():
+            pname = prod_name_for(full)
+            if pname not in prod_names and abs(v) > 0:
+                cat1.append((pname, v, st["key"]))
+    if cat1:
+        sub("BACKTEST TRADED, NO PROD PNL ROW (Cat 1 -- verify before concluding)")
+        for pname, v, key in sorted(cat1, key=lambda x: -abs(x[1])):
+            # The min-price-replay explanation is an options mechanism; it does not
+            # apply to the equity stock backtest, whose rows are share PnL.
+            note = ("  (sub-$100: consistent with a 1-lot at the backtest's min-price "
+                    "replay, not a missed signal)"
+                    if abs(v) < 100 and key != "equity" else "")
+            emit(f"   {pname[:60]:<60}{v:>12,.0f}  {key}{note}")
+
+    if len(other):
+        sub("NON-ALGO PNL ROWS SAME DAY (context only, not part of this review)")
+        for _, r in other.sort_values("pnl").iterrows():
+            emit(f"   {str(r['strategy'])[:56]:<56}{r['pnl']:>12,.0f}")
+    return bt_pnl
+
+
+PNL_DISAGREE_PCT = 0.10
+
+
+def section_reconciliation(prod_df, review_date, statuses, atl):
+    """Per-strategy AGREE / DISAGREE verdict, so the review never eyeballs two numbers.
+
+    Materiality bar (Zach, 2026-08-21, correction #7 amendment): a disagreement is a PnL gap
+    of >= 10% of the larger side, a different strike on either leg, one side trading while
+    the other did not, or a different side/direction. Anything tighter is agreement and gets
+    no line in the review.
+    """
+    hdr("RECONCILIATION VERDICT")
+    day = prod_df[prod_df["trade_date"] == review_date]
+    # Scope rule (correction #3): only strategies belonging to a run_algos.sh script. The
+    # discretionary / iron condor / wheel book is out of scope for this review entirely.
+    day = day[day["strategy"].str.contains("ALGO_42|EQUITY_ALGO|BTIC", case=False, na=False)]
+    prod_pnl, prod_note = {}, {}
+    for _, r in day.iterrows():
+        prod_pnl[str(r["strategy"])] = float(r["pnl"])
+        if isinstance(r.get("notes"), str) and r["notes"].strip():
+            prod_note[str(r["strategy"])] = r["notes"].strip()
+
+    bt_pnl, bt_strikes, bt_src = {}, {}, {}
+    for st in statuses:
+        for full, v in st["pnl"].items():
+            name = prod_name_for(full)
+            bt_pnl[name] = v
+            bt_src[name] = st["key"]
+            if st["strikes"].get(full):
+                bt_strikes[name] = st["strikes"][full]
+
+    # Prod strikes from the base (non-v8, non-fast) book; those are what the backtest models.
+    prod_strikes = {}
+    if not atl.empty:
+        base = atl[~atl["script_name"].astype(str).str.contains("_V8|_FAST", regex=True)]
+        for _, r in base.iterrows():
+            name = prod_name_for(r["algo_name"])
+            cp = str(r["cp"])
+            if cp in ("Put", "Call"):
+                prod_strikes.setdefault(name, {})[cp] = (
+                    _f(r["short_strike"]), _f(r["long_strike"]))
+
+    names = sorted(set(prod_pnl) | set(bt_pnl))
+    if not names:
+        emit("   nothing traded on either side.")
+        return
+    verdicts = []
+    for name in names:
+        p, b = prod_pnl.get(name), bt_pnl.get(name)
+        reasons = []
+        if p is None and b is not None and abs(b) > 0:
+            reasons.append("backtest traded, prod did not")
+        elif b is None and p is not None and "OUTRIGHT" not in name.upper():
+            # OUTRIGHT never has a backtest row (create_backtests filters it unless
+            # --outright). Structural, already understood, and Zach asked not to be told
+            # about it again -- correction #2.
+            reasons.append("prod traded, backtest has no row")
+        elif p is not None and b is not None:
+            denom = max(abs(p), abs(b))
+            if denom > 0:
+                pct = abs(p - b) / denom
+                if pct >= PNL_DISAGREE_PCT:
+                    reasons.append(f"PnL differs {pct * 100:.0f}% "
+                                   f"(prod {p:,.0f} vs bt {b:,.0f})")
+        ps, bs = prod_strikes.get(name, {}), bt_strikes.get(name, {})
+        if ps and bs:
+            for cp in sorted(set(ps) | set(bs)):
+                if cp not in ps:
+                    reasons.append(f"backtest traded {cp}, prod did not")
+                elif cp not in bs:
+                    reasons.append(f"prod traded {cp}, backtest did not")
+                elif ps[cp] != bs[cp]:
+                    reasons.append(
+                        f"{cp} strikes differ: prod {ps[cp][0]:.0f}/{ps[cp][1]:.0f} "
+                        f"vs bt {bs[cp][0]:.0f}/{bs[cp][1]:.0f}")
+        verdicts.append((name, p, b, bt_src.get(name, "-"), reasons))
+
+    dis = [v for v in verdicts if v[4]]
+    agree = [v for v in verdicts if not v[4]]
+    emit(f"   {len(dis)} disagreement(s), {len(agree)} in agreement "
+         f"(bar: >={PNL_DISAGREE_PCT * 100:.0f}% PnL, any strike diff, or one-sided trade)")
+    if dis:
+        sub("DISAGREE -- name these in the review")
+        for name, p, b, src, reasons in dis:
+            emit(f"   {name}")
+            emit(f"      prod {'-' if p is None else f'{p:,.0f}'}   "
+                 f"backtest {'-' if b is None else f'{b:,.0f}'}   [{src}]")
+            for why in reasons:
+                emit(f"      - {why}")
+            if name in prod_note:
+                emit(f"      prod note: {prod_note[name][:110]}")
+    if agree:
+        sub("AGREE -- one flat line in the review, no per-strategy detail")
+        for name, p, b, src, _ in agree:
+            emit(f"   {name[:58]:<58}prod {'-' if p is None else f'{p:>10,.0f}'}   "
+                 f"bt {'-' if b is None else f'{b:>10,.0f}'}")
+    if not prod_strikes:
+        emit()
+        emit("   NOTE: no algo_trade_log rows, so strike-level comparison was not possible; "
+             "verdicts above are PnL-only.")
+
+
+def section_streaks(prod_df, review_date):
+    hdr("CONSECUTIVE PNL STREAKS (sizing signal)")
+    days = trailing_trading_days(review_date, 15)
+    window = prod_df[prod_df["trade_date"].isin(days)].copy()
+    window = window[window["strategy"].str.contains("ALGO_42|EQUITY_ALGO|BTIC",
+                                                    case=False, na=False)]
+    if window.empty:
+        emit("   no algo rows in the trailing window")
+        return
+    traded_today = set(
+        prod_df[prod_df["trade_date"] == review_date]["strategy"].astype(str))
+
+    emit(f"   window: {days[0]} .. {days[-1]} ({len(days)} trading days), "
+         "fire days only (a day with no row is not a break in the streak)")
+    emit()
+    emit(f"   {'strategy':<56}{'run':>5}{'run $':>12}{'last 6 fire days':>26}")
+    emit("   " + "-" * 100)
+    rows = []
+    for name, grp in window.groupby("strategy"):
+        grp = grp.sort_values("trade_date")
+        if review_date not in set(grp["trade_date"]):
+            continue
+        pnls = list(grp["pnl"])
+        sign = 1 if pnls[-1] > 0 else (-1 if pnls[-1] < 0 else 0)
+        run, total = 0, 0.0
+        for v in reversed(pnls):
+            if sign > 0 and v > 0 or sign < 0 and v < 0:
+                run += 1
+                total += v
+            else:
+                break
+        recent = " ".join(f"{v/1000:+.0f}k" for v in pnls[-6:])
+        rows.append((run * sign, name, run, total, recent, name in traded_today))
+    for _, name, run, total, recent, _ in sorted(rows, key=lambda x: -abs(x[0])):
+        flag = "  <== 3+ day run" if run >= 3 else ""
+        emit(f"   {name[:56]:<56}{run:>5}{total:>12,.0f}{recent:>26}{flag}")
+    emit()
+    emit("   Interpretation is the review's job: a 3+ day same-sign run is a size-up "
+         "(positive) or size-down (negative) candidate ONLY after checking "
+         "eod_option_algos/prod_change_logs/ for a deliberate recent change.")
+
+
+def _bin_of(value, edges):
+    """Bin index for a value against ascending edges, plus distance to the nearest edge."""
+    idx = sum(1 for e in edges if value >= e)
+    near = min(edges, key=lambda e: abs(value - e))
+    return idx, near, value - near
+
+
+def _daily_moves_row(path, review_date):
+    """One row of a spy_daily_moves CSV for the review date, or None."""
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        return None, f"could not read {os.path.basename(path)}: {e}"
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    row = df[df["date"] == review_date]
+    if row.empty:
+        return None, (f"{os.path.basename(path)} has no row for {review_date} "
+                      f"(latest {df['date'].max()}) -- market-metric CSVs may be stale")
+    return row.iloc[0], None
+
+
+def section_market_state(log_facts, review_date):
+    """Trade-gate distances, reporting ONLY the gates that were genuinely near (#16, #17).
+
+    A prod log line "*Don't trade X* because <veto>" proves only that the veto was evaluated
+    first -- helpers.py:1250 returns on the first match -- so it says nothing about whether a
+    trade trigger would have fired. This section measures the trade side instead.
+
+    Zach, 2026-08-26: report a gate ONLY if it was within 5 bps / one vol point / $100M of
+    its boundary. Everything wider is a recap he has to read for nothing, so it is suppressed
+    here rather than left for the review to filter. When nothing is near, this section says so
+    in one line and the review writes no near-miss at all.
+    """
+    hdr("TRADE-GATE DISTANCES (near-misses only)")
+    near = []      # (label, text) for gates inside the bars
+    state = []     # one compact context line per script
+
+    # --- market type: the +-0.5 market_ratio boundary, measured in SPY bps ----------------
+    for label, path in [("350PM", DAILY_MOVES_350), ("355PM", DAILY_MOVES_355)]:
+        row, err = _daily_moves_row(path, review_date)
+        if err:
+            near.append((label, f"market metrics unavailable -- {err}"))
+            continue
+        ratio, px, yest, std = (row["market_ratio"], row["trade_price"],
+                                row["yest_close_price"], row["rolling_std"])
+        mtype = ("UP" if ratio > MKT_RATIO_BOUND else
+                 "DOWN" if ratio < -MKT_RATIO_BOUND else "FLAT")
+        state.append(f"{label} market {mtype} (ratio {ratio:+.3f})")
+        for bound, name in [(MKT_RATIO_BOUND, "UP"), (-MKT_RATIO_BOUND, "DOWN")]:
+            if mtype == name:
+                continue
+            flip_px = yest * (1 + bound * std)
+            gap_bps = abs((flip_px / px - 1) * 1e4)
+            if gap_bps < NEAR_BPS:
+                near.append((label, f"market type was {gap_bps:.1f} bps from {name} "
+                                    f"(ratio {ratio:+.3f} vs {bound:+.1f}; SPY {px:.2f}, "
+                                    f"needed {flip_px:.2f})"))
+        # prod's own logged type vs the CSV the backtest reads -- a real disagreement, always
+        # worth a line regardless of distance.
+        key = "mkt_type_log" if label == "350PM" else "mkt_355"
+        stem = "350pm_script" if label == "350PM" else "355pm_script"
+        logged = (log_facts.get(stem) or {}).get("state", {}).get(key)
+        if logged and logged != mtype:
+            near.append((label, f"prod logged market {logged} but "
+                                f"{os.path.basename(path)} gives {mtype} "
+                                f"(ratio {ratio:+.3f}) -- prod and backtest disagree, FLAG"))
+
+    # --- the +-12bps DONT_TRADE veto on the GROWS family ----------------------------------
+    st355 = (log_facts.get("355pm_script") or {}).get("state", {})
+    if "bps_1550_1555" in st355:
+        b = st355["bps_1550_1555"]
+        state.append(f"SPY 3:50-3:55 {b:+.1f} bps")
+        for edge in (12.0, -12.0):
+            d = abs(b - edge)
+            if d < NEAR_BPS:
+                tripped = b >= 12.0 if edge > 0 else b <= -12.0
+                near.append(("355PM", f"the {edge:+.0f}bps veto was {'TRIPPED' if tripped else 'missed'}"
+                                      f" by {d:.1f} bps ({b:+.1f} bps actual)"))
+
+    # --- vol gates ------------------------------------------------------------------------
+    for stem, label in [("350pm_script", "350PM"), ("355pm_script", "355PM")]:
+        st = (log_facts.get(stem) or {}).get("state", {})
+        vol = st.get("atm_vol", st.get("today_vol"))
+        if vol is None:
+            continue
+        bits = [f"vol {vol:.3f}"]
+        if "vix" in st:
+            bits.append(f"VIX {st['vix']:.2f}")
+        state.append(f"{label} " + ", ".join(bits))
+        _, edge, d = _bin_of(vol, TODAY_VOL_EDGES)
+        if abs(d) < NEAR_VOL:
+            near.append((label, f"vol {vol:.3f} was {abs(d):.3f} from the {edge:.4f} bin "
+                                f"edge (factor_vol / factor_vol_high_enough)"))
+        if abs(vol - BUMPED_VOL_MAX) < NEAR_VOL:
+            near.append((label, f"vol {vol:.3f} was {abs(vol - BUMPED_VOL_MAX):.3f} from the "
+                                f"BUMPED {BUMPED_VOL_MAX} gate"))
+
+    # --- imbalance ladders ----------------------------------------------------------------
+    for stem, label in [("350pm_script", "350PM"), ("355pm_script", "355PM")]:
+        st = (log_facts.get(stem) or {}).get("state", {})
+        for key, thresholds, nm in [("imbal_350", IMBAL_THRESHOLDS_350, "350 imbal"),
+                                    ("imbal_355", IMBAL_THRESHOLDS_355, "355 imbal")]:
+            if key not in st:
+                continue
+            v = st[key]
+            if stem == "355pm_script" or key == "imbal_350":
+                state.append(f"{nm} {v/1e9:+.2f}B")
+            for t in thresholds:
+                for signed in ({t, -t} if t else {0.0}):
+                    d = abs(v - signed)
+                    if d < NEAR_IMBAL:
+                        near.append((label, f"{nm} {v/1e9:+.3f}B was ${d/1e6:.0f}M from the "
+                                            f"{signed/1e9:+.1f}B threshold"))
+        if "imbal_350" in st and "imbal_355" in st:
+            d = st["imbal_355"] - st["imbal_350"]
+            gap = abs(abs(d) - IMBAL_DELTA_THRESHOLD)
+            if gap < NEAR_IMBAL:
+                near.append((label, f"(355-350) delta {d/1e9:+.3f}B was ${gap/1e6:.0f}M from "
+                                    f"the +-{IMBAL_DELTA_THRESHOLD/1e9:.1f}B SML gate"))
+
+    # --- output ---------------------------------------------------------------------------
+    seen, uniq = set(), []
+    for label, txt in near:
+        if (label, txt) not in seen:
+            seen.add((label, txt))
+            uniq.append((label, txt))
+    if uniq:
+        emit(f"   Gates within the reporting bars ({NEAR_BPS:.0f} bps / {NEAR_VOL} vol / "
+             f"${NEAR_IMBAL/1e6:.0f}M). A near gate is NOT a near-miss on its own -- before "
+             "writing one, check the algo's WHOLE trigger tuple against these values and name "
+             "the binding gate.")
+        for label, txt in uniq:
+            emit(f"   {label}: {txt}")
+    else:
+        emit(f"   No trade gate within {NEAR_BPS:.0f} bps / {NEAR_VOL} vol / "
+             f"${NEAR_IMBAL/1e6:.0f}M of its boundary. Write NO near-miss line today, and do "
+             "not report any of these values as context.")
+    if state:
+        emit()
+        emit("   Day context (for reference only -- do not restate in the review unless a "
+             "finding turns on it):")
+        # Both scripts read the same 3:50 imbal, so the raw list repeats entries.
+        emit("      " + " | ".join(dict.fromkeys(state)))
+
+
+
+def section_rebal_veto(review_date, atl):
+    """IMBAL_GROWS CLOSER/BUMPED levered-rebal veto checks (REVIEW_GUIDE WATCH ITEM 4):
+    daily CSV row present/sane, 350-log context line matches the CSV, veto/fail-open
+    banners surfaced, and the parquet-refresh / constituency-refresh recommendations."""
+    if review_date < REBAL_VETO_LIVE_DATE:
+        return
+    hdr("LEVERED-REBAL VETO (IMBAL_GROWS CLOSER/BUMPED)")
+    flags = []
+
+    # --- 1. the CSV row prod read (source of truth for the number) -------------------------
+    rebal_b = None
+    row = None
+    try:
+        csv = pd.read_csv(REBAL_CSV, dtype=str)
+        hit = csv[csv["trade_date"] == review_date.isoformat()]
+        row = hit.iloc[-1] if len(hit) else None
+    except Exception as e:
+        flags.append(f"*** CSV unreadable ({type(e).__name__}: {e}) -- fail-open day ***")
+    if row is None and not flags:
+        flags.append("*** no CSV row for this date -- fail-open day (layers traded "
+                     "unvetoed) ***")
+    if row is not None:
+        raw = str(row.get("rebal_355_B", "")).strip()
+        if raw in ("", "nan", "None"):
+            flags.append("*** CSV row has blank rebal_355_B -- fail-open day ***")
+        else:
+            rebal_b = float(raw)
+            poll = str(row.get("poll_time_et", "")).strip()
+            emit(f"   CSV row: rebal_355_B {rebal_b:+.2f}B (polled {poll or '?'}, "
+                 f"source {row.get('source', '?')})")
+            if not poll.startswith(("15:48", "15:49", "15:50")):
+                flags.append(f"poll_time_et {poll} is far from the normal ~15:49:03 -- "
+                             "check btic_and_imbal_script")
+        age = str(row.get("constituency_max_age_td", "")).strip()
+        if age not in ("", "nan", "None") and float(age) > REBAL_CONSTITUENCY_MAX_AGE:
+            flags.append(f"constituency files stale (max age {age} td, oldest "
+                         f"{row.get('constituency_oldest_etf', '?')}) -- recommend: "
+                         "cd /d/agent_projects/levered_rebal && python "
+                         f"_download_constituents.py --mode daily {review_date} {review_date}")
+
+    # --- 2. the 350 logs: context line, VETOED banners, fail-open banner -------------------
+    log_vals, veto_lines, inactive = [], [], False
+    for path in sorted(glob.glob(os.path.join(LOG_DIR,
+                                              f"{review_date}_350pm_script*.txt"))):
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        m = re.search(r"355 levered rebal for IMBAL_GROWS CLOSER/BUMPED veto:\s*"
+                      r"([+-]?\d+(?:\.\d+)?)B", text)
+        if m:
+            log_vals.append((os.path.basename(path), float(m.group(1))))
+        veto_lines += [ln.strip() for ln in text.splitlines()
+                       if "VETOED: projected 355 rebal" in ln or "CLOSER VETOED" in ln]
+        if "REBAL VETO INACTIVE" in text:
+            inactive = True
+    if inactive:
+        flags.append("*** REBAL VETO INACTIVE banner in a 350 log -- prod could not read "
+                     "the number (btic crash / late write / CSV problem); layers traded "
+                     "unvetoed ***")
+    for fname, v in log_vals:
+        if rebal_b is not None and abs(v - rebal_b) > 0.011:
+            flags.append(f"*** {fname} context line says {v:+.2f}B but the CSV row says "
+                         f"{rebal_b:+.2f}B ***")
+    if row is not None and rebal_b is not None and not log_vals and not inactive:
+        flags.append("no rebal context line found in the 350 logs -- confirm the veto "
+                     "code ran")
+
+    # --- 3. above-threshold day: veto banners + no gated fills -----------------------------
+    if rebal_b is not None and abs(rebal_b) > REBAL_VETO_PROD_B:
+        side, cp = ("Call", "C") if rebal_b > 0 else ("Put", "P")
+        emit(f"   |rebal| > {REBAL_VETO_PROD_B}B adverse to {side}s -- veto should gate "
+             f"GROWS CLOSER/BUMPED {side}s today.")
+        for ln in dict.fromkeys(veto_lines):
+            emit(f"      {ln}")
+        if not veto_lines:
+            flags.append(f"*** rebal {rebal_b:+.2f}B is past the {REBAL_VETO_PROD_B}B bar "
+                         "but NO VETOED banner in the 350 logs -- either no GROWS "
+                         "CLOSER/BUMPED trigger existed on that side, or the veto did not "
+                         "run; check the logs ***")
+        if not atl.empty and {"algo_name", "cp"}.issubset(atl.columns):
+            # 350PM only: the 355 family has its own ALGO_42_355PM_..._IMBAL_GROWS_CLOSER, which is
+            # NOT subject to this veto and must not be counted as a violation.
+            gated = atl[atl["algo_name"].astype(str)
+                        .str.contains("350PM_SPREAD_SALES_SPX_IMBAL_GROWS_(?:CLOSER|BUMPED)", regex=True)]
+            gated = gated[gated["cp"].astype(str).str.upper().str.startswith(cp)]
+            filled = gated[pd.to_numeric(gated.get("size_filled"),
+                                         errors="coerce").fillna(0) > 0]
+            if len(filled):
+                flags.append(f"*** {len(filled)} IMBAL_GROWS CLOSER/BUMPED {side} fill(s) "
+                             "in algo_trade_log DESPITE the adverse rebal being past the "
+                             "veto bar -- THIS SHOULD BE REVIEWED ***")
+    elif veto_lines:
+        flags.append("*** VETOED banner present but the CSV rebal is inside the "
+                     f"{REBAL_VETO_PROD_B}B bar -- threshold mismatch, check the logs ***")
+
+    # --- 4. WATCH ITEM 4f: recommend refreshing the backtest-side parquet history ----------
+    if rebal_b is not None and abs(rebal_b) > REBAL_RERUN_RECO_B:
+        try:
+            paths = glob.glob(REBAL_PARQUET_GLOB)
+            newest = max(paths, key=os.path.getmtime)
+            pq_max = pd.to_datetime(
+                pd.read_parquet(newest, columns=["date"])["date"]).max().date()
+            if pq_max < review_date:
+                start = pq_max + dt.timedelta(days=1)
+                emit(f"   RECOMMEND (|rebal| > {REBAL_RERUN_RECO_B}B, parquet history ends "
+                     f"{pq_max}): refresh the rebal projection history so this date can be "
+                     "verified against the backtest's veto model:")
+                emit("      cd /d/vbam-data-oracle/projects/levered_rebal && "
+                     f"python run_levered_rebal.py {start} {review_date}")
+            else:
+                emit(f"   rebal parquet history already covers {review_date} "
+                     "(no refresh needed).")
+        except Exception as e:
+            flags.append(f"could not check the rebal parquet history "
+                         f"({type(e).__name__}: {e})")
+
+    for f in flags:
+        emit(f"   {f}")
+    if not flags and rebal_b is not None and abs(rebal_b) <= REBAL_VETO_PROD_B:
+        emit(f"   Veto input normal: {rebal_b:+.2f}B, inside the {REBAL_VETO_PROD_B}B bar; "
+             "logs consistent. Nothing to report.")
+
+
+def section_fills(atl, review_date, log_facts):
+    hdr("FILLS BY WAVE (optionsResearch.algo_trade_log)")
+    if atl.empty:
+        emit(f"   NO algo_trade_log rows for {review_date}. Either no option algo traded, "
+             "or the logger failed -- check the script logs for "
+             "'algo_trade_logger: upserted N row(s)'.")
+        return
+    atl = atl.sort_values(["script_name", "algo_name", "cp"])
+    emit(f"   {'script':<11}{'algo':<48}{'cp':<5}{'strikes':<14}"
+         f"{'att':>5}{'fill':>6}{'W1':>5}{'W2':>5}{'W1lim':>7}{'W2lim':>7}"
+         f"{'avg':>7}{'sprc':>7}{'cross':>7}")
+    emit("   " + "-" * 125)
+    for _, r in atl.iterrows():
+        short = short_algo(r["algo_name"])
+
+        def num(v, fmt="{:.2f}"):
+            return "-" if pd.isna(v) else fmt.format(float(v))
+
+        emit(f"   {str(r['script_name']):<11}{short[:48]:<48}{str(r['cp']):<5}"
+             f"{f'{r.short_strike:.0f}/{r.long_strike:.0f}':<14}"
+             f"{int(r.size_attempted):>5}"
+             f"{'-' if pd.isna(r.size_filled) else int(r.size_filled):>6}"
+             f"{'-' if pd.isna(r.wave1_filled_qty) else int(r.wave1_filled_qty):>5}"
+             f"{'-' if pd.isna(r.wave2_filled_qty) else int(r.wave2_filled_qty):>5}"
+             f"{num(r.wave1_limit):>7}{num(r.wave2_limit):>7}"
+             f"{num(r.avg_fill_price):>7}{num(r.srprc1, '{:.3f}'):>7}"
+             f"{num(r.cross_price1):>7}")
+
+    sub("FILL VERDICTS (mechanical -- the review supplies the meaning)")
+    n_hack = int(atl["algo_name"].astype(str).str.startswith(HACK_PREFIX).sum())
+    if n_hack:
+        emit(f"   ({n_hack} HACK_ row(s) skipped here -- reconciled against the hacker "
+             "backtest in the 355pm_script / 355pm_script_v8 blocks below)")
+    for _, r in atl.iterrows():
+        if str(r["algo_name"]).startswith(HACK_PREFIX):
+            continue
+        att = int(r["size_attempted"])
+        filled = 0 if pd.isna(r["size_filled"]) else int(r["size_filled"])
+        w1 = 0 if pd.isna(r["wave1_filled_qty"]) else int(r["wave1_filled_qty"])
+        w2 = 0 if pd.isna(r["wave2_filled_qty"]) else int(r["wave2_filled_qty"])
+        name = f"{r['script_name']} {short_algo(r['algo_name'])} {r['cp']}"
+        floors = log_facts.get(_script_key(r["script_name"]), {}).get(
+            "clamp_floors", set())
+        w1lim = None if pd.isna(r["wave1_limit"]) else round(float(r["wave1_limit"]), 4)
+        w2lim = None if pd.isna(r["wave2_limit"]) else round(float(r["wave2_limit"]), 4)
+        clamped = w1lim is not None and w1lim in floors
+        both_same = w1lim is not None and w1lim == w2lim
+        why = ""
+        if clamped:
+            why = (f" -- wave-1 limit {w1lim} IS the min_price floor: the computed "
+                   "target was below min_price and got clamped up")
+        if filled == 0:
+            emit(f"   UNFILLED  {name}: 0/{att}{why}")
+        elif w1 >= att:
+            emit(f"   W1 FULL   {name}: {w1}/{att} on wave 1")
+        elif w1 == 0 and w2 > 0:
+            extra = ""
+            if both_same:
+                extra = (f"; W2 limit is IDENTICAL to W1 ({w1lim}) because both hit the "
+                         "min_price floor -- the W2 fill came from the market/surface "
+                         "moving, NOT from a more aggressive limit")
+            emit(f"   W2 ONLY   {name}: 0 on W1, {w2}/{att} on W2 "
+                 f"(W1 limit {w1lim}, W2 limit {w2lim}{extra})")
+        elif filled < att:
+            emit(f"   PARTIAL   {name}: {filled}/{att} (W1 {w1}, W2 {w2})")
+        else:
+            emit(f"   SPLIT     {name}: {filled}/{att} (W1 {w1}, W2 {w2})")
+
+    sub("V8 SIZE-RATIO CHECK")
+    v8_check(atl, log_facts)
+
+
+def v8_check(atl, log_facts):
+    """Flag v8 sizes ONLY when they miss v8's own intended size (correction #19).
+
+    V8_SIZE_RATIO applies to v8's OWN pre-ratio size, which the v8 log prints as
+    "ALGO_...: 23 --> 4", and the result is floored: max(1, int(size * ratio)). Comparing
+    v8's traded size against v7's produced false mismatches -- v7 and v8 reach different
+    pre-ratio sizes (loss-cap pro-rata, CLOSER resize), and floor rounding alone puts a
+    23-lot parent at 0.17x rather than 0.20x. Zach, 2026-08-26: if prod fills roughly match
+    the backtest, or what the v8 ratio implies, do not flag it -- so agreement prints nothing.
+    """
+    ratios, pre = {}, {}
+    for path, label in (("350pm_script_v8.py", "350PM"), ("355pm_script_v8.py", "355PM")):
+        full = os.path.join(ALGOS_DIR, path)
+        if not os.path.exists(full):
+            continue
+        with open(full, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r"^V8_SIZE_RATIO\s*=\s*([\d.]+)", line.strip())
+                if m:
+                    ratios[label] = float(m.group(1))
+                    break
+        stem = path[:-3]
+        pre[label] = (log_facts.get(stem) or {}).get("v8_resize", {})
+    if not ratios:
+        emit("   could not read V8_SIZE_RATIO from the v8 scripts")
+        return
+    problems, compared = [], 0
+    # Hacker sizes derive from each book's own parent fills, not from V8_SIZE_RATIO.
+    atl = atl[~atl["algo_name"].astype(str).str.startswith(HACK_PREFIX)]
+    for base, expected in ratios.items():
+        b = atl[atl["script_name"] == base]
+        v = atl[atl["script_name"] == f"{base}_V8"]
+        if b.empty or v.empty:
+            continue
+        m = b.merge(v, on=["algo_name", "cp", "short_strike"], suffixes=("_v7", "_v8"))
+        for _, r in m.iterrows():
+            a7, a8 = int(r["size_attempted_v7"]), int(r["size_attempted_v8"])
+            algo = r["algo_name"]
+            compared += 1
+            src = pre[base].get(algo)
+            if src:
+                want = max(1, int(src[0] * expected))
+                if a8 != want:
+                    problems.append(
+                        f"   {base} {short_algo(algo)[:40]} {r['cp']}: v8 sent {a8} but its "
+                        f"own pre-ratio size {src[0]} x {expected:.2f} floors to {want}")
+            else:
+                # No resize line for this algo -- fall back to v7, allowing floor rounding.
+                want = max(1, int(a7 * expected))
+                if a8 != want and a7 > 2:
+                    problems.append(
+                        f"   {base} {short_algo(algo)[:40]} {r['cp']}: v8 sent {a8}, expected "
+                        f"{want} from v7's {a7} x {expected:.2f} (no v8 resize line in the "
+                        f"log -- v8's own pre-ratio size unknown)")
+    if problems:
+        emit("   Sizes that do not match v8's intended size:")
+        for line in problems:
+            emit(line)
+    elif compared:
+        emit(f"   All {compared} v7/v8 pair(s) match v8's intended size "
+             f"(pre-ratio size x V8_SIZE_RATIO, floored). Nothing to report.")
+    else:
+        emit("   no v7/v8 script pair traded the same algo -- nothing to compare")
+
+
+
+def _script_key(script_name):
+    """algo_trade_log script_name -> log file stem."""
+    return {"350PM": "350pm_script", "355PM": "355pm_script",
+            "350PM_FAST": "350pm_script_fast", "350PM_V8": "350pm_script_v8",
+            "355PM_V8": "355pm_script_v8"}.get(str(script_name), str(script_name).lower())
+
+
+# --- Fill quality (correction #13): quote AT the fill, from SpiderRock's execution table ---
+# Zach's calibration (2026-08-25): sold 0.82 on fillBid 0.80 / fillAsk 0.95 = fine;
+# sold 0.82 on fillBid 0.80 / fillAsk 1.20 = flag. Both conditions must hold to flag:
+# fill near the disadvantageous side AND an extremely wide fill-time spread.
+SR_FILLS_USER, SR_FILLS_PASS = "agm.zdietz", "m9c8mu.m"
+
+# Both books must be queried: v8 accounts (EOD61_C42, the 355 SPREAD_BUYS book) do NOT appear
+# in the v7 table at all. NOTE THE NAMING -- v8 drops the _agm_ infix, and srtrade_agm_<date>
+# does not exist on v8. Confirmed with SpiderRock (Will) 2026-08-26.
+#   ("label", host, port, db-name template)
+SR_FILL_SOURCES = [
+    ("v7", "198.102.4.55", 3307, "srtrade_agm_%Y_%m_%d"),
+    ("v8", "192.81.231.66", 3700, "srtrade_%Y_%m_%d"),
+]
+# The v8 endpoint is load-balanced and some backends lack the grant, so the same query can
+# return "ERROR 1142 SELECT command denied" on one connection and succeed on the next.
+# Measured 2026-08-26: 8 of 12 fresh connections succeeded, and a denial recurred 5s after a
+# success. Retry on a NEW connection -- a retry on the same one lands on the same backend.
+# 6 attempts, not 3: the denials cluster rather than arriving independently -- 4 consecutive
+# failures were observed on 2026-08-26 despite a ~2/3 per-connection success rate. Worst case
+# this costs 25s of waiting on a day v8 is genuinely down, which is fine for a T+1 batch job.
+SR_FILL_RETRIES = 6
+SR_FILL_RETRY_WAIT_S = 5
+FILL_POS_AGGRESSIVE = 0.25   # fill within this fraction of the quote from the bad side
+FILL_SPREAD_WIDE_ABS = 0.25  # $; 0.15 (his fine example) stays under, 0.40 (his flag) over
+FILL_SPREAD_WIDE_REL = 0.30  # and spread >= this fraction of mid, so deep-ITM $ spreads pass
+FILL_OUTSIDE_EPS = 0.005     # beyond-quote tolerance (fillPrice==fillBid differs by ~2e-8)
+
+
+# Columns we want. v7 and v8 do NOT share a schema -- v7 has 254 columns including the
+# _us microsecond companions, v8 has 339 and drops them (its datetimes carry microseconds
+# directly). Selecting a v7-only column against v8 raises 1054 Unknown column, which looks
+# exactly like a failed connection if you are not reading the error. So the SELECT is built
+# per source from the columns that actually exist there.
+SR_FILL_WANT = ["accnt", "secKey_tk", "secKey_xx", "secKey_cp", "orderSide", "fillPrice",
+                "fillQuantity", "fillBid", "fillAsk", "fillMark", "fillExch", "fillExecId",
+                "fillTransactDttm"]
+SR_FILL_REQUIRED = ["accnt", "secKey_xx", "secKey_cp", "orderSide", "fillPrice",
+                    "fillQuantity", "fillBid", "fillAsk"]
+
+
+def _load_sr_fills_one(host, port, db):
+    """Option fills from one srtrade host, retrying a denial on a fresh connection.
+
+    The v8 endpoint sits behind a load balancer whose backends do not all carry the grant, so
+    a 1142 "SELECT command denied" is not proof the table is unavailable -- a new connection
+    often lands on a backend that has it. Returns (DataFrame or None, error or None, attempts).
+    """
+    import pymysql
+    last = None
+    for attempt in range(1, SR_FILL_RETRIES + 1):
+        if attempt > 1:
+            time.sleep(SR_FILL_RETRY_WAIT_S)
+        try:
+            # New connection each attempt: reusing one keeps hitting the same backend.
+            conn = pymysql.connect(host=host, port=port, user=SR_FILLS_USER,
+                                   password=SR_FILLS_PASS, database=db, connect_timeout=15)
+            try:
+                cur = conn.cursor()
+                cur.execute("SHOW COLUMNS FROM msgsrparentexecution")
+                have = {r[0] for r in cur.fetchall()}
+                missing = [c for c in SR_FILL_REQUIRED if c not in have]
+                if missing:
+                    return None, (f"msgsrparentexecution is missing required column(s) "
+                                  f"{missing} -- schema changed, the fill-quality check "
+                                  f"needs updating"), attempt
+                cols = [c for c in SR_FILL_WANT if c in have]
+                df = pd.read_sql(
+                    f"SELECT {', '.join(cols)} FROM msgsrparentexecution "
+                    "WHERE secKey_cp IN ('Call','Put')", conn)
+                for c in SR_FILL_WANT:
+                    if c not in df.columns:
+                        df[c] = pd.NA   # keep one shape for both books
+            finally:
+                conn.close()
+            return df, None, attempt
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+            # Retry only the load-balancer family: 1044/1142 access denied (a backend without
+            # the grant), 2003/2013 connect/lost. Anything else -- a bad column, a missing
+            # table -- is deterministic, so retrying just wastes 25s and reports the wrong
+            # cause. This is the trap that hid a v8 schema difference as a connection failure.
+            code = getattr(getattr(e, "orig", e), "args", [None])[0]
+            if code not in (1044, 1142, 2003, 2013):
+                return None, last, attempt
+    return None, last, SR_FILL_RETRIES
+
+
+def load_sr_fills(review_date):
+    """All option fills for the trade date, from BOTH the v7 and v8 execution tables.
+
+    v8 accounts do not appear in the v7 table, so the day is only complete with both. Returns
+    (DataFrame, error string or None, notes). The error is set only when NEITHER host could be
+    read; if one host works, the notes say which failed and the review carries on with a
+    partial book. fillBid/fillAsk are SpiderRock's quote AT the fill -- the only valid
+    fill-quality evidence (correction #13).
+    """
+    frames, notes, errors = [], [], []
+    for label, host, port, tmpl in SR_FILL_SOURCES:
+        db = review_date.strftime(tmpl)
+        df, err, attempts = _load_sr_fills_one(host, port, db)
+        if err is not None:
+            errors.append(f"{label} ({db} at {host}:{port}): {err}")
+            notes.append(f"{label}: FAILED after {attempts} attempt(s) "
+                         f"{SR_FILL_RETRY_WAIT_S}s apart -- {db} at {host}:{port}")
+            continue
+        retried = f" (succeeded on attempt {attempts})" if attempts > 1 else ""
+        notes.append(f"{label}: {len(df)} option fill row(s) from {db}{retried}")
+        if not df.empty:
+            df = df.copy()
+            df["book"] = label
+            frames.append(df)
+    if not frames and errors:
+        return None, " | ".join(errors), notes
+    if not frames:
+        return pd.DataFrame(), None, notes
+    out = pd.concat(frames, ignore_index=True)
+    # The two tables OVERLAP -- they are not one book each. Measured 2026-08-25: v8's
+    # srtrade_2026_08_25 held all 416 v7 rows PLUS the 2 EOD61_C42 fills that v7 was missing,
+    # so a plain concat doubled every lot. Dedupe on fillExecId, which is unique per fill.
+    before = len(out)
+    if "fillExecId" in out.columns and out["fillExecId"].notna().all():
+        out = out.drop_duplicates(subset=["fillExecId"], keep="last")
+    else:
+        out = out.drop_duplicates(
+            subset=["accnt", "secKey_xx", "secKey_cp", "orderSide", "fillPrice",
+                    "fillQuantity", "fillTransactDttm"], keep="last")
+        notes.append("dedupe: fillExecId missing on some rows, fell back to a composite key")
+    dupes = before - len(out)
+    if dupes:
+        notes.append(f"dedupe: {dupes} row(s) present in both books, counted once "
+                     f"({len(out)} unique fills)")
+    for c in ("secKey_xx", "fillPrice", "fillQuantity", "fillBid", "fillAsk", "fillMark"):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out.reset_index(drop=True), None, notes
+
+
+def _classify_fill(r):
+    """'' | 'AGGRESSIVE' | 'OUTSIDE QUOTE' per correction #13. When in doubt, alert."""
+    bid, ask, px = r["fillBid"], r["fillAsk"], r["fillPrice"]
+    if pd.isna(bid) or pd.isna(ask) or ask <= bid:
+        return "NO QUOTE"
+    if px < bid - FILL_OUTSIDE_EPS or px > ask + FILL_OUTSIDE_EPS:
+        return "OUTSIDE QUOTE"
+    spread, mid = ask - bid, (ask + bid) / 2
+    pos = (px - bid) / spread
+    near_bad_side = (pos <= FILL_POS_AGGRESSIVE if r["orderSide"] == "Sell"
+                     else pos >= 1 - FILL_POS_AGGRESSIVE)
+    wide = spread >= FILL_SPREAD_WIDE_ABS and spread >= FILL_SPREAD_WIDE_REL * mid
+    return "AGGRESSIVE" if (near_bad_side and wide) else ""
+
+
+def section_fill_quality(review_date, atl):
+    """Per-fill fillPrice vs the quote AT the fill, with the correction-#13 flag computed."""
+    hdr("FILL QUALITY (msgsrparentexecution, v7 + v8)")
+    emit("   fillBid/fillAsk are SpiderRock's quote recorded AT each fill -- judge fill")
+    emit("   quality ONLY from these, never from a pre-trade quote snapshot in a script log")
+    emit("   (correction #13). Flag bar: fill near the disadvantageous side AND spread >= "
+         f"${FILL_SPREAD_WIDE_ABS:.2f} and >= {FILL_SPREAD_WIDE_REL:.0%} of mid.")
+
+    fills, err, notes = load_sr_fills(review_date)
+    for n in notes:
+        emit(f"   source {n}")
+    algo_filled = (not atl.empty
+                   and pd.to_numeric(atl["size_filled"], errors="coerce").fillna(0).sum() > 0)
+    if err is not None:
+        emit()
+        emit("   *** FILL-QUALITY CHECK COULD NOT RUN -- LOUD FLAG, LEAD THE REVIEW WITH "
+             "THIS ***")
+        emit(f"   *** BOTH execution tables failed after {SR_FILL_RETRIES} attempts "
+             f"{SR_FILL_RETRY_WAIT_S}s apart: {err} ***")
+        emit("   *** Per Zach (8/25/26): access needs to be updated -- he will talk to "
+             "SpiderRock. Do not infer fill quality from anything else. ***")
+        return
+    if any("FAILED" in n for n in notes):
+        emit()
+        emit("   *** ONE BOOK'S EXECUTION TABLE WAS UNREADABLE (see the source lines above) "
+             "-- the fill-quality check below covers only the book that loaded. Flag this in "
+             "the review; access may need updating. ***")
+    if fills.empty:
+        if algo_filled:
+            emit()
+            emit("   *** TABLE REACHABLE BUT EMPTY on a day algo_trade_log shows option "
+                 "fills -- LOUD FLAG, LEAD THE REVIEW WITH THIS. This is what a completed "
+                 "v8 migration looks like if the v7 srtrade_agm mirror stops populating. "
+                 "Access needs updating; Zach will talk to SpiderRock. ***")
+        else:
+            emit("   no option fills on this date; nothing to check.")
+        return
+
+    # Scope (correction #3): only the run_algos.sh book. Algo accounts are EOD*/A.3*/ICON*
+    # plus the stock scripts' DDD/CCC. Discretionary accounts (RV.SS, RATIO.CAL, DISC, WWW,
+    # ...) and T.* test accounts are out of scope. Rows with secKey_xx == 0 are equity legs,
+    # not options -- excluded from this option fill-quality check.
+    acct = fills["accnt"].astype(str)
+    is_algo = acct.str.match(r"^(EOD|ICON|A\.3|DDD_|CCC_)")
+    is_test = acct.str.startswith("T.")
+    prod = fills[is_algo & ~is_test & (fills["secKey_xx"] > 0)].copy()
+    prod["flag"] = prod.apply(_classify_fill, axis=1)
+    n_excl = len(fills) - len(prod)
+    if prod.empty:
+        if algo_filled:
+            emit()
+            emit("   *** TABLE REACHABLE BUT NO ALGO OPTION FILLS on a day algo_trade_log "
+                 "shows fills -- LOUD FLAG, LEAD THE REVIEW WITH THIS. Access or account "
+                 "scope needs updating; Zach will talk to SpiderRock. ***")
+        else:
+            emit("   no algo option fills on this date; nothing to check.")
+        return
+
+    emit()
+    emit(f"   {len(prod)} algo option fills ({int(prod.fillQuantity.sum())} lots) across "
+         f"{prod.accnt.nunique()} accounts; {n_excl} rows excluded "
+         "(test accounts, non-algo book, equity legs).")
+    emit()
+    emit(f"   {'accnt':<14}{'leg':<10}{'side':<6}{'lots':>6}{'vwap':>8}"
+         f"{'fillBid rng':>13}{'fillAsk rng':>13}{'maxSpr':>8}{'flags':>7}")
+    emit("   " + "-" * 88)
+    grp = prod.groupby(["accnt", "secKey_tk", "secKey_xx", "secKey_cp", "orderSide"])
+    for (acct, tk, xx, cp, side), g in sorted(grp, key=lambda kv: -kv[1].fillQuantity.sum()):
+        vwap = (g.fillPrice * g.fillQuantity).sum() / g.fillQuantity.sum()
+        nflag = int((g.flag != "").sum())
+        emit(f"   {acct:<14}{f'{xx:.0f}{cp[0]}':<10}{side:<6}{g.fillQuantity.sum():>6.0f}"
+             f"{vwap:>8.3f}{f'{g.fillBid.min():.2f}-{g.fillBid.max():.2f}':>13}"
+             f"{f'{g.fillAsk.min():.2f}-{g.fillAsk.max():.2f}':>13}"
+             f"{(g.fillAsk - g.fillBid).max():>8.2f}"
+             f"{nflag if nflag else '-':>7}")
+
+    flagged = prod[prod.flag != ""]
+    if len(flagged):
+        sub("FLAGGED FILLS -- report these (when in doubt, alert)")
+        for _, r in flagged.sort_values("fillQuantity", ascending=False).iterrows():
+            emit(f"   {r['flag']:<14}{r['accnt']:<14}"
+                 f"{r['secKey_xx']:.0f}{r['secKey_cp'][0]} {r['orderSide']:<5}"
+                 f"{r['fillQuantity']:.0f}x at {r['fillPrice']:.2f} on "
+                 f"fillBid {r['fillBid']:.2f} / fillAsk {r['fillAsk']:.2f} "
+                 f"({r['fillTransactDttm']} CT, {r['fillExch']}, {r['fillExecId']})")
+    else:
+        emit()
+        emit("   No fill flagged: every prod fill sat inside its fill-time quote and no "
+             "near-bad-side fill had a wide spread.")
+
+
+def section_v7_v8_spx(log_facts, review_date):
+    """v7 vs v8 SPX (SR uPrc) at the trade snap, for the 350 and 355 books.
+
+    Standing check Zach asked for on 2026-08-21, active through V8_PARALLEL_RUN_ENDS. It
+    exists because the two books read different quote tables (v7 msgoptionimpliedquote, v8
+    msgliveimpliedquoteadj) and land on different SPX at their snaps -- 8/21 355: v7 7675.19
+    at 15:55:01.269 vs v8 7676.91 at 15:55:01.444. On a $5 strike grid a ~1pt difference can
+    flip a knife-edge strike selection, which is how the CLOSER picked 7675 on v7 and 7680 on
+    v8 that day. Open question is whether it is the 0.1s+ gate delay or a table bias.
+    """
+    if review_date > V8_PARALLEL_RUN_ENDS:
+        return
+    hdr("V7 vs V8 SPX AT THE TRADE SNAP")
+    emit(f"   Standing check through {V8_PARALLEL_RUN_ENDS} (the overlapped v7/v8 run). "
+         "Retire this section after that date.")
+    pairs = [("350pm_script", "350pm_script_v8", "350PM"),
+             ("355pm_script", "355pm_script_v8", "355PM")]
+    any_pair = False
+    for v7_stem, v8_stem, label in pairs:
+        f7, f8 = log_facts.get(v7_stem), log_facts.get(v8_stem)
+        if not f7 or not f8:
+            emit(f"   {label}: no v7/v8 pair of logs for this date "
+                 f"({'v7 missing' if not f7 else 'v8 missing'}) -- cannot compare.")
+            continue
+        if f7["spx"] is None or f8["spx"] is None:
+            emit(f"   {label}: SPX not parsed from "
+                 f"{'v7' if f7['spx'] is None else 'v8'} log -- cannot compare.")
+            continue
+        any_pair = True
+        d = f8["spx"] - f7["spx"]
+        bps = d / f7["spx"] * 1e4
+        t7 = f7["spx_ts"].strftime("%H:%M:%S.%f")[:-3] if f7["spx_ts"] else "?"
+        t8 = f8["spx_ts"].strftime("%H:%M:%S.%f")[:-3] if f8["spx_ts"] else "?"
+        lag_ms = ""
+        if f7["spx_ts"] and f8["spx_ts"]:
+            lag_ms = f"{(secs(f8['spx_ts']) - secs(f7['spx_ts'])) * 1000:+.0f}ms"
+        emit()
+        emit(f"   {label}")
+        emit(f"      v7  SPX {f7['spx']:>10,.2f}  snapped {t7}")
+        emit(f"      v8  SPX {f8['spx']:>10,.2f}  snapped {t8}   (v8 snap {lag_ms})")
+        flag = ("*** FLAG -- at or above the "
+                f"{SPX_DIFF_WARN_PTS:.2f}pt bar that can flip a $5 strike ***"
+                if abs(d) >= SPX_DIFF_WARN_PTS else "under the flag bar")
+        emit(f"      diff v8-v7 {d:+.2f} pts ({bps:+.2f} bps)   {flag}")
+    if any_pair:
+        emit()
+        emit("   To tell a table bias from the gate delay: if the two snaps are within a few "
+             "hundred ms and SPX still differs by ~1pt+, that is a DATA difference between "
+             "the two quote tables, not latency. Report which, and say whether it changed a "
+             "strike selection on the day (compare the strikes in the FILLS BY WAVE table).")
+
+
+def section_sprc(log_facts):
+    hdr("SPRC vs NBBO (fill-quality diagnostics)")
+    any_flag = False
+    for stem, f in log_facts.items():
+        if not f["quotes"]:
+            continue
+        sub(stem)
+        # Algos that sold the same strikes see identical quotes; collapse them onto one
+        # row so the interesting numbers are not buried in repetition.
+        rows = {}
+        for q in f["quotes"]:
+            if "net_sprc" not in q:
+                continue
+            key = (q["wave"], q["legs"][0]["strike"], q["legs"][1]["strike"],
+                   q["net_sprc"], q["net_cross"])
+            rows.setdefault(key, {"q": q, "algos": []})["algos"].append(
+                short_algo(q["algo"]))
+        emit(f"   {'wave':<5}{'legs':<14}{'net sprc':>9}{'net cross':>10}"
+             f"{'net mid':>9}{'sprc-cross':>11}  algos")
+        for key, v in rows.items():
+            q = v["q"]
+            legs = f"{q['legs'][0]['strike']:.0f}/{q['legs'][1]['strike']:.0f}" \
+                   f"{q['legs'][0]['cp']}"
+            emit(f"   {q['wave']:<5}{legs:<14}{q['net_sprc']:>9.3f}"
+                 f"{q['net_cross']:>10.3f}{q['net_mid']:>9.3f}"
+                 f"{q['sprc_minus_cross']:>11.3f}  "
+                 f"{', '.join(sorted(set(v['algos'])))}")
+        if f["sprc_outside_nbbo"]:
+            any_flag = True
+            emit("   *** legs where the SR surface price sat OUTSIDE its own NBBO ***")
+            seen = {}
+            for o in f["sprc_outside_nbbo"]:
+                key = (o["wave"], o["leg"], o["sprc"], o["nbbo"], o["is_short_leg"])
+                seen.setdefault(key, []).append(short_algo(o["algo"]))
+            for (wave, leg, sprc, nbbo, is_short), algos in seen.items():
+                match = next(x for x in f["sprc_outside_nbbo"]
+                             if (x["wave"], x["leg"], x["sprc"], x["nbbo"],
+                                 x["is_short_leg"]) == (wave, leg, sprc, nbbo, is_short))
+                role = "SHORT leg" if is_short else "long leg"
+                emit(f"     {wave} {leg:<8} {role:<10} sprc={sprc:.3f} nbbo={nbbo} "
+                     f"{match['side']} by {abs(match['outside_by']):.3f}   "
+                     f"({', '.join(sorted(set(algos)))[:60]})")
+    if not any_flag:
+        emit()
+        emit("   No leg had sprc outside its NBBO on any wave.")
+    emit()
+    emit("   Note: prod wave limits are surface-anchored (sprc minus edge), so a large "
+         "positive sprc-cross means the limit is priced off a surface the book is not "
+         "showing -- the documented wave-1 no-fill mechanism "
+         "(eod_option_algos/README.md, 'sprc-vs-cross divergence as a wave-1 fill signal').")
+
+
+def section_slowness(log_facts):
+    hdr("SLOWNESS / DATA-PULL LATENCY")
+    for stem, f in sorted(log_facts.items()):
+        n_q = len(f["queries"])
+        span = "no timestamped lines"
+        if f["first_ts"] and f["last_ts"]:
+            span = (f"{f['first_ts'].strftime('%H:%M:%S')}-"
+                    f"{f['last_ts'].strftime('%H:%M:%S')}")
+        sub(f"{stem}  ({span}, {n_q} queries, {f['bytes']:,} bytes)")
+        if f["wait_source"]:
+            emit(f"   scheduled-wait times parsed from {f['wait_source']} "
+                 f"({len(f['wait_marks'])} marks)")
+        else:
+            emit("   *** no prod script found for this log -- scheduled-wait times fall "
+                 "back to the hardcoded list, so a designed wait may show as UNEXPLAINED "
+                 "and a real gap may be wrongly suppressed ***")
+        if n_q:
+            qs = sorted(f["queries"])
+            emit(f"   run_query TOTAL: median {qs[len(qs)//2]:.1f}ms  "
+                 f"max {qs[-1]:.1f}ms")
+        if f["slow_queries"]:
+            emit(f"   queries over {QUERY_WARN_MS:.0f}ms:")
+            for q in f["slow_queries"][:10]:
+                emit(f"     {q}")
+        if f["fresh_conns"]:
+            emit(f"   fresh-connection cost over {CONN_WARN_MS:.0f}ms "
+                 "(pool miss -- expected on the first query of a phase):")
+            for q in f["fresh_conns"][:6]:
+                emit(f"     {q}")
+        slow_retries = [r for r in f["retries"] if r["attempt"] >= RETRY_WARN]
+        if slow_retries:
+            emit("   poll retries at or past the warn threshold:")
+            for r in slow_retries[:8]:
+                emit(f"     {r['fn']} attempt {r['attempt']}/{r['of']} "
+                     f"{'(got value)' if r['got'] else '(still empty)'}")
+        elif f["retries"]:
+            got = [r for r in f["retries"] if r["got"]]
+            if got:
+                emit("   poll retries: " + ", ".join(
+                    f"{r['fn']} on attempt {r['attempt']}/{r['of']}" for r in got[:4]))
+        unscheduled = [g for g in f["gaps"] if not g["likely_scheduled"]]
+        scheduled = [g for g in f["gaps"] if g["likely_scheduled"]]
+        if unscheduled:
+            emit(f"   UNEXPLAINED timestamp gaps over {GAP_WARN_S:.0f}s:")
+            for g in sorted(unscheduled, key=lambda x: -x["gap_s"])[:8]:
+                emit(f"     {g['gap_s']:>6.2f}s  {g['after']} -> {g['before']}")
+                emit(f"             after : {g['prev_line']}")
+                emit(f"             before: {g['next_line']}")
+        else:
+            emit("   no unexplained timestamp gaps")
+        if scheduled:
+            emit(f"   ({len(scheduled)} gaps look like scheduled waits: "
+                 + ", ".join(f"{g['gap_s']:.0f}s" for g in
+                             sorted(scheduled, key=lambda x: -x["gap_s"])[:6]) + ")")
+
+
+def read_hacker_prod_policy():
+    """(HACK_MAX_PRICE, TARGET_NAMES) from prod hacker_trades.py by regex -- text read only,
+    never imported (it pulls SpiderRock deps). (None, []) if unreadable."""
+    path = os.path.join(ALGOS_DIR, "hacker_trades.py")
+    cap, names = None, []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            src = f.read()
+    except OSError:
+        return cap, names
+    m = re.search(r"^HACK_MAX_PRICE\s*=\s*([\d.]+)", src, re.M)
+    if m:
+        cap = float(m.group(1))
+    m = re.search(r"^TARGET_NAMES\s*=\s*\((.*?)^\)", src, re.M | re.S)
+    if m:
+        names = re.findall(r'"([A-Z0-9_]+)"', m.group(1))
+    return cap, names
+
+
+def _hack_label(algo_name):
+    """Prod algo name -> hacker-backtest sheet label. HACK_ALGO_42_350PM_SPREAD_SALES_SPX_
+    IMBAL_GROWS_CLOSER -> 'IMBAL_GROWS CLOSER'; ..._BUMPED -> '... BUMP'; base -> 'BASE'."""
+    s = str(algo_name)
+    if s.startswith(HACK_PREFIX):
+        s = s[len(HACK_PREFIX):]
+    s = s.split("SPREAD_SALES_SPX")[-1].lstrip("_")
+    if not s:
+        return "BASE"
+    for suf, rep in (("_CLOSER", " CLOSER"), ("_BUMPED", " BUMP")):
+        if s.endswith(suf):
+            s = s[: -len(suf)] + rep
+    return s
+
+
+def _label_config(label):
+    """Inverse of _hack_label: sheet label -> prod parent config name."""
+    base = "ALGO_42_350PM_SPREAD_SALES_SPX"
+    s = str(label).replace(" CLOSER", "_CLOSER").replace(" BUMP", "_BUMPED")
+    return base if s == "BASE" else f"{base}_{s}"
+
+
+def _cp1(v):
+    return str(v).strip()[:1].upper()
+
+
+def _hacker_block(stem, atl, hacker_rows, cap, scope):
+    """Per-script hacker line for 355pm_script / 355pm_script_v8. Prints ONLY when prod has a
+    HACK_ row for this script or the backtest attempted a hack on the review date; quiet
+    days print nothing. Flags only the four real discrepancies (trigger outside the
+    0.9-1.1B buffer, cap violation, size relation, attempted-but-unfilled when the model
+    filled); price/timing, half-of-model vs half-of-filled sizing, v8 ratio sizing and
+    unfilled-parent differences are by design and are named as such, not flagged."""
+    script = {"355pm_script": "355PM", "355pm_script_v8": "355PM_V8"}.get(stem)
+    if script is None:
+        return
+    parent_script = {"355PM": "350PM", "355PM_V8": "350PM_V8"}[script]
+    prod = pd.DataFrame()
+    parents = pd.DataFrame()
+    if not atl.empty:
+        is_hack = atl["algo_name"].astype(str).str.startswith(HACK_PREFIX)
+        prod = atl[(atl["script_name"] == script) & is_hack]
+        parents = atl[(atl["script_name"] == parent_script) & ~is_hack]
+    bt_att = [r for r in hacker_rows if bool(r.get("attempted_hacked"))]
+    if prod.empty and not bt_att:
+        return
+
+    cap_s = f"${cap:.2f}" if cap else "UNKNOWN (hacker_trades.py unreadable)"
+    emit(f"   355 HACKER -- prod vs hacker backtest (prod cap {cap_s}, half-size unwind):")
+
+    def parent_filled(cfg, cp):
+        if parents.empty:
+            return None
+        pr = parents[(parents["algo_name"].astype(str) == cfg)
+                     & (parents["cp"].astype(str).str[:1].str.upper() == _cp1(cp))]
+        if pr.empty or pd.isna(pr.iloc[0]["size_filled"]):
+            return None
+        return int(pr.iloc[0]["size_filled"])
+
+    def bt_match(label, cp, strikes=None):
+        out = []
+        for r in hacker_rows:
+            if r["strategy"] != label or _cp1(r["cp"]) != _cp1(cp):
+                continue
+            if strikes and {_f(r["sh_strike"]), _f(r["lg_strike"])} != strikes:
+                continue
+            out.append(r)
+        return out
+
+    def bt_line(b, indent="       "):
+        imb = _f(b.get("imbal_355"))
+        imb_s = "-" if imb is None else f"{imb / 1e9:+.2f}B"
+        cost = _f(b.get("hack_exit_cost"))
+        cost_s = "-" if cost is None else f"{cost:.2f}"
+        t = b.get("hack_exit_time")
+        t_s = "-" if t is None or (isinstance(t, float) and pd.isna(t)) else str(t)
+        emit(f"{indent}backtest {b['strategy']} {b['cp']} {_f(b['sh_strike']):.0f}/"
+             f"{_f(b['lg_strike']):.0f}: size {int(b['size'])}, hack_size "
+             f"{int(b['hack_size'])}, imbal_355 {imb_s}, triggered={bool(b['hack_triggered'])}, "
+             f"attempted={bool(b['attempted_hacked'])}, filled={bool(b['hack_filled'])}, "
+             f"model exit {cost_s} @ {t_s}, "
+             f"delta_pnl {_f(b.get('delta_pnl')) or 0:,.0f}")
+
+    def in_buffer(b):
+        imb = _f(b.get("imbal_355"))
+        return imb is not None and HACK_IMBAL_BUFFER[0] <= abs(imb) <= HACK_IMBAL_BUFFER[1]
+
+    flags = []
+    seen = set()
+    for _, r in prod.iterrows():
+        label, cp = _hack_label(r["algo_name"]), str(r["cp"])
+        seen.add((label, _cp1(cp)))
+        att = int(r["size_attempted"])
+        filled = 0 if pd.isna(r["size_filled"]) else int(r["size_filled"])
+        w1 = 0 if pd.isna(r["wave1_filled_qty"]) else int(r["wave1_filled_qty"])
+        w2 = 0 if pd.isna(r["wave2_filled_qty"]) else int(r["wave2_filled_qty"])
+        w3 = max(0, filled - w1 - w2)   # no wave-3 column exists; the re-log lands here
+        avg = _f(r["avg_fill_price"])
+        avg = None if avg is None else abs(avg)
+        lim = lambda v: "-" if _f(v) is None else f"{abs(_f(v)):.2f}"
+        strikes = {_f(r["short_strike"]), _f(r["long_strike"])}
+        lo, hi = sorted(strikes)
+        cfg = str(r["algo_name"])[len(HACK_PREFIX):]
+        pf = parent_filled(cfg, cp)
+        want = None if pf is None else pf // 2
+        emit(f"     prod {label} {cp} {lo:.0f}/{hi:.0f}: sent {att}, filled {filled} "
+             f"(W1 {w1}, W2 {w2}, W3 {w3}), avg debit "
+             f"{'-' if avg is None else f'{avg:.2f}'}, W1lim {lim(r['wave1_limit'])} "
+             f"W2lim {lim(r['wave2_limit'])}; parent {parent_script} filled "
+             f"{'-' if pf is None else pf} -> floor(half) = {'-' if want is None else want}")
+        if avg is not None and cap and avg > cap + 1e-9:
+            flags.append(f"CAP VIOLATION: {script} {label} {cp} avg debit {avg:.2f} > "
+                         f"prod cap {cap:.2f}")
+        if pf is None:
+            flags.append(f"SIZE RELATION UNCHECKED: no {parent_script} algo_trade_log row "
+                         f"for {cfg} {cp}")
+        elif att != want:
+            flags.append(f"SIZE RELATION: {script} {label} {cp} sent {att} but "
+                         f"floor(parent filled {pf} / 2) = {want}")
+        matches = bt_match(label, cp, strikes) or bt_match(label, cp)
+        if not matches:
+            emit(f"       backtest: no {label} {cp} leg modeled on this date")
+            continue
+        b = matches[0]
+        bt_line(b)
+        if not bool(b["hack_triggered"]) and not in_buffer(b):
+            imb = _f(b.get("imbal_355"))
+            flags.append(f"TRIGGER MISMATCH: prod hacked {label} {cp} but backtest "
+                         f"hack_triggered=False at imbal_355 {imb / 1e9:+.2f}B (outside the "
+                         "0.9-1.1B buffer)")
+        if att > 0 and filled == 0 and bool(b["hack_filled"]):
+            cost = _f(b.get("hack_exit_cost"))
+            flags.append(f"*** POSSIBLE WAVE-3 MALFUNCTION: prod {script} {label} {cp} sent "
+                         f"{att}, filled 0, but the backtest says the cross was at/under the "
+                         f"cap (model exit {cost:.2f} @ {b.get('hack_exit_time')}). "
+                         "THIS SHOULD BE REVIEWED. ***")
+
+    for b in bt_att:
+        key = (b["strategy"], _cp1(b["cp"]))
+        if key in seen:
+            continue
+        cfg = _label_config(b["strategy"])
+        emit(f"     backtest-only: attempted hack with no {script} HACK_ row")
+        bt_line(b)
+        pf = parent_filled(cfg, b["cp"])
+        if scope and cfg not in scope:
+            emit(f"       {cfg} is not in prod hacker scope (hacker_trades.TARGET_NAMES) "
+                 "-- expected")
+        elif pf is None or pf == 0:
+            emit(f"       parent {cfg} {b['cp']} had no {parent_script} fill -- expected "
+                 "(prod hacks filled legs only; the backtest assumes every modeled leg "
+                 "filled at 3:50)")
+        elif pf // 2 < 1:
+            emit(f"       parent filled {pf} -> half-size 0, 1-lot skip -- expected")
+        elif in_buffer(b):
+            emit("       imbal_355 inside the 0.9-1.1B buffer -- live 950M vs T+1 1B "
+                 "threshold difference, expected")
+        else:
+            imb = _f(b.get("imbal_355"))
+            flags.append(f"TRIGGER MISMATCH: backtest hacked {b['strategy']} {b['cp']} "
+                         f"(imbal_355 {imb / 1e9:+.2f}B) but prod {script} did not; parent "
+                         f"{parent_script} filled {pf}")
+
+    if flags:
+        emit("   HACKER FLAGS (real discrepancies):")
+        for line in flags:
+            emit(f"     {line}")
+    else:
+        emit("   no real hacker discrepancy (fill price/timing, half-of-model vs "
+             "half-of-filled sizing, v8 ratio sizing and threshold-buffer differences are "
+             "by design)")
+
+
+def section_scripts(log_facts, review_date, atl, hacker_rows=None):
+    hdr("PER-SCRIPT INVENTORY AND FINDINGS")
+    hacker_rows = hacker_rows or []
+    hack_cap, hack_scope = read_hacker_prod_policy()
+    traded_scripts, sent_sizes = set(), {}
+    if not atl.empty:
+        traded_scripts = {_script_key(s) for s in atl["script_name"].unique()}
+        # (log stem, algo name) -> [(cp, size actually sent), ...]. The banner size upstream
+        # is pre-resize; this is what went to SR.
+        for _, r in atl.iterrows():
+            key = (_script_key(r["script_name"]), str(r["algo_name"]))
+            sent_sizes.setdefault(key, []).append(
+                (str(r["cp"]), int(r["size_attempted"])))
+
+    present = sorted(log_facts.keys())
+    missing = [s for s in EXPECTED_SCRIPTS if s not in present]
+    extra = [s for s in present if s not in EXPECTED_SCRIPTS]
+    emit(f"   logs found ({len(present)}): {', '.join(present)}")
+    if extra:
+        emit(f"   not in run_algos.sh (launched by hand?): {', '.join(extra)}")
+    if missing:
+        emit(f"   *** EXPECTED BUT NO LOG: {', '.join(missing)} -- "
+             "either the script was intentionally not launched or it never started ***")
+
+    for stem in present:
+        f = log_facts[stem]
+        depth = "DEEP" if stem in DEEP_SCRIPTS else "brief"
+        sub(f"{stem}  [{depth}]")
+        if f["traded"]:
+            emit(f"   prep_trades fired {len(f['traded'])} order(s). NOTE: the size on the")
+            emit("   ALGO TRADED banner is PRE-RESIZE (before the CLOSER offset and before")
+            emit("   the loss cap). NEVER use it as a fill denominator -- the sent size is")
+            emit("   size_attempted in FILLS BY WAVE. Both are shown below.")
+            for t in f["traded"]:
+                e = t["edges"]
+                sent = sent_sizes.get((stem, t["algo"]))
+                sent_s = ("  -> SENT " + "/".join(f"{cp} {n}" for cp, n in sent)
+                          if sent else "  -> no algo_trade_log row")
+                if e:
+                    emit(f"     {t['algo']} {t['structure']} price={e['price']} "
+                         f"size(pre-resize)={e['size']}{sent_s}")
+                    emit(f"        ET1={e['et1']} ME1={e['me1']} "
+                         f"ET2={e['et2']} ME2={e['me2']}")
+                else:
+                    emit(f"     {t['algo']} {t['structure']}{sent_s}")
+        elif stem in traded_scripts:
+            emit("   traded (algo_trade_log has rows) but no ALGO TRADED banner parsed")
+        else:
+            emit("   no ALGO TRADED banner (this script family does not print one; "
+                 "see ORDER ACTIVITY below)")
+        if f["orders"]:
+            emit("   order activity / skip reasons:")
+            for o in f["orders"][:22]:
+                emit(f"     {o}")
+        if f["clamps"]:
+            emit(f"   min_price clamps ({len(f['clamps'])} distinct): "
+                 + "; ".join(f["clamps"][:6]))
+        if f["underfill"]:
+            emit("   wave-1 underfill handling:")
+            emit("   NOTE: the 'WAVE1 UNDERFILL [side]: x/y' figure is a SIDE-LEVEL total "
+                 "across EVERY order on that side, not one algo. Never quote it against a "
+                 "single strategy -- use size_attempted / wave1_filled_qty from FILLS BY "
+                 "WAVE for per-algo numbers.")
+            side_totals = {}
+            for (s, algo), rows in sent_sizes.items():
+                if s != stem:
+                    continue
+                for cp, n in rows:
+                    side_totals.setdefault(cp, []).append((short_algo(algo), n))
+            for cp, parts in side_totals.items():
+                tot = sum(n for _, n in parts)
+                emit(f"     side {cp} sent {tot} = "
+                     + " + ".join(f"{a} {n}" for a, n in parts))
+            for u in f["underfill"][:8]:
+                emit(f"     {u}")
+        if f["premium_addon"]:
+            emit("   premium add-on applied:")
+            for p in f["premium_addon"][:8]:
+                emit(f"     {p}")
+        _hacker_block(stem, atl, hacker_rows, hack_cap, hack_scope)
+        if f["losscap"]:
+            emit("   loss cap:")
+            for l in f["losscap"][:8]:
+                emit(f"     {l}")
+        if f["notable"]:
+            emit("   month-end / MOC lines:")
+            for n in f["notable"][:6]:
+                emit(f"     {n}")
+        if f["errors"]:
+            emit(f"   *** ERROR-LIKE LINES ({len(f['errors'])}) -- read these ***")
+            for e in f["errors"][:12]:
+                emit(f"     {e}")
+        else:
+            emit("   no error-like lines")
+        emit(f"   last log line: {f['last_line']}")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("date", nargs="?", help="trade date to review (YYYY-MM-DD)")
+    ap.add_argument("--regen", action="store_true",
+                    help="attempt to rebuild stale/missing backtest workbooks")
+    args = ap.parse_args()
+
+    today = dt.date.today()
+    if args.date:
+        review_date = dt.date.fromisoformat(args.date)
+    else:
+        review_date = prior_trading_day(today)
+
+    statuses = [workbook_status(spec, review_date, today) for spec in BACKTEST_SOURCES]
+    regen_info = None
+    if args.regen:
+        stale = [spec for spec, st in zip(BACKTEST_SOURCES, statuses)
+                 if not st["fresh"]]
+        if stale:
+            print(f"Regenerating {len(stale)} stale workbook(s)...", flush=True)
+            regen_info = attempt_regen(stale, today)
+            statuses = [workbook_status(spec, review_date, today)
+                        for spec in BACKTEST_SOURCES]
+        else:
+            regen_info = {"log": ["", "-- REGEN ATTEMPT",
+                                  "   all workbooks already fresh -- "
+                                  "nothing to regenerate"]}
+
+    # Logs for the review date.
+    log_facts = {}
+    for path in sorted(glob.glob(os.path.join(LOG_DIR, f"{review_date}_*.txt"))):
+        stem = os.path.basename(path)[len(str(review_date)) + 1: -4]
+        log_facts[stem] = parse_log(path, stem)
+
+    load_notes = []
+    try:
+        atl = load_algo_trade_log(review_date)
+    except Exception as e:
+        atl = pd.DataFrame()
+        load_notes.append(f"   *** algo_trade_log query FAILED: "
+                          f"{type(e).__name__}: {e} ***")
+    try:
+        prod_df = load_prod_pnl()
+    except Exception as e:
+        prod_df = pd.DataFrame(columns=["trade_date", "strategy", "pnl", "notes"])
+        load_notes.append(f"   *** PNL LOG NEW.xlsx read FAILED: "
+                          f"{type(e).__name__}: {e} ***")
+
+    section_inputs(review_date, today, statuses, regen_info, load_notes)
+    if not prod_df.empty:
+        section_prod_pnl(prod_df, review_date, statuses)
+        section_reconciliation(prod_df, review_date, statuses, atl)
+        section_streaks(prod_df, review_date)
+    else:
+        hdr("PROD PNL vs BACKTEST PNL")
+        emit("   PNL LOG NEW.xlsx unreadable -- prod PnL unavailable this run.")
+    section_market_state(log_facts, review_date)
+    section_rebal_veto(review_date, atl)
+    section_fills(atl, review_date, log_facts)
+    section_fill_quality(review_date, atl)
+    section_v7_v8_spx(log_facts, review_date)
+    section_sprc(log_facts)
+    section_slowness(log_facts)
+    hacker_rows = next((s["hacker_rows"] for s in statuses if s["key"] == "hacker"), [])
+    section_scripts(log_facts, review_date, atl, hacker_rows)
+
+    hdr("END OF DIGEST")
+    emit("Cleaned logs sit alongside this file as <script>_clean.txt. Read the cleaned "
+         "log for every script that traded, plus any script flagged above.")
+
+    out_dir = os.path.join(PACK_ROOT, review_date.strftime("%Y_%m_%d"))
+    os.makedirs(out_dir, exist_ok=True)
+    digest_path = os.path.join(out_dir, "digest.txt")
+    with open(digest_path, "w", encoding="ascii", errors="replace", newline="") as f:
+        f.write("\r\n".join(OUT) + "\r\n")
+    for stem, facts in log_facts.items():
+        with open(os.path.join(out_dir, f"{stem}_clean.txt"), "w",
+                  encoding="ascii", errors="replace", newline="") as f:
+            f.write(clean_log_text(facts["raw"]))
+
+    print(f"Pack written: {out_dir}")
+    print(f"  digest.txt ({os.path.getsize(digest_path):,} bytes)")
+    for stem in sorted(log_facts):
+        p = os.path.join(out_dir, f"{stem}_clean.txt")
+        print(f"  {stem}_clean.txt ({os.path.getsize(p):,} bytes)")
+    bad = [s["label"] for s in statuses if not s["fresh"]]
+    if bad:
+        print(f"STALE OR MISSING INPUTS: {', '.join(bad)}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(2)

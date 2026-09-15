@@ -1,0 +1,147 @@
+"""
+Large index flows -- step 2b: 0DTE strangle backtest on the effective date.
+
+Trade (Zach 9/10/26): at 15:00 buy the 0DTE call and put that are each OTM by at
+least OTM_BPS (120 bps) vs the 15:00 spot. Hold to expiry; payoff = intrinsic at
+the Bloomberg PX_LAST close.
+
+Pricing:
+  * fill = bid + SPREAD_PAID (70%) x (ask - bid), per 1-sec quote
+  * entry price = median fill over ENTRY_START..ENTRY_END (15:00:00-15:00:10)
+  * cost / payoff / pnl reported per share and in bps of the 15:00 spot
+
+Data: intraday_prices.csv (15:00 spot + PX_LAST) and the 0DTE quotes cached in
+optionsResearch.t_opra_quotes by pull_0dte_quotes.py.
+
+Run from Git Bash:  python /d/agent_projects/large_index_flows/backtest_strangle.py
+"""
+import datetime as dt
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import vbam_helpers
+
+PROJ_DIR = 'D:/agent_projects/large_index_flows'
+PRICES_CSV = os.path.join(PROJ_DIR, 'intraday_prices.csv')
+TABLE = 't_opra_quotes'
+
+MIN_FLOW_BN = 7.0
+OTM_BPS = 120                    # each leg OTM by at least this vs the 15:00 spot
+SPREAD_PAID = 0.70               # pay 70% of the bid-ask spread when buying
+ENTRY_TIME = dt.time(15, 0, 0)   # spot reference + first entry quote
+ENTRY_WINDOW_SEC = 10            # median fill over [ENTRY_TIME, ENTRY_TIME + 10s]
+NOTIONAL_USD = 10_000_000        # $ of stock notional per event for the $ pnl column
+
+pd.set_option('display.width', 250)
+pd.set_option('display.max_columns', 40)
+
+
+def load_events(min_flow_bn=MIN_FLOW_BN):
+    """Events with est_flow_bn >= min_flow_bn: eff_date, symbol, direction, spot (15:00), close (PX_LAST)."""
+    ev = pd.read_csv(PRICES_CSV, parse_dates=['eff_date'])
+    ev = ev[ev['est_flow_bn'] >= min_flow_bn].copy()
+    ev['eff_date'] = ev['eff_date'].dt.date
+    ev = ev.rename(columns={'15:00': 'spot_1500', 'PX_LAST': 'close'})
+    return ev[['eff_date', 'symbol', 'direction', 'est_flow_bn', 'spot_1500', 'close']].reset_index(drop=True)
+
+
+def load_entry_quotes(eng, symbol, date, start, end):
+    """0DTE quotes for (symbol, date) with timestmp in [start, end]: strike, cp, timestmp, bidPrc, askPrc."""
+    q = pd.read_sql(text(f"""
+        SELECT strike, cp, timestmp, bidPrc, askPrc FROM {TABLE}
+        WHERE symbol = :s AND trade_date = :d AND exp = :d AND timestmp BETWEEN :t0 AND :t1"""),
+        eng, params={'s': symbol, 'd': date, 't0': start, 't1': end})
+    q['strike'] = q['strike'].astype(float)
+    q[['bidPrc', 'askPrc']] = q[['bidPrc', 'askPrc']].astype(float)
+    return q
+
+
+def median_fill(q, strike, cp, spread_paid=SPREAD_PAID):
+    """Median buy fill (bid + spread_paid x spread) over the window for one contract; NaN if no valid quotes.
+    A zero bid is a real no-bid market (fill = spread_paid x ask); only zero/crossed asks are dropped."""
+    sub = q[(q.strike == strike) & (q.cp == cp) & (q.askPrc > 0) & (q.askPrc >= q.bidPrc)]
+    if sub.empty:
+        return np.nan, 0
+    fills = sub.bidPrc + spread_paid * (sub.askPrc - sub.bidPrc)
+    return float(fills.median()), len(sub)
+
+
+def pick_strikes(strikes, spot, otm_bps=OTM_BPS):
+    """(call_strike, put_strike): nearest strikes at least otm_bps OTM vs spot; NaN if none."""
+    strikes = np.sort(np.unique(strikes))
+    calls = strikes[strikes >= spot * (1 + otm_bps / 1e4)]
+    puts = strikes[strikes <= spot * (1 - otm_bps / 1e4)]
+    return (calls[0] if len(calls) else np.nan), (puts[-1] if len(puts) else np.nan)
+
+
+def run_backtest(events, eng, otm_bps=OTM_BPS, spread_paid=SPREAD_PAID,
+                 entry_time=ENTRY_TIME, window_sec=ENTRY_WINDOW_SEC):
+    """One row per event: strikes, entry fills, cost/payoff/pnl per share and in bps of spot.
+    events: from load_events(); eng: dev engine; otm_bps: min OTM per leg; spread_paid: fraction of
+    spread paid; entry_time: entry snap; window_sec: seconds after entry_time for the median fill."""
+    end = (dt.datetime.combine(dt.date.today(), entry_time) + dt.timedelta(seconds=window_sec)).time()
+    rows = []
+    for ev in events.itertuples(index=False):
+        q = load_entry_quotes(eng, ev.symbol, ev.eff_date, entry_time, end)
+        if q.empty:
+            print(f"  {ev.eff_date} {ev.symbol}: no quotes in entry window", flush=True)
+            continue
+        k_call, k_put = pick_strikes(q.strike.values, ev.spot_1500, otm_bps)
+        call_px, n_c = median_fill(q, k_call, 'Call', spread_paid) if not np.isnan(k_call) else (np.nan, 0)
+        put_px, n_p = median_fill(q, k_put, 'Put', spread_paid) if not np.isnan(k_put) else (np.nan, 0)
+        cost = call_px + put_px
+        call_pay = max(ev.close - k_call, 0.0)
+        put_pay = max(k_put - ev.close, 0.0)
+        payoff = call_pay + put_pay
+        rows.append({
+            'eff_date': ev.eff_date, 'symbol': ev.symbol, 'direction': ev.direction,
+            'est_flow_bn': ev.est_flow_bn, 'spot_1500': ev.spot_1500, 'close': ev.close,
+            'move_bps': (ev.close / ev.spot_1500 - 1) * 1e4,
+            'call_strike': k_call, 'put_strike': k_put,
+            'call_otm_bps': (k_call / ev.spot_1500 - 1) * 1e4, 'put_otm_bps': (1 - k_put / ev.spot_1500) * 1e4,
+            'call_px': call_px, 'put_px': put_px, 'n_quotes': min(n_c, n_p),
+            'cost_bps': cost / ev.spot_1500 * 1e4,
+            'payoff_bps': payoff / ev.spot_1500 * 1e4,
+            'pnl_bps': (payoff - cost) / ev.spot_1500 * 1e4,
+            'pnl_usd_per_10mm': (payoff - cost) / ev.spot_1500 * NOTIONAL_USD,
+            'winner': 'call' if call_pay > 0 else ('put' if put_pay > 0 else 'none'),
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize(bt):
+    """Summary stats over events: cost, payoff, pnl (bps of spot), hit rate, Sharpe (raw mean/std)."""
+    pnl = bt['pnl_bps']
+    return pd.Series({
+        'n_events': len(bt),
+        'mean_cost_bps': bt['cost_bps'].mean(), 'median_cost_bps': bt['cost_bps'].median(),
+        'mean_payoff_bps': bt['payoff_bps'].mean(),
+        'mean_pnl_bps': pnl.mean(), 'median_pnl_bps': pnl.median(),
+        'total_pnl_bps': pnl.sum(),
+        'win_rate': (pnl > 0).mean(),
+        'sharpe_raw': pnl.mean() / pnl.std() if pnl.std() else np.nan,
+        'payoff_to_cost': bt['payoff_bps'].sum() / bt['cost_bps'].sum(),
+        'total_pnl_usd_per_10mm': bt['pnl_usd_per_10mm'].sum(),
+    })
+
+
+if __name__ == '__main__':
+    eng = create_engine(vbam_helpers.dev_connection_string, pool_pre_ping=True)
+    events = load_events()
+    print(f"{len(events)} events | buy call+put >= {OTM_BPS} bps OTM at {ENTRY_TIME}, "
+          f"median fill over {ENTRY_WINDOW_SEC}s, pay {SPREAD_PAID:.0%} of spread, hold to close", flush=True)
+    bt = run_backtest(events, eng)
+    cols = ['eff_date', 'symbol', 'direction', 'est_flow_bn', 'spot_1500', 'close', 'move_bps',
+            'call_strike', 'put_strike', 'call_px', 'put_px', 'cost_bps', 'payoff_bps', 'pnl_bps', 'winner']
+    print(bt[cols].to_string(index=False, float_format=lambda x: f'{x:,.2f}'))
+    print("\nSummary:")
+    print(summarize(bt).to_string(float_format=lambda x: f'{x:,.2f}'))
+    print("\nBy flow bucket:")
+    bt['bucket'] = np.where(bt['est_flow_bn'] >= 10, '>= $10B', '$7-10B')
+    by_bucket = pd.DataFrame({b: summarize(g) for b, g in bt.groupby('bucket')})
+    print(by_bucket.to_string(float_format=lambda x: f'{x:,.2f}'))

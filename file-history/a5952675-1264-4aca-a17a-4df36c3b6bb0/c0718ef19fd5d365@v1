@@ -1,0 +1,120 @@
+"""Global knobs shared across all algos. Imported via `from algo_globals import *`
+so future additions land in every config without per-file edits.
+
+SIZE_KNOB scales every dollar_target and max_size that uses scaled() (350PM configs + bumped layer).
+  1.0  -> no change (identical to pre-refactor behavior)
+  1.1  -> +10% across the board
+  0.9  -> -10% across the board
+
+SIZE_KNOB_355  is a separate dial for 355PM configs only (used via scaled_355).
+SIZE_KNOB_BTIC is a separate dial for BTIC configs only (used via scaled_btic).
+340PM configs are opted out of all knobs (raw values, no scaled wrapper).
+"""
+import math
+
+__all__ = [
+    "SIZE_KNOB", "SIZE_KNOB_355", "SIZE_KNOB_BTIC",
+    "scaled", "scaled_355", "scaled_btic",
+    "LAST_HOUR",
+    "MAX_LOSS_CAP", "MAX_LOSS_CAP_340", "MAX_LOSS_CAP_350", "MAX_LOSS_CAP_355",
+    "SHOCK_DOWN", "SHOCK_UP",
+    "SIZE_MULT_340_CALLS", "SIZE_MULT_340_PUTS",
+    "SIZE_MULT_350_CALLS", "SIZE_MULT_350_PUTS",
+    "SIZE_MULT_355_CALLS", "SIZE_MULT_355_PUTS",
+    "SIZE_MULT_BTIC_CALLS", "SIZE_MULT_BTIC_PUTS",
+    "get_live_size_mults",
+]
+
+SIZE_KNOB      = 2.6   # primary dial: 350PM configs + bumped layer. last resized 8/18
+SIZE_KNOB_355  = 8.9   # 355PM-only dial: independent of SIZE_KNOB. last resized 8/19
+SIZE_KNOB_BTIC = 1.0    # BTIC-only dial: independent of SIZE_KNOB and SIZE_KNOB_355. Start at 1.0 (no scaling).
+
+LAST_HOUR = 15   # canonical 3 PM ET hour for intraday wait_until calls. 4pm scripts override locally with LAST_HOUR+1.
+
+# Per-side $ loss caps. Two layers:
+#   MAX_LOSS_CAP_3xx: per-script cap on THIS script's new trades only (ignores prior scripts).
+#   MAX_LOSS_CAP:     GLOBAL ceiling -- (existing-from-prior + new) across ALL scripts must stay under.
+# Evaluated by shocking SPX to {SHOCK_DOWN, SHOCK_UP} and summing structural max loss across
+# today's logged 2-legged credit spreads (no premium netting on logged; credit netted on new).
+# Outrights are excluded. Consumed by position_logging_helper.apply_size_limits().
+MAX_LOSS_CAP_340 = 10_000     # USD; 340PM new trades only
+MAX_LOSS_CAP_350 = 380_000    # USD; 350PM new trades only
+MAX_LOSS_CAP_355 = 470_000    # USD; 355PM new trades only
+MAX_LOSS_CAP     = 710_000    # USD; global ceiling: existing + new across ALL scripts
+SHOCK_DOWN   = 0
+SHOCK_UP     = 99_999_999
+
+
+def _scale_with_knob(value, knob):
+    """Internal: scale a value by the given knob with sign preservation and a floor of 1 on magnitude.
+
+    Falsy values (False, None, 0) pass through unchanged so helpers.py truthiness checks keep working.
+    Negative values preserve sign; magnitude is floored at 1 so scaling-down never zeroes a max_size=1 config.
+    """
+    if not value:                                  # False, None, 0
+        return value
+    sign = 1 if value > 0 else -1
+    mag = max(1, math.floor(knob * abs(value)))
+    return sign * mag
+
+
+def scaled(value):
+    """Scale a dollar_target or max_size by SIZE_KNOB. See _scale_with_knob for semantics."""
+    return _scale_with_knob(value, SIZE_KNOB)
+
+
+def scaled_355(value):
+    """Scale a dollar_target or max_size by SIZE_KNOB_355 (independent 355PM dial)."""
+    return _scale_with_knob(value, SIZE_KNOB_355)
+
+
+def scaled_btic(value):
+    """Scale a dollar_target or max_size by SIZE_KNOB_BTIC (independent BTIC dial)."""
+    return _scale_with_knob(value, SIZE_KNOB_BTIC)
+
+
+# ==================== Per-side size mults (live-reloadable) ====================
+# Per-script per-side scale on spread-sale sizing. Applied inside prep_trades to
+# `dollar_target`, `size_target`, AND `max_size` so the entire sizing envelope scales
+# together. Composes MULTIPLICATIVELY with the existing SIZE_KNOB_* knobs and the
+# factor-driven size_mult bucket:
+#     final = base * SIZE_KNOB_* * size_mult_bucket * side_mult
+#
+# Applied ONLY to 2-legged credit-selling configs:
+#     - direction == "Sell"
+#     - AND both short_legs AND long_legs are present (spreads only, not outright shorts)
+# Debit spreads (direction == "Buy") and outright shorts are untouched.
+#
+# IMPORTANT: setting a mult to 0.0 does NOT fully kill a side -- prep_trades' `min_size`
+# floor (typically 1) still bumps put_size/call_size back up to min_size. To fully
+# disable a side, disable/remove the config; don't rely on 0.0 mult.
+#
+# LIVE-RELOAD: use get_live_size_mults(script_prefix) below. It reloads this module so
+# mid-run edits to this file take effect at the next call (typically right before
+# prep_trades runs in each caller script). Reload failure (e.g. mid-save syntax error)
+# falls back to the currently-loaded values -- never disrupts trading.
+SIZE_MULT_340_CALLS  = 1.0
+SIZE_MULT_340_PUTS   = 1.0
+SIZE_MULT_350_CALLS  = 1.0
+SIZE_MULT_350_PUTS   = 1.0 # used this on 7/2 and missed out on good pnl bc of it
+SIZE_MULT_355_CALLS  = 1.0
+SIZE_MULT_355_PUTS   = 1.0
+SIZE_MULT_BTIC_CALLS = 1.0
+SIZE_MULT_BTIC_PUTS  = 1.0
+
+
+def get_live_size_mults(script_prefix):
+    """Return (puts_mult, calls_mult) for the given script prefix ("340", "350", "355", "BTIC").
+    Reloads algo_globals so mid-run edits to this file take effect. Falls back to whatever
+    values were loaded before the failed reload, so a syntax error mid-save never disrupts
+    trading. Called right before prep_trades in each caller script."""
+    import importlib, sys
+    module = sys.modules[__name__]
+    try:
+        module = importlib.reload(module)
+    except Exception as e:
+        print(f"[algo_globals] get_live_size_mults reload failed ({e}); using in-memory values")
+    return (
+        getattr(module, f"SIZE_MULT_{script_prefix}_PUTS", 1.0),
+        getattr(module, f"SIZE_MULT_{script_prefix}_CALLS", 1.0),
+    )

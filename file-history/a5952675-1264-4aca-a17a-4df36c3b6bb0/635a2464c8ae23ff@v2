@@ -1,0 +1,15 @@
+import pandas as pd
+x = pd.ExcelFile('C:/Users/zdietz/Downloads/bumped_spread_backtest_20260910_0817.xlsx')
+for s in x.sheet_names:
+    if 'BUMP' not in s:
+        continue
+    df = pd.read_excel(x, s)
+    df['trade_date'] = pd.to_datetime(df['trade_date'])
+    r = df[df.trade_date == '2026-09-09']
+    if not r.empty:
+        print(s)
+        print(r.T)
+    # how often would the backtest double-bump: spot within $1 above a strike
+    if 'idx_at_trade' in df.columns:
+        frac = ((df.idx_at_trade % 5) < 1).mean()
+        print(f"  {s}: {frac:.0%} of {len(df)} traded days have spot within $1 above a strike (double-bump days)")

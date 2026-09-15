@@ -1,0 +1,1291 @@
+"""350pm_ss_script.py -- Single-stock 3:50 PM imbalance -> 0DTE Deep-ITM trade.
+
+Mirrors the timing/structure of D:/PycharmProjects/scratch/algos/350pm_script.py
+but for the 8-symbol single-stock universe. Strategy details and tuning live in
+configs_ss/ss_2_5pct_adv_350pm.py.
+
+Pipeline:
+    ~3:48      pull 3pm (15:00) prices for all 8 via blp.bdib intraday bars
+    3:50:00.5  snapshot 15:50 spot for all 8 via blp.bdp
+    3:50:01    pull SPX/NDX/SS imbals (bounded retries)
+    3:50:01.x  determine qualifying symbols (per-symbol ADV-weighted threshold)
+    3:50:01.x  ONE SQL against srtrade for option chains of qualifying symbols
+    3:50:02+   per-symbol: pick deep-ITM strike, compute size, build order
+    3:50:02+   asyncio.gather send_outright_two_waves for each qualifying name
+
+`send_outright_two_waves` is defined in this script (modeled on
+spdr_rock_order_functions.send_complex_two_waves but for outright single-leg).
+"""
+import asyncio
+import datetime as dt
+import math
+import sys
+import time
+from pathlib import Path
+from urllib.parse import quote_plus
+
+import pandas as pd
+from sqlalchemy import create_engine, sql
+
+sys.path.insert(1, "D:/PycharmProjects/utils")
+sys.path.insert(1, "D:/PycharmProjects/scratch/algos")
+
+# --- SpiderRock v8 migration toggle (per-script) --------------------------------------------
+# USE_V8=True -> DATA reads on v8 (the two chain/quote SQLs below read _srof.IMPLIED_QUOTE_TABLE
+# at call time). SEND_V8=True -> orders/cancels/fills on v8 too. This script builds its OWN
+# outright order INSERT + cancel INSERT (not the shared send path), so the v8 column/id shape
+# is gated inline where those SQLs are built. Stock legs (tradeSharesLOC/Limit) ride the
+# SEND_V8-gated stock module. When USE_V8, the v7-only .56 pin below is SKIPPED.
+USE_V8  = True
+SEND_V8 = True
+if USE_V8:
+    from spdr_rock_order_functions import use_v8 as _use_v8
+    _use_v8(True, send=SEND_V8)
+
+# ==================== SR host routing (v7 ONLY): run this script's queries against 198.102.4.56 ====================
+# See D:/agent_projects/eod_option_algos/sr_host_routing_findings.md. TEMPORARY until SRSE ships.
+# Skipped under USE_V8 -- v8 is a single host reached via use_v8's routing, so the .56 pin is moot there.
+#
+# Pin only in PROD: test runs stay on the default .63 so they never queue behind slow intraday
+# loop queries in testing. Temporary fix that will be removed in Sept.
+_TEST_MODE = "--test" in sys.argv
+if not USE_V8 and not _TEST_MODE:
+    import spdr_rock_functions as _srf
+    _srf.hostname = "198.102.4.56"
+    _srf.HOSTNAME = "198.102.4.56"
+    _defaults = list(_srf.run_query.__defaults__)
+    assert len(_defaults) == 7, f"run_query.__defaults__ has {len(_defaults)} elements; expected 7 (signature changed?)."
+    _defaults[2] = "198.102.4.56"   # position: (database, fetch, hostname, pool, verbose, t_await, tag)
+    _srf.run_query.__defaults__ = tuple(_defaults)
+    del _srf, _defaults
+# =========================================================================================================
+
+from calendar_utils import getNowEst, wait_until, x_days_ago, SERIALS
+from xbbg import blp
+
+from helpers import (NO_IMBAL_VAL, get_350_imbal, get_qqq_net_imbal,
+                     TEST_ACCOUNTS, is_month_end, likely_stale_calendars,
+                     LAST_HOUR, TIME_FORMAT, pretty_time, warm_up_bloomberg_connection)
+from spdr_rock_order_functions import run_query, counter, to_v8_id
+import spdr_rock_order_functions as _srof   # IMPLIED_QUOTE_TABLE read at call time
+import spdr_rock_functions as _srf_flags    # USING_V8/SEND_V8 flags read at call time
+from spdr_rock_stock_order_functions import tradeSharesLOC, tradeSharesLimit
+from google_chat_webhook import send_message, my_chat
+
+from configs_ss import ss_2_5pct_adv_350pm as CFG
+
+# ---- VBAM RDS connection (auctionResearch + EODStrategies live on this host) ----
+VBAM_HOSTNAME = "alpine-vbam-prod.c7wvpkbyvjzb.us-east-1.rds.amazonaws.com"
+VBAM_DATABASE = "EODStrategies"
+VBAM_USERNAME = "VBAM_Read"
+VBAM_PASSWORD = "read-VBAM-^6"
+
+# ============================================================================
+# TEST MODE
+# ============================================================================
+# IS_TEST=True   : skip wait loops, use any non-None TEST_* override below;
+#                  prod ACCOUNT is remapped via TEST_ACCOUNTS so live trades
+#                  go to test broker accounts.
+# IS_TEST=False  : full prod flow.
+# The IS_TEST assignment itself lives in the test-mode CLI block below, alongside the
+# other knobs, so each default sits on the same line as its CLI override.
+
+# All test overrides default to None. If non-None, the corresponding live pull
+# is bypassed and the override is used instead. Set just the ones you want to
+# stub out -- the rest will hit live data sources.
+#
+# UNITS: TEST_SS_IMBALS / TEST_SPX_IMBAL / TEST_NDX_IMBAL are all in DOLLARS.
+# Use scientific notation (e.g., 0.3e9 for $300M, 1.5e9 for $1.5B).
+#
+# Example TEST_SS_IMBALS (commented out):
+# TEST_SS_IMBALS = {
+#     'NVDA':  +0.9e9,    # +$900M  buy-side, clears the $805M NVDA threshold
+#     'TSLA':  -0.7e9,    # -$700M  sell-side, clears $665M TSLA threshold
+#     'GOOGL': +0.5e9,    # +$500M  Alphabet combined (sum of GOOGL+GOOG imbals)
+#     'MSFT':  +0.4e9,    # +$400M  clears $366M MSFT
+#     'AMZN':  -0.35e9,   # -$350M  clears $326M AMZN
+#     'AAPL':  +0.32e9,   # +$320M  clears $311M AAPL
+#     'META':  -0.28e9,   # -$280M  clears $272M META
+#     'AVGO':  +0.25e9,   # +$250M  clears $244M AVGO
+# }
+# --- Test-mode CLI (fed by test_run_algos.sh) ------------------------------------------------
+# Prod runs with NO arguments and behaves exactly as before. Passing ANY argument without
+# --test is a hard error, so a prod launch can never be silently overridden.
+# The three dict knobs take JSON, e.g. --test-ss-imbals '{"NVDA": 0.9e9, "TSLA": -0.7e9}'.
+import argparse as _argparse
+import json as _json
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--test", action="store_true")
+_p.add_argument("--send-trades", type=lambda s: s.strip().lower() == "true", default=None)
+_p.add_argument("--send-loc", type=lambda s: s.strip().lower() == "true", default=None)
+_p.add_argument("--test-ss-imbals", type=_json.loads, default=None)
+_p.add_argument("--test-spx-imbal", type=float, default=None)
+_p.add_argument("--test-ndx-imbal", type=float, default=None)
+_p.add_argument("--test-spot-300", type=_json.loads, default=None)
+_p.add_argument("--test-spot-350", type=_json.loads, default=None)
+_p.add_argument("--test-force-trade", action="store_true")
+_a = _p.parse_args()
+if len(sys.argv) > 1 and not _a.test:
+    raise AssertionError(f"CLI args are only allowed in test mode. Got {sys.argv[1:]}. Pass --test.")
+
+IS_TEST = False or _a.test
+TEST_SS_IMBALS  = None if _a.test_ss_imbals is None else dict(_a.test_ss_imbals)   # dict {ticker: notional_dollars_signed} (+ = buy, - = sell)
+TEST_SPX_IMBAL  = None if _a.test_spx_imbal is None else _a.test_spx_imbal   # float in dollars, e.g., 3.4e9
+TEST_NDX_IMBAL  = None if _a.test_ndx_imbal is None else _a.test_ndx_imbal   # float in dollars, e.g., 1.2e9
+TEST_SPOT_300   = None if _a.test_spot_300 is None else dict(_a.test_spot_300)   # dict {ticker: float}, e.g., {'NVDA': 200.10, 'AAPL': 282.40}
+TEST_SPOT_350   = None if _a.test_spot_350 is None else dict(_a.test_spot_350)   # dict {ticker: float}
+TEST_FORCE_TRADE = False or _a.test_force_trade # if True: ignore threshold check (trade any signal)
+
+# Production guard. Even with IS_TEST=False, set SEND_TRADES=False to dry-run.
+SEND_TRADES = True if _a.send_trades is None else _a.send_trades
+# If True: send LOC stock orders post-fill (limit = strike). If False: send
+# IMMEDIATE limit orders (tradeSharesLimit at strike) for prompt unwind instead.
+SEND_LOC    = True if _a.send_loc is None else _a.send_loc
+# Chat summaries are ALWAYS sent (including IS_TEST -- messages self-label TEST).
+
+# Bloomberg OI-format backup file: written every day the strategy fills, even when
+# SEND_LOC=True. User uploads this into Bloomberg if SR Trade LOCs fail. Path:
+# {EXIT_FILE_DIR}/{MM_DD_YYYY}.csv. Constants hardcoded (single-strategy account).
+EXIT_FILE_DIR     = Path('C:/Users/zdietz/Desktop/single_stock_exits')
+EXIT_FILE_ACCOUNT = 'CLEAR42'
+EXIT_FILE_DESC    = 'ALGO_42 350PM OUTRIGHT BUYS SINGLES'
+
+
+# ============================================================================
+# Imbal pull -- get_350_ss_imbal
+# ============================================================================
+# Take the FIRST imbal capture at-or-after this time-of-day for each ticker.
+# Matches the backtest's signal_snap convention.
+SIGNAL_START_TIME = '15:50:01'
+
+def get_350_ss_imbal(tickers, start_time=SIGNAL_START_TIME,
+                     is_test=False, test_imbal=None,
+                     max_attempts=7, sleep_between=0.8):
+    """Pull 3:50 closing-imbalance per ticker. Returns
+        {ticker: signed_notional_dollars}
+    where the value is positive for buy-side imbal, negative for sell-side, 0
+    for no-side / no-marketable. Returns None on total failure.
+
+    For each ticker, the value is from the FIRST capture with capture_timestamp
+    >= today + start_time (default '15:50:01') -- mirrors the backtest's
+    signal_snap convention.
+
+    GOOG is included implicitly when GOOGL is in `tickers`, so the caller can
+    sum the two for Alphabet.
+
+    Retries up to `max_attempts` with `sleep_between`s between each.
+    Triggers a retry on: db error, empty result, missing ticker, or zero
+    notional (treated as 'feed not yet published').
+    """
+    if is_test and test_imbal:
+        return dict(test_imbal)
+
+    run_date = (x_days_ago(1) if is_test else dt.date.today()).strftime("%Y-%m-%d")
+    pull_tickers = list(set(tickers) | ({'GOOG'} if 'GOOGL' in tickers else set()))
+
+    engine_timed = create_engine(
+        f"mysql+pymysql://{VBAM_USERNAME}:{VBAM_PASSWORD}@{VBAM_HOSTNAME}/{VBAM_DATABASE}",
+        connect_args={"read_timeout": 5, "write_timeout": 5, "connect_timeout": 5},
+    )
+    sql_obj = sql.text("""
+        SELECT t.ticker,
+               (CASE t.imbalance_side
+                    WHEN 1 THEN  t.order_imbalance_vol
+                    WHEN 2 THEN -t.order_imbalance_vol
+                    ELSE 0
+                END) * t.price AS notional
+        FROM auctionResearch.t_prices_daily_price_capture t
+        INNER JOIN (
+            SELECT ticker, MIN(capture_timestamp) AS first_ts
+            FROM auctionResearch.t_prices_daily_price_capture
+            WHERE run_date = :run_date AND ticker IN :tickers
+              AND capture_timestamp >= TIMESTAMP(:run_date, :start_time)
+            GROUP BY ticker
+        ) first_cap ON t.ticker = first_cap.ticker
+                    AND t.capture_timestamp = first_cap.first_ts
+        WHERE t.run_date = :run_date
+        ORDER BY t.ticker
+    """).bindparams(sql.bindparam("tickers", expanding=True))
+
+    try:
+        latest_df = None    # remember last non-empty result for end-of-retries fallback
+        for attempt in range(1, max_attempts + 1):
+            try:
+                df = pd.read_sql_query(sql_obj, engine_timed,
+                                        params={"run_date": run_date,
+                                                "tickers": pull_tickers,
+                                                "start_time": start_time})
+                if df.empty:
+                    raise ValueError("empty result set")
+                latest_df = df
+                missing = sorted(set(pull_tickers) - set(df['ticker']))
+                zero    = sorted(df.loc[df['notional'] == 0, 'ticker'].tolist())
+                if not missing and not zero:
+                    return dict(zip(df['ticker'], df['notional'].astype(float)))
+                print(f"get_350_ss_imbal attempt {attempt}/{max_attempts}: "
+                      f"missing={missing} zero_imbal={zero}")
+            except Exception as e:
+                print(f"get_350_ss_imbal attempt {attempt}/{max_attempts} errored: {e}")
+            if attempt < max_attempts:
+                print(f"  Sleeping {sleep_between}s before retry.")
+                time.sleep(sleep_between)
+
+        # All retries exhausted. If we ever got a non-empty response, return the
+        # PARTIAL dict -- tickers still missing/zero won't trigger downstream
+        # (threshold check fails on 0), but tickers with real data trade normally.
+        # Avoids the "one bad ticker kills the whole run" failure mode.
+        if latest_df is not None:
+            partial = dict(zip(latest_df['ticker'], latest_df['notional'].astype(float)))
+            missing = sorted(set(pull_tickers) - set(partial))
+            zero    = sorted([t for t, v in partial.items() if v == 0])
+            n_ok    = sum(1 for v in partial.values() if v != 0)
+            print(f"WARNING: get_350_ss_imbal exhausted all retries -- returning PARTIAL "
+                  f"({n_ok}/{len(pull_tickers)} with valid imbal; "
+                  f"missing={missing}, zero_imbal={zero})")
+            return partial
+
+        print("WARNING: get_350_ss_imbal exhausted all retries with NO data. Returning None.")
+        return None
+    finally:
+        engine_timed.dispose()
+
+
+# ============================================================================
+# 3pm intraday prices (via Bloomberg bdib)
+# ============================================================================
+def pull_3pm_prices_bbg(tickers, target_date=None, is_test=False):
+    """One bdib call per ticker (Bloomberg bdib doesn't support multi-symbol).
+    Returns dict {ticker: price}.
+
+    Reference time is 15:00 in prod, 9:31 in test mode -- test runs typically
+    happen well before 15:00, so 9:31 gives an early-morning bar that already
+    exists in the bdib feed.
+    """
+    target_date = target_date or dt.date.today()
+    target_time = dt.time(9, 31, 0) if is_test else dt.time(15, 0, 0)
+    target_ts = pd.Timestamp(dt.datetime.combine(target_date, target_time))
+    out = {}
+    for t in tickers:
+        try:
+            df = blp.bdib(ticker=f'{t} US Equity', dt=target_date.strftime('%Y-%m-%d'),
+                           interval=1, ref="EquityUS")
+            df.index = pd.to_datetime(df.index)
+            # bdib returns a tz-aware index in America/New_York. Normalize to naive
+            # for an apples-to-apples comparison with a naive target_ts.
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            mask = df.index <= target_ts
+            if not mask.any():
+                out[t] = None
+                continue
+            closest = df.index[mask].max()
+            row = df.loc[closest]
+            # Multi-level columns (ticker, field) -- grab close (typical idx 3 for OHLCV)
+            close_key = (f'{t} US Equity', 'close')
+            if close_key in row.index:
+                out[t] = float(row[close_key])
+            elif 'close' in row.index:
+                out[t] = float(row['close'])
+            else:
+                out[t] = float(row.iloc[3])
+        except Exception as e:
+            print(f"  pull_3pm_prices_bbg({t}): {e}")
+            out[t] = None
+    return out
+
+
+def pull_350_spot_bbg(tickers):
+    """Snapshot live PX_LAST for all tickers in one bdp call."""
+    try:
+        df = blp.bdp([f'{t} US Equity' for t in tickers], 'PX_LAST')
+        df.index = df.index.str.replace(' US Equity', '', regex=False)
+        return df['px_last'].to_dict()
+    except Exception as e:
+        print(f"  pull_350_spot_bbg failed: {e}")
+        return {t: None for t in tickers}
+
+
+# ============================================================================
+# Strike chain pull -- ONE SQL against srtrade for all qualifying symbols
+# ============================================================================
+def pull_chains_for_symbols(symbols):
+    """One SQL round-trip for option chains of all qualifying symbols.
+    Returns df with okey_tk, okey_xx, okey_cp, uprc, sprc, obid, oask, okey_yr/mn/dy.
+    Filters to today's expiry and strikes within +/- 1% of underlying."""
+    today = dt.date.today()
+    in_clause = ", ".join(f"'{s}'" for s in symbols)
+    chain_sql = f"""
+        SELECT okey_tk, okey_xx, okey_cp, uprc, sprc, obid, oask,
+               okey_yr, okey_mn, okey_dy
+        FROM {_srof.IMPLIED_QUOTE_TABLE}
+        WHERE okey_tk IN ({in_clause})
+          AND okey_yr = {today.year} AND okey_mn = {today.month} AND okey_dy = {today.day}
+          AND okey_xx BETWEEN uprc * 0.98 AND uprc * 1.02
+        ORDER BY okey_tk, okey_xx
+    """
+    return run_query(chain_sql)
+
+
+def pick_strike(chain, symbol, spot, cp,
+                max_otm_bps=CFG.MAX_OTM_BPS, max_itm_bps=CFG.MAX_ITM_BPS):
+    """Closest listed strike to spot in the asymmetric ITM/OTM band.
+    cp='Call': allowed range [spot - max_itm_bps, spot + max_otm_bps].
+    cp='Put':  allowed range [spot - max_otm_bps, spot + max_itm_bps].
+    Returns the chain row (Series) or None."""
+    sub = chain[(chain['okey_tk'] == symbol) & (chain['okey_cp'] == cp)]
+    if sub.empty: return None
+    if cp == 'Call':
+        lo = spot * (1 - max_itm_bps/1e4); hi = spot * (1 + max_otm_bps/1e4)
+    else:
+        lo = spot * (1 - max_otm_bps/1e4); hi = spot * (1 + max_itm_bps/1e4)
+    cand = sub[(sub['okey_xx'] >= lo) & (sub['okey_xx'] <= hi)]
+    if cand.empty: return None
+    idx = (cand['okey_xx'] - spot).abs().idxmin()
+    return cand.loc[idx]
+
+
+# ============================================================================
+# send_outright_two_waves -- our local 2-wave outright order helper
+# ============================================================================
+def _build_outright_order_sql(symbol, option_row, size, direction, account,
+                                limit_price, grouping_code, duration, userData,
+                                limit_class="Simple", parent_handling="Activetaker",
+                                surf_offset=None):
+    """REPLACE INTO srtrade.msgoptordergateway for an outright single-leg order.
+
+    limit_class      -- "Simple" or "Surface". Sets BOTH takeLimitClass and
+                        makeLimitClass.
+    parent_handling  -- "Activetaker" (current outright default) or "Seeker"
+                        (matches send_complex_two_waves; recommended with Surface).
+    surf_offset      -- if not None, adds takesurfPrcoffset + makesurfPrcoffset
+                        to the SQL (both set to this value). SR interprets the
+                        sign automatically based on orderSide -- always pass a
+                        positive number where positive = more aggressive.
+
+    orderPrcLimit acts as a hard price cap (for Buy) / floor (for Sell). With
+    limit_class="Surface", the effective limit is BEST(orderPrcLimit, surfLimit)
+    where surfLimit = liveSurfaceMid + surf_offset (in the appropriate direction).
+    """
+    surf_fields = ""
+    surf_values = ""
+    if surf_offset is not None:
+        surf_fields = ", takesurfPrcoffset, makesurfPrcoffset"
+        surf_values = f", {float(surf_offset)}, {float(surf_offset)}"
+    # v8 (gated on _srf_flags.SEND_V8, v7 byte-identical): Timeinforce -> marketSession ('Day' ->
+    # 'RegMkt'), groupingcode/riskgroupid -> hex to_v8_id strings. The !r formatting quotes hex
+    # strings on v8 while leaving v7 ints as bare digits (repr(int) == str(int)). Same four-fix
+    # family as extra_spread_trader (this script builds its own INSERT, shared path never sees it).
+    _tif_col = "marketSession" if _srf_flags.SEND_V8 else "Timeinforce"
+    _tif_val = "RegMkt" if _srf_flags.SEND_V8 else "Day"
+    _rgid = to_v8_id(counter()) if _srf_flags.SEND_V8 else counter()
+    # v8's OUTRIGHT gateway (msgoptordergateway) dropped 'Seeker' from the parentOrderHandling
+    # enum (1265 reject, found 8/24 test run; the COMPLEX gateway kept it). Map to ActiveTaker
+    # on v8 (per Zach; same value the shared outright path always used). NOTE: ActiveTaker works
+    # the book differently than Seeker's seek-liquidity algo -- W1 fill character changes on v8.
+    if _srf_flags.SEND_V8 and parent_handling == "Seeker":
+        parent_handling = "ActiveTaker"
+    return f"""REPLACE INTO srtrade.msgoptordergateway
+    (okey_at, okey_ts, okey_tk, okey_yr, okey_mn, okey_dy, okey_xx, okey_cp,
+     ordersize, orderPrcLimit, accnt, spdractiontype, groupingcode, orderside,
+     {_tif_col}, orderduration, orderlimittype, Parentorderhandling,
+     parentbalancehandling, takelimitclass, makelimitclass, autohedge,
+     riskgroupid, spdrstagetype, tradername, CHECKSUM, UserData1{surf_fields})
+    VALUES
+    ('EQT', 'NMS', '{symbol}', {int(option_row['okey_yr'])},
+     {int(option_row['okey_mn'])}, {int(option_row['okey_dy'])},
+     {float(option_row['okey_xx'])}, '{option_row['okey_cp']}',
+     {int(size)}, {float(limit_price)}, '{account}', 'addreplace',
+     {grouping_code!r}, '{direction}', '{_tif_val}', {int(duration)}, 'Prc',
+     '{parent_handling}', 'postlimit', '{limit_class}', '{limit_class}', 'None',
+     {_rgid!r}, 'None', 'agm.zdietz', 13, '{userData}'{surf_values})"""
+
+
+def _refresh_outright_quote(option_row):
+    """Re-query SR surface for fresh sprc/obid/oask. Returns updated copy.
+    Sets 'quote_refreshed' = True only when the re-query returned a row -- callers
+    use it to decide whether obid/oask are live NBBO or the stale startup snap."""
+    s = f"""SELECT sprc, obid, oask FROM {_srof.IMPLIED_QUOTE_TABLE}
+            WHERE okey_tk='{option_row['okey_tk']}'
+              AND okey_xx={float(option_row['okey_xx'])}
+              AND okey_cp='{option_row['okey_cp']}'
+              AND okey_yr={int(option_row['okey_yr'])}
+              AND okey_mn={int(option_row['okey_mn'])}
+              AND okey_dy={int(option_row['okey_dy'])}"""
+    fresh = run_query(s)
+    out = option_row.copy()
+    out['quote_refreshed'] = not fresh.empty
+    if not fresh.empty:
+        out['sprc'] = float(fresh['sprc'].iloc[0])
+        out['obid'] = float(fresh['obid'].iloc[0])
+        out['oask'] = float(fresh['oask'].iloc[0])
+    return out
+
+
+# ---- Outright order broker-state helpers ----------------------------------
+# Orders inserted into srtrade.msgoptordergateway are "converted to
+# SpdrParentOrder records" (per SR docs), so their broker state lives in
+# msgsrparentbrkrstate -- NOT msgsrmlegbrkrstate (which is for orders sent via
+# msgparentordergatewayext, i.e. the multi-leg gateway).
+def _outright_get_parent(grouping_code):
+    """Look up SpdrParent broker state for an outright option grouping_code.
+    Returns (parent_number, is_closed):
+        parent_number -- alive parent (str/int) or None if state row not yet visible
+        is_closed     -- True if order finished (filled/cxld/expired)
+    Empty result row -> (None, False)  (state hasn't propagated yet).
+    """
+    sql = f"""SELECT parentNumber, spdrBrokerStatus
+              FROM srtrade.msgsrparentbrkrstate
+              WHERE groupingCode = {grouping_code!r}"""
+    df = run_query(sql, "srtrade")
+    if df.empty:
+        return None, False
+    status = df['spdrBrokerStatus'].iloc[0]
+    return df['parentNumber'].iloc[0], status in ('Closed', 'Filled',
+                                                  'Cancelled', 'Expired')
+
+
+def _outright_get_fill_data(grouping_code):
+    """(cumFillQuantity, avgFillPrice) for an outright option grouping_code.
+    Returns (0, 0.0) if state row not yet visible. Used for premium budget
+    reconciliation between waves -- W2 sizing nets against the REAL W1 spend
+    (filled * avgFillPrice * 100), not the W1 cap."""
+    sql = f"""SELECT cumFillQuantity, avgFillPrice FROM srtrade.msgsrparentbrkrstate
+              WHERE groupingCode = {grouping_code!r}"""
+    df = run_query(sql, "srtrade")
+    if df.empty:
+        return 0, 0.0
+    qty = int(df['cumFillQuantity'].iloc[0] or 0)
+    avg = float(df['avgFillPrice'].iloc[0] or 0.0)
+    return qty, avg
+
+
+def _outright_cancel(parent_number, grouping_code, account):
+    """Cancel an outright SpdrParentOrder. Returns (cumFillQuantity, avgFillPrice)
+    at cancel time."""
+    # v8: userName->modifiedBy, timestamp_us dropped, clientFirm='AGM' REQUIRED (AccountMatches
+    # rule -> 1105 without it). v7 keeps the original columns. Same rewrite as cancel_order.
+    if _srf_flags.SEND_V8:
+        cancel_sql = f"""INSERT INTO srtrade.msgsrparentcancel
+                           (accnt, parentNumber, cxlReason, modifiedBy, clientFirm, timestamp)
+                         VALUES
+                           ('{account}', '{parent_number}', 'cxlReason', 'agm.zdietz', 'AGM', NOW())"""
+    else:
+        cancel_sql = f"""INSERT INTO srtrade.msgsrparentcancel
+                           (accnt, parentNumber, cxlReason, userName, timestamp, timestamp_us)
+                         VALUES
+                           ('{account}', '{parent_number}', 'cxlReason', 'agm.zdietz', NOW(), '0')"""
+    run_query(cancel_sql, "srtrade", fetch=False)
+    return _outright_get_fill_data(grouping_code)
+
+
+async def send_outright_two_waves(symbol, option_row, target_premium, account,
+                                    max_edge_from_sprc=CFG.MAX_EDGE_FROM_SPRC,
+                                    max_edge_for_limit1=CFG.MAX_EDGE_FOR_LIMIT1,
+                                    max_edge_for_limit2=CFG.MAX_EDGE_FOR_LIMIT2,
+                                    max_edge_pct_of_sprc=CFG.MAX_EDGE_PCT_OF_SPRC,
+                                    direction='Buy', userData='',
+                                    wave1_duration=CFG.WAVE_1_DURATION_S,
+                                    wave2_duration=CFG.WAVE_2_DURATION_S):
+    """Outright single-leg with 2 waves, target_premium-budgeted.
+
+    target_premium is a HARD $ budget. Each wave sizes itself from the freshest
+    sprc + (effective cap), and W2 nets against the REAL W1 spend (filled *
+    avgFillPrice * 100) so the strategy can't blow through budget on a stale
+    snapshot ask.
+
+    Effective edges = min(dollar value, sprc * max_edge_pct_of_sprc). The pct
+    cap binds on low-priced options; the dollar caps bind otherwise. Caller
+    picks the pct (normal vs special-day).
+
+    Wave 1 (SURFACE):
+        effective_surf_off = min(max_edge_from_sprc, sprc * pct)
+        effective_W1_cap   = min(max_edge_for_limit1, sprc * pct)
+        size_W1 = ceil(target_premium / (W1_cap_price * 100)), W1_cap_price = sprc +/- effective_W1_cap.
+        takeLimitClass / makeLimitClass = "Surface", parentOrderHandling = "Seeker"
+        takesurfPrcoffset = makesurfPrcoffset = effective_surf_off.
+        orderPrcLimit = W1_cap_price. Effective limit = BEST(orderPrcLimit, surfLimit).
+
+    Wave 2 (SIMPLE limit, surface-free fallback, budget-reconciled):
+        effective_W2_cap = min(max_edge_for_limit2, refreshed_sprc * pct)
+        spent1 = filled1 * avgFillPrice_W1 * 100  (REAL spend; fallback to W1 cap if avg unavailable)
+        remaining_budget = max(0, target_premium - spent1)
+        size_W2 = ceil(remaining_budget / (W2_cap_price * 100)).
+        W2 limit is NBBO-clamped: min(sprc-based limit, oask + 0.03). The sprc-based
+        limit alone tripped SR's limit collar on 7/31 (broken AAPL surface -> sprc
+        0.80 vs 0.60 mid -> limit 1.20 rejected: PR:LmtCollar). oask is live NBBO
+        even when the surface fit is broken (per SR support), and ask+0.03 is always
+        inside the collar. Clamp skipped if the quote refresh failed (stale snap
+        obid/oask are untrustworthy -- 7/31 snap oask was below intrinsic).
+        takeLimitClass / makeLimitClass = "Simple", parentOrderHandling = "Activetaker", no surf fields.
+
+    FIRES W2 AND RETURNS IMMEDIATELY (355pm-style) -- does NOT wait out
+    wave2_duration. The caller sends the chat recap right away, then
+    collect_w2_fills() reads W2 fills after the order expires.
+
+    Returns {'w1_filled', 'w1_avg', 'w1_spent', 'w2_gc', 'w2_size', 'w2_limit',
+    'w2_end_dt'} -- the w2_* fields are None/0 when no W2 was sent.
+    """
+    print(f"{pretty_time()} -- send_outright_two_waves [{userData}]: {symbol} "
+          f"{option_row['okey_xx']:g}{option_row['okey_cp'][0]} "
+          f"target_prem=${target_premium:,.0f} dir={direction}  "
+          f"surf_off={max_edge_from_sprc} cap1={max_edge_for_limit1} "
+          f"cap2={max_edge_for_limit2} pct_cap={max_edge_pct_of_sprc:.0%}")
+
+    # -------------------- Wave 1: surface-priced (pct-capped) --------------------
+    sprc1 = float(option_row['sprc'])
+    pct_cap_1  = sprc1 * max_edge_pct_of_sprc
+    eff_surf_1 = min(max_edge_from_sprc,  pct_cap_1)
+    eff_cap_1  = min(max_edge_for_limit1, pct_cap_1)
+    if direction == 'Buy':
+        limit1 = round(sprc1 + eff_cap_1, 2)
+    else:
+        limit1 = round(sprc1 - eff_cap_1, 2)
+    size1 = max(1, math.ceil(target_premium / (abs(limit1) * 100)))
+    gc1 = to_v8_id(counter()) if _srf_flags.SEND_V8 else counter()
+    sql1 = _build_outright_order_sql(
+        symbol, option_row, size1, direction, account,
+        limit_price=limit1, grouping_code=gc1, duration=wave1_duration,
+        userData=f"{userData}_W1",
+        limit_class="Surface", parent_handling="Seeker",
+        surf_offset=eff_surf_1,
+    )
+    run_query(sql1, "srtrade", fetch=False)
+    binds_1 = "pct" if pct_cap_1 < max_edge_for_limit1 else "dollar"
+    print(f"  W1 sent (Surface/Seeker): {symbol} sprc=${sprc1:.2f} "
+          f"surf_off=${eff_surf_1:.3f} eff_cap=${eff_cap_1:.3f} ({binds_1} binds; "
+          f"pct_cap=${pct_cap_1:.3f}) limit=${limit1} size={size1} "
+          f"(budget ${target_premium:,.0f}) gc={gc1} dur={wave1_duration}s")
+
+    await asyncio.sleep(wave1_duration)
+
+    # Check fill / cancel residual against the SpdrParent state table.
+    parent1, is_closed = _outright_get_parent(gc1)
+    # Retry briefly when state isn't visible -- the most common cause is SR Trade
+    # write-latency (gateway -> msgsrparentbrkrstate write), not rejection. 3 retries
+    # x 0.3s = up to +0.9s after the W1 sleep. Most lag cases resolve here, letting
+    # us cleanly cancel W1 and budget-reconcile W2 instead of falling through to the
+    # full-budget W2 path (which risks doubling exposure if W1 silently fills).
+    for _ in range(3):
+        if is_closed or parent1 is not None:
+            break
+        time.sleep(0.3)
+        parent1, is_closed = _outright_get_parent(gc1)
+
+    if is_closed:
+        filled1, avg1 = _outright_get_fill_data(gc1)
+    elif parent1 is not None:
+        filled1, avg1 = _outright_cancel(parent1, gc1, account)
+    else:
+        # State STILL invisible after retries. Per design preference (prefer overfill
+        # to missed fill), proceed with W2 at FULL budget. Risk: if W1 is alive-but-
+        # untracked and silently fills, total exposure could be up to 2x target_premium.
+        filled1, avg1 = 0, 0.0
+        print(f"  W1: parent state not visible for gc={gc1} after retries -- "
+              f"proceeding with W2 at FULL budget (double-fill possible if W1 silently fills)")
+    # Safety net: if filled but avgFillPrice not yet populated, conservatively
+    # treat the fill as having cleared at the cap (the worst we'd have paid).
+    if filled1 > 0 and avg1 <= 0:
+        avg1 = abs(limit1)
+        print(f"  W1: avgFillPrice not yet populated; using cap ${avg1:.2f} for budget reconciliation")
+    spent1 = filled1 * avg1 * 100
+    print(f"  W1 result: filled {filled1}/{size1} @ ${avg1:.3f} avg  (spent ${spent1:,.0f})")
+
+    no_w2 = {'w1_filled': int(filled1), 'w1_avg': float(avg1), 'w1_spent': spent1,
+             'w2_gc': None, 'w2_size': 0, 'w2_limit': None, 'w2_end_dt': None}
+
+    if filled1 >= size1:
+        print(f"  Fully filled on W1 -- {symbol}")
+        return no_w2
+
+    # -------------------- Wave 2: simple limit (refreshed sprc, NBBO-clamped, budget-reconciled) --------------------
+    remaining_budget = max(0.0, target_premium - spent1)
+    if remaining_budget <= 0:
+        print(f"  W1 spend ${spent1:,.0f} consumed budget ${target_premium:,.0f}; no W2")
+        return no_w2
+
+    # Refresh sprc/obid/oask before computing wave 2's limit (pct-capped).
+    fresh = _refresh_outright_quote(option_row)
+    sprc2 = float(fresh['sprc'])
+    pct_cap_2 = sprc2 * max_edge_pct_of_sprc
+    eff_cap_2 = min(max_edge_for_limit2, pct_cap_2)
+    if direction != 'Buy':
+        raise AssertionError("W2 NBBO clamp only implemented for Buy -- "
+                             "review clamp direction before enabling Sell")
+    limit2_sprc = round(sprc2 + eff_cap_2, 2)
+    oask2 = float(fresh['oask'])
+    quote_ok = bool(fresh['quote_refreshed']) and oask2 > 0
+    nbbo_clamp = round(oask2 + 0.03, 2)
+    limit2 = min(limit2_sprc, nbbo_clamp) if quote_ok else limit2_sprc
+    size2 = max(0, math.ceil(remaining_budget / (abs(limit2) * 100)))
+    if size2 <= 0:
+        print(f"  W2 size=0 after budget reconciliation; no W2 sent")
+        return no_w2
+
+    gc2 = to_v8_id(counter()) if _srf_flags.SEND_V8 else counter()
+    sql2 = _build_outright_order_sql(
+        symbol, fresh, size2, direction, account,
+        limit_price=limit2, grouping_code=gc2, duration=wave2_duration,
+        userData=f"{userData}_W2",
+        limit_class="Simple", parent_handling="Activetaker",
+        surf_offset=None,
+    )
+    run_query(sql2, "srtrade", fetch=False)
+    w2_end_dt = getNowEst() + dt.timedelta(seconds=wave2_duration)
+    binds_2 = "pct" if pct_cap_2 < max_edge_for_limit2 else "dollar"
+    clamp_desc = (f"nbbo-clamp binds; sprc-based=${limit2_sprc}, oask=${oask2}"
+                  if quote_ok and nbbo_clamp < limit2_sprc
+                  else f"sprc-based binds; oask={f'${oask2}' if quote_ok else 'UNAVAILABLE (refresh failed)'}")
+    print(f"  W2 sent (Simple/Activetaker): {symbol} refreshed_sprc=${sprc2:.2f} "
+          f"eff_cap=${eff_cap_2:.3f} ({binds_2} binds; pct_cap=${pct_cap_2:.3f}) "
+          f"limit=${limit2} ({clamp_desc}) size={size2} "
+          f"(remaining budget ${remaining_budget:,.0f}) gc={gc2} dur={wave2_duration}s")
+
+    # Fire-and-return (355pm-style): W2 rests at SR for wave2_duration; fills are
+    # read later by collect_w2_fills so the chat recap can go out immediately.
+    return {'w1_filled': int(filled1), 'w1_avg': float(avg1), 'w1_spent': spent1,
+            'w2_gc': gc2, 'w2_size': int(size2), 'w2_limit': abs(limit2),
+            'w2_end_dt': w2_end_dt}
+
+
+# ============================================================================
+# Per-symbol decision logic
+# ============================================================================
+def is_special_day(today=None):
+    """Special day = serial (monthly) expiry OR trading month-end. FED days do
+    NOT count as special (backtest showed FED days never triggered a trade and
+    are not part of the edge)."""
+    today = today or dt.date.today()
+    serial_set = set(pd.to_datetime(SERIALS).date)
+    if today in serial_set:
+        return True
+    # Trading month-end: next business day is in a different month
+    today_ts = pd.Timestamp(today)
+    nxt = today_ts + pd.tseries.offsets.BDay(1)
+    return nxt.month != today_ts.month
+
+
+def build_trade_for_symbol(signal_symbol, combined_imbal, spot_300, spot_350,
+                            chain, spx_imbal, today_is_special, force=False):
+    """Decide whether to trade `signal_symbol` and (if so) what option to trade.
+
+    All imbalance values are in DOLLARS (signed).
+
+    Always returns a flat dict. Keys ALWAYS populated:
+        signal_symbol     -- one of the 8 universe names (e.g. 'GOOGL' for Alphabet)
+        combined_imbal    -- signed imbal in $ (Alphabet sums GOOG+GOOGL)
+        triggered         -- True if |imbal| >= per-symbol ADV threshold (or force)
+        will_trade        -- True if a qualifying strike was found and order will go
+        note              -- human-readable status string
+
+    Keys ADDITIONALLY populated when will_trade=True:
+        symbol         -- actual traded ticker (Alphabet may pick GOOG fallback)
+        cp             -- 'Call' or 'Put'
+        option_row     -- chain row (pandas Series)
+        strike         -- float strike price
+        trade_spot     -- 3:50 spot used for the chosen leg
+        ref_spot_300   -- 3pm spot used for momentum calc
+        move_bps       -- 3pm -> 3:50 move in bps (None if 3pm spot missing)
+        ask, bid       -- floats
+        mult_special   -- 1 or CFG.MULT_SPECIAL (special-day flag: serial/month-end)
+        mult_momentum  -- 1 or CFG.MULT_MOMENTUM (3pm -> 3:50 momentum confirm flag)
+        mult_spx       -- 1 or CFG.MULT_SPX (SPX broad-market confirm flag)
+        size_mult      -- product of the three multipliers
+        target_premium -- $ target premium = BASE_PREMIUM * size_mult
+        contracts      -- ceil(target_premium / (ask * 100)), min 1
+        user_data      -- userData string for the order ('{NAME}_{symbol}')
+    """
+    out = {
+        'signal_symbol' : signal_symbol,
+        'combined_imbal': combined_imbal,
+        'triggered'     : False,
+        'will_trade'    : False,
+        'note'          : '',
+    }
+
+    threshold = CFG.UNIVERSE[signal_symbol]['threshold']
+    if not force and abs(combined_imbal) < threshold:
+        out['note'] = (f'imbal {combined_imbal/1e6:+.0f}M below '
+                       f'threshold ${threshold/1e6:.0f}M')
+        return out
+    out['triggered'] = True
+
+    cp = 'Call' if combined_imbal > 0 else 'Put'
+
+    # Alphabet: prefer GOOGL, fall back to GOOG if GOOGL has no qualifying strike.
+    candidates = ['GOOGL', 'GOOG'] if signal_symbol == 'GOOGL' else [signal_symbol]
+    chosen = None
+    for try_sym in candidates:
+        try_spot = spot_350.get(try_sym)
+        if try_spot is None:
+            continue
+        opt = pick_strike(chain, try_sym, try_spot, cp)
+        if opt is None:
+            continue
+        chosen = (try_sym, try_spot, opt)
+        break
+
+    if chosen is None:
+        out['cp']   = cp
+        out['note'] = f'no qualifying {cp} strike for {signal_symbol} (or GOOG fallback)'
+        return out
+
+    trade_sym, trade_spot, opt = chosen
+    ref_300 = spot_300.get(trade_sym)
+    move_bps = ((trade_spot / ref_300) - 1) * 1e4 if ref_300 else None
+
+    # Compounding multipliers (size_mult = product). Each defaults to 1 when its
+    # flag is off; the active values come from CFG (special=4x, momentum=1.2x, spx=1.5x).
+    mult_special  = CFG.MULT_SPECIAL if today_is_special else 1
+    mult_momentum = CFG.MULT_MOMENTUM if (
+        (cp == 'Call' and move_bps is not None and move_bps >  CFG.MOVE_CONFIRM_BPS) or
+        (cp == 'Put'  and move_bps is not None and move_bps < -CFG.MOVE_CONFIRM_BPS)
+    ) else 1
+    mult_spx = CFG.MULT_SPX if (
+        (cp == 'Call' and spx_imbal is not None and spx_imbal >  CFG.SPX_CONFIRM) or
+        (cp == 'Put'  and spx_imbal is not None and spx_imbal < -CFG.SPX_CONFIRM)
+    ) else 1
+    size_mult = mult_special * mult_momentum * mult_spx
+
+    target_premium = CFG.BASE_PREMIUM * size_mult
+    # Sizing now lives in send_outright_two_waves -- it derives contracts per wave
+    # from the freshest sprc + cap and budget-reconciles W2 against the REAL W1 spend.
+    # This avoids the AAPL-5/29-style blowup where a stale snapshot oask led to 3x
+    # over-spend. We just pass target_premium downstream.
+
+    out.update({
+        'will_trade'    : True,
+        'symbol'        : trade_sym,
+        'cp'            : cp,
+        'option_row'    : opt,
+        'strike'        : float(opt['okey_xx']),
+        'trade_spot'    : trade_spot,
+        'ref_spot_300'  : ref_300,
+        'move_bps'      : move_bps,
+        'sprc'          : float(opt['sprc']),
+        'snap_ask'      : float(opt['oask']),  # informational only, NOT used for sizing
+        'snap_bid'      : float(opt['obid']),  # informational only
+        'mult_special'  : mult_special,
+        'mult_momentum' : mult_momentum,
+        'mult_spx'      : mult_spx,
+        'size_mult'     : size_mult,
+        'target_premium': target_premium,
+        'user_data'     : f"{CFG.NAME}_{trade_sym}",
+        'note'          : (f'will trade {trade_sym} {opt["okey_xx"]:g}{cp[0]} '
+                           f'target_prem=${target_premium:,.0f} '
+                           f'(mult {mult_special}x{mult_momentum}x{mult_spx} = {size_mult}x)'),
+    })
+    return out
+
+
+# ============================================================================
+# Phase functions -- main is a thin orchestration over these.
+# ============================================================================
+def format_imbal_table(tickers, imbal):
+    """Render the per-ticker imbal vs threshold table as a multi-line string.
+    Used both for terminal logging in pull_signal_data and for chat pings in
+    post_no_trade_summary / post_chat_summary."""
+    lines = ["Imbal per ticker (signed | threshold | %thresh):"]
+    for t in tickers:
+        imbal_d  = imbal.get(t, 0.0)
+        thresh_d = CFG.UNIVERSE[t]['threshold']
+        pct      = abs(imbal_d) / thresh_d * 100 if thresh_d else 0
+        flag     = "  *QUALIFIES*" if abs(imbal_d) >= thresh_d else ""
+        lines.append(f"  {t:<6} {imbal_d/1e6:>+5.0f}M | "
+                     f"{thresh_d/1e6:>4.0f}M | {pct:>3.0f}%{flag}")
+    return "\n".join(lines)
+
+
+def pull_signal_data(tickers):
+    """Phase 1: gather all market data needed to make trade decisions.
+
+    Waits at the appropriate ET clock times (skipped when IS_TEST=True),
+    pulls 3pm prices, 3:50 spot, and SS/SPX/NDX imbals.
+
+    Returns a dict with (all imbal values in DOLLARS, signed):
+        spot_300   -- dict {ticker: 3pm price}     (includes GOOG for Alphabet)
+        spot_350   -- dict {ticker: 3:50 spot}     (includes GOOG)
+        imbal      -- dict {ticker: signed_imbal_$}, with GOOG summed into GOOGL
+        spx_imbal  -- float or None
+        ndx_imbal  -- float or None
+    Or None if SS imbal pull failed entirely (caller should bail).
+    """
+    # Wait until ~3:38 (coarse), then ~3:48 (fine), then pull 3pm prices.
+    if not IS_TEST:
+        wait_until(dt.time(LAST_HOUR, 38, 1), poll_interval=30)
+        wait_until(dt.time(LAST_HOUR, 48, 1))
+
+    ref_label = "9:31 AM" if IS_TEST else "3:00 PM"
+    print(f"{pretty_time()} -- Pulling {ref_label} prices via blp.bdib")
+    spot_300 = (dict(TEST_SPOT_300) if TEST_SPOT_300 is not None
+                else pull_3pm_prices_bbg(tickers + ['GOOG'], is_test=IS_TEST))
+    print(f"  {ref_label} prices: {spot_300}")
+
+    # Wait until 3:50:01.7 (shifted +0.2s from 3:50:01.5 on 2026-08-24 for SR query-collision
+    # avoidance: separates the chain pull + option sends that follow from the jitter-timed
+    # sends of the fast scripts at ~3:50:01.1-02.0), then snapshot live spot.
+    if not IS_TEST:
+        wait_until(dt.time(LAST_HOUR, 50, 1, 700_000), poll_interval=0.05)
+
+    print(f"{pretty_time()} -- Pulling 3:50 spot via blp.bdp")
+    spot_350 = (dict(TEST_SPOT_350) if TEST_SPOT_350 is not None
+                else pull_350_spot_bbg(tickers + ['GOOG']))
+    print(f"  3:50 spot: {spot_350}")
+
+    # Pull imbals immediately after spot (no extra wait).
+    print(f"{pretty_time()} -- Pulling SS / SPX / NDX imbals")
+    ss_imbals = get_350_ss_imbal(tickers, is_test=IS_TEST, test_imbal=TEST_SS_IMBALS,
+                                  max_attempts=CFG.IMBAL_MAX_ATTEMPTS,
+                                  sleep_between=CFG.IMBAL_SLEEP_BETWEEN)
+    # Pass is_test=IS_TEST so these pull YESTERDAY's data when in test mode
+    # (which has actual auction snapshots regardless of when test runs).
+    # get_350_imbal accepts a stub override directly via test_imbal=...
+    # get_qqq_net_imbal has no stub override -- handle TEST_NDX_IMBAL at script level.
+    spx_imbal_raw = get_350_imbal(is_test=IS_TEST, test_imbal=TEST_SPX_IMBAL)
+    ndx_imbal_raw = (TEST_NDX_IMBAL if TEST_NDX_IMBAL is not None
+                     else get_qqq_net_imbal(is_test=IS_TEST))
+    spx_imbal = spx_imbal_raw if spx_imbal_raw not in (None, NO_IMBAL_VAL) else None
+    ndx_imbal = ndx_imbal_raw if ndx_imbal_raw is not None else None
+    print(f"  SPX: {f'{spx_imbal/1e6:+.0f}M' if spx_imbal is not None else 'N/A'}  "
+          f"NDX: {f'{ndx_imbal/1e6:+.0f}M' if ndx_imbal is not None else 'N/A'}")
+
+    if not ss_imbals:
+        return None
+
+    # Per-ticker imbal in $, with Alphabet aggregation (GOOG + GOOGL).
+    imbal = dict(ss_imbals)
+    if 'GOOGL' in imbal and 'GOOG' in imbal:
+        imbal['GOOGL'] += imbal['GOOG']
+
+    # Pretty-print: imbal vs threshold so non-qualifying near-misses are obvious.
+    for line in format_imbal_table(tickers, imbal).split("\n"):
+        print(f"  {line}")
+
+    return {'spot_300': spot_300, 'spot_350': spot_350, 'imbal': imbal,
+            'spx_imbal': spx_imbal, 'ndx_imbal': ndx_imbal}
+
+
+def decide_trades(tickers, signal_data, today_is_special):
+    """Phase 2: per-ticker decision -- run threshold + strike-pick + sizing.
+
+    Pulls option chains for qualifying symbols (one SQL round-trip), then
+    builds a decision dict (from build_trade_for_symbol) for each qualifier.
+
+    Returns the list of decision dicts. Decisions where will_trade=False are
+    included for transparency (visible in the printed log) but are filtered
+    out before sending.
+    """
+    imbal = signal_data['imbal']
+
+    qualifiers = [t for t in tickers
+                  if TEST_FORCE_TRADE or abs(imbal.get(t, 0.0)) >= CFG.UNIVERSE[t]['threshold']]
+    print(f"  Qualifying symbols: {qualifiers}")
+    if not qualifiers:
+        return []
+
+    # ONE SQL for option chains of qualifying symbols. Include GOOG for Alphabet fallback.
+    chain_symbols = list(set(qualifiers) | ({'GOOG'} if 'GOOGL' in qualifiers else set()))
+    print(f"{pretty_time()} -- Pulling option chains for {chain_symbols}")
+    chain = pull_chains_for_symbols(chain_symbols)
+    print(f"  Chain: {len(chain)} rows; symbols={sorted(chain['okey_tk'].unique())}")
+
+    decisions = []
+    for t in qualifiers:
+        d = build_trade_for_symbol(t, imbal.get(t, 0.0),
+                                    signal_data['spot_300'], signal_data['spot_350'],
+                                    chain, signal_data['spx_imbal'],
+                                    today_is_special, force=TEST_FORCE_TRADE)
+        print(f"  {t}: {d['note']}")
+        decisions.append(d)
+    return decisions
+
+
+def send_option_orders(decisions, account, today_is_special):
+    """Phase 3: send option orders concurrently for all will_trade decisions.
+
+    Records option-send timestamp BEFORE awaiting any coroutine, returns it
+    so the caller can compute the LOC delay target.
+
+    today_is_special selects the percent-of-sprc edge cap (more aggressive on
+    serial/month-end days).
+
+    Returns as soon as every trade's W2 is FIRED (not filled) -- ~4s, not 40s.
+    Mutates each will_trade decision in-place with the send_outright_two_waves
+    result dict plus provisional 'filled'/'premium_paid' (W1-only numbers;
+    collect_w2_fills folds in W2 later).
+    Returns the option-send timestamp (dt.datetime, ET).
+    """
+    trades = [d for d in decisions if d['will_trade']]
+    edge_pct = (CFG.MAX_EDGE_PCT_OF_SPRC_SPECIAL if today_is_special
+                else CFG.MAX_EDGE_PCT_OF_SPRC)
+
+    print(f"{pretty_time()} -- Preparing {len(trades)} trade(s)  "
+          f"(edge_pct_of_sprc={edge_pct:.0%}, special={today_is_special})")
+    for d in trades:
+        print(f"    {d['symbol']} {d['cp']} K={d['strike']:g} "
+              f"mult={d['size_mult']} target_prem=${d['target_premium']:,.0f} "
+              f"sprc=${d['sprc']:.2f} (snap_ask=${d['snap_ask']:.2f})")
+
+    # Capture t=0 BEFORE building coroutines (which is essentially immediate
+    # but we want the timestamp anchored before any awaits).
+    t_options_send = getNowEst()
+
+    # Build (coroutine, decision) tuples upfront -- mirrors 350pm_script.py pattern.
+    # Sizing happens inside send_outright_two_waves from target_premium + fresh sprc.
+    order_coros = []
+    for d in trades:
+        coro = send_outright_two_waves(
+            symbol=d['symbol'], option_row=d['option_row'],
+            target_premium=d['target_premium'],
+            account=account,
+            max_edge_from_sprc=CFG.MAX_EDGE_FROM_SPRC,
+            max_edge_for_limit1=CFG.MAX_EDGE_FOR_LIMIT1,
+            max_edge_for_limit2=CFG.MAX_EDGE_FOR_LIMIT2,
+            max_edge_pct_of_sprc=edge_pct,
+            direction='Buy', userData=d['user_data']
+        )
+        order_coros.append((coro, d))
+
+    print(f"{pretty_time()} -- Starting asyncio.run(send_trades()) 350PM_SS")
+    if SEND_TRADES:
+        async def safe_send(coro, trade_name):
+            """Wrap a trade coroutine so one failure doesn't kill the rest.
+            Returns the send_outright_two_waves result dict (zeros on error)."""
+            try:
+                return await coro
+            except Exception as e:
+                print(f"ERROR sending trade '{trade_name}': {e}")
+                return {'w1_filled': 0, 'w1_avg': 0.0, 'w1_spent': 0.0,
+                        'w2_gc': None, 'w2_size': 0, 'w2_limit': None, 'w2_end_dt': None}
+
+        async def send_trades():
+            return await asyncio.gather(
+                *[safe_send(coro, d['user_data']) for coro, d in order_coros]
+            )
+
+        results = asyncio.run(send_trades())
+        for (_, d), res in zip(order_coros, results):
+            d.update(res)
+            # Provisional totals = W1 only; collect_w2_fills adds W2 after it expires.
+            d['filled'] = int(res['w1_filled'])
+            d['premium_paid'] = float(res['w1_spent'])
+    else:
+        # Dry-run: estimate filled at target_premium / snap_ask and premium = target_premium
+        for _, d in order_coros:
+            est_ct = max(1, math.ceil(d['target_premium'] / max(d['snap_ask'], 0.01) / 100))
+            d['filled'] = est_ct
+            d['premium_paid'] = d['target_premium']
+            d.update({'w1_filled': est_ct, 'w1_avg': 0.0, 'w1_spent': d['target_premium'],
+                      'w2_gc': None, 'w2_size': 0, 'w2_limit': None, 'w2_end_dt': None})
+    print(f"{pretty_time()} -- Finished asyncio.run(send_trades()) 350PM_SS")
+
+    return t_options_send
+
+
+def post_chat_summary(decisions, signal_data, today_is_special, account):
+    """Phase 4: build the chat recap, print it, and post to chat.
+
+    Sent IMMEDIATELY after the W2 orders are fired (355pm-style) -- fill numbers
+    are W1-only at this point; any W2 still resting is shown as 'working' and its
+    final fills go out later via post_w2_final_summary.
+    """
+    spx_imbal = signal_data['spx_imbal']
+    ndx_imbal = signal_data['ndx_imbal']
+
+    summary = (f"{dt.date.today().strftime('%m/%d/%Y')} {CFG.NAME} "
+               f"3:50 PM Algo{' TEST' if IS_TEST else ''} RECAP:\n\n")
+    summary += f"SPX imbal: {f'{spx_imbal/1e6:+,.0f}M' if spx_imbal is not None else 'N/A'}.  "
+    summary += f"NDX imbal: {f'{ndx_imbal/1e6:+,.0f}M' if ndx_imbal is not None else 'N/A'}.  "
+    summary += f"Special day: {today_is_special}.\n"
+
+    total_premium_paid = 0.0
+    for d in decisions:
+        if not d['will_trade']:
+            continue
+        filled = d.get('filled', 0)
+        premium_paid = d.get('premium_paid', 0.0)   # REAL spend from avg fill price
+        total_premium_paid += premium_paid
+        avg_fill = (premium_paid / filled / 100) if filled > 0 else 0.0
+        summary += (
+            f"\n*{d['user_data']}* ({account}):\n"
+            f"Buy {filled} {d['symbol']} "
+            f"{d['strike']:g}{d['cp'][0]} @ ${avg_fill:.2f} avg "
+            f"(mult={d['size_mult']}x, target=${d['target_premium']:,.0f}, "
+            f"prem ${premium_paid:,.0f}, imbal {d['combined_imbal']/1e6:+,.0f}M)\n"
+        )
+        if d.get('w2_gc') is not None:
+            summary += (f"W2 working {d['w2_size']} more @ ${d['w2_limit']:.2f} limit "
+                        f"({CFG.WAVE_2_DURATION_S}s) -- fills in follow-up msg\n")
+
+    any_w2 = any(d.get('w2_gc') is not None for d in decisions if d['will_trade'])
+    summary += (f"\nTotal premium paid{' (W1 so far; W2 fills follow)' if any_w2 else ''}: "
+                f"${total_premium_paid:,.0f}\n")
+
+    # Size-multiplier breakdown per trade (special-day / momentum / SPX flags).
+    for d in decisions:
+        if not d['will_trade']:
+            continue
+        summary += (
+            f"\n{d['symbol']} size mult breakdown:\n"
+            f"mult_special_day = {d['mult_special']}\n"
+            f"mult_momentum = {d['mult_momentum']}\n"
+            f"mult_spx_imbal = {d['mult_spx']}\n"
+        )
+
+    print(summary)
+    try:
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary,
+                     my_chat)
+    except Exception as e:
+        print(f"WARNING: chat send failed: {e}")
+
+
+def collect_w2_fills(decisions):
+    """Phase 4b: wait for each W2 order to expire, then fold its fills into
+    d['filled'] / d['premium_paid'] (which hold W1-only numbers from the
+    immediate-recap phase). No-op for trades without a W2. Must run BEFORE
+    write_bbg_exit_file and send_stock_unwinds -- both need final fill counts."""
+    for d in decisions:
+        if not d['will_trade'] or d.get('w2_gc') is None:
+            continue
+        # W2 dies at fire-time + wave2_duration; +1.5s for SR state to settle.
+        target = d['w2_end_dt'] + dt.timedelta(seconds=1.5)
+        if getNowEst() < target:
+            wait_until(target, poll_interval=0.1)
+        filled2, avg2 = _outright_get_fill_data(d['w2_gc'])
+        if filled2 > 0 and avg2 <= 0:
+            avg2 = float(d['w2_limit'])
+            print(f"  {d['symbol']} W2: avgFillPrice not yet populated; using cap ${avg2:.2f}")
+        d['w2_filled'] = int(filled2)
+        d['w2_avg'] = float(avg2)
+        d['filled'] = int(d['w1_filled']) + int(filled2)
+        d['premium_paid'] = float(d['w1_spent']) + filled2 * avg2 * 100
+        print(f"  {d['symbol']} W2 result: filled {filled2}/{d['w2_size']} @ ${avg2:.3f} avg  "
+              f"(trade total {d['filled']} contracts, prem ${d['premium_paid']:,.0f})")
+
+
+def post_w2_final_summary(decisions):
+    """Phase 4c: short follow-up chat message with final W2 fills. Skipped
+    entirely when no W2 was sent (recap numbers were already final)."""
+    lines = []
+    for d in decisions:
+        if not d['will_trade'] or d.get('w2_gc') is None:
+            continue
+        lines.append(f"{d['symbol']} W2 final: filled {d['w2_filled']}/{d['w2_size']} "
+                     f"@ ${d['w2_avg']:.2f} -- trade total {d['filled']} contracts, "
+                     f"prem ${d['premium_paid']:,.0f}")
+    if not lines:
+        return
+    msg = (f"{dt.date.today().strftime('%m/%d/%Y')} {CFG.NAME}"
+           f"{' TEST' if IS_TEST else ''} W2 fills:\n" + "\n".join(lines))
+    print(msg)
+    try:
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + msg, my_chat)
+    except Exception as e:
+        print(f"WARNING: chat send failed: {e}")
+
+
+def post_no_trade_summary(tickers, signal_data, today_is_special, reason):
+    """Chat ping for the no-trade path so we know the algo ran cleanly even on
+    quiet days. Includes SPX/NDX context + the per-ticker imbal table.
+
+    Called from main's early-exit branches. signal_data may be None (when the
+    SS imbal pull failed entirely) -- in that case we just send the reason."""
+    summary = (f"{dt.date.today().strftime('%m/%d/%Y')} {CFG.NAME} "
+               f"3:50 PM Algo{' TEST' if IS_TEST else ''} -- {reason}\n")
+    if signal_data is not None:
+        spx_imbal = signal_data['spx_imbal']
+        ndx_imbal = signal_data['ndx_imbal']
+        summary += (
+            f"SPX imbal: {f'{spx_imbal/1e6:+,.0f}M' if spx_imbal is not None else 'N/A'}.  "
+            f"NDX imbal: {f'{ndx_imbal/1e6:+,.0f}M' if ndx_imbal is not None else 'N/A'}.  "
+            f"Special day: {today_is_special}.\n"
+        )
+        # Triple-backtick code block so the table renders monospaced in chat.
+        summary += "```\n" + format_imbal_table(tickers, signal_data['imbal']) + "\n```"
+
+    print(summary)
+    try:
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary,
+                     my_chat)
+    except Exception as e:
+        print(f"WARNING: chat send failed: {e}")
+
+
+def write_bbg_exit_file(decisions):
+    """Write a Bloomberg OI-format CSV with the stock unwind orders, one row per
+    filled option trade. Backup for when SR Trade LOC orders fail -- the user
+    uploads this file into Bloomberg to execute the stock leg.
+
+    Format (no header), one row per filled trade:
+        TICKER, SIDE, SHARES, STRIKE, ACCOUNT, DESCRIPTION, , , LOC
+
+    SIDE:   B if we bought Puts  (need to BUY stock to cover the short assignment)
+            S if we bought Calls (need to SELL stock to deliver the long assignment)
+    TICKER: the actual traded leg (e.g. GOOG when Alphabet falls back to GOOG).
+    Always written when any trade filled, regardless of IS_TEST / SEND_LOC -- this
+    is a low-cost backup artifact that prod overwrites if it runs later in the day.
+    """
+    rows = []
+    for d in decisions:
+        if not d['will_trade'] or d.get('filled', 0) <= 0:
+            continue
+        side = 'B' if d['cp'] == 'Put' else 'S'
+        shares = int(d['filled']) * 100
+        rows.append(f"{d['symbol']} US EQUITY,{side},{shares},{d['strike']:g},"
+                    f"{EXIT_FILE_ACCOUNT},{EXIT_FILE_DESC},,,LOC")
+    if not rows:
+        print(f"{pretty_time()} -- No filled trades; skipping BBG exit backup file")
+        return
+    EXIT_FILE_DIR.mkdir(parents=True, exist_ok=True)
+    path = EXIT_FILE_DIR / f"{dt.date.today().strftime('%m_%d_%Y')}.csv"
+    with open(path, 'w') as f:
+        f.write('\n'.join(rows) + '\n')
+    print(f"{pretty_time()} -- BBG exit backup file: {path} ({len(rows)} rows, LOC)")
+
+
+def send_stock_unwinds(decisions, account, t_options_send):
+    """Phase 5: wait LOC_DELAY_S after option send, then fire stock unwinds.
+
+    For each filled option, send a stock order at the strike price:
+      - Call -> Sell shares at strike (assigned long shares -> deliver)
+      - Put  -> Buy  shares at strike (assigned short shares -> cover)
+
+    Mode controlled by global SEND_LOC: True -> tradeSharesLOC (LmtOnCls),
+    False -> tradeSharesLimit (immediate limit).
+    """
+    target_loc_dt = t_options_send + dt.timedelta(seconds=CFG.LOC_DELAY_S)
+    print(f"{pretty_time()} -- Waiting until "
+          f"{target_loc_dt.strftime('%I:%M:%S.%f %p')[:-3]} "
+          f"(option_send + {CFG.LOC_DELAY_S}s) before stock unwind")
+    if not IS_TEST:
+        wait_until(target_loc_dt, poll_interval=0.1)
+
+    print(f"{pretty_time()} -- Starting stock unwind orders "
+          f"({'LOC' if SEND_LOC else 'immediate-limit'}) 350PM_SS")
+    for d in decisions:
+        if not d['will_trade']:
+            continue
+        filled = d.get('filled', 0)
+        if filled <= 0:
+            print(f"  {d['symbol']}: SKIP (0 contracts filled)")
+            continue
+        stock_size = int(filled) * 100
+        side = 'Sell' if d['cp'] == 'Call' else 'Buy'   # call->long->sell; put->short->buy
+        limit = float(d['strike'])
+        unwind_user_data = f"{d['user_data']}_UNWIND"
+
+        if not SEND_TRADES:
+            print(f"  {d['symbol']}: DRY-RUN  {side} {stock_size} @ ${limit:g} "
+                  f"({'LOC' if SEND_LOC else 'limit-immediate'})")
+            continue
+
+        try:
+            if SEND_LOC:
+                gc = tradeSharesLOC(symbol=d['symbol'], size=stock_size, account=account,
+                                     order_side=side, limit_price=limit,
+                                     userData=unwind_user_data)
+                print(f"  {d['symbol']}: LOC sent  {side} {stock_size} @ ${limit:g}  gc={gc}")
+            else:
+                gc = tradeSharesLimit(symbol=d['symbol'], size=stock_size, account=account,
+                                       order_side=side, limit_price=limit,
+                                       order_duration=60,
+                                       userData=unwind_user_data)
+                print(f"  {d['symbol']}: limit-immediate  {side} {stock_size} @ ${limit:g}  gc={gc}")
+        except Exception as e:
+            print(f"  {d['symbol']}: ERROR sending stock unwind -- {e}")
+    print(f"{pretty_time()} -- Finished stock unwind orders 350PM_SS")
+
+
+# ============================================================================
+# Main -- orchestration
+# ============================================================================
+if __name__ == "__main__":
+    warm_up_bloomberg_connection()   # pay blpapi Session.start() now, not at the 3:48 price pull (see helpers)
+    print(f"{pretty_time()} -- Starting 350pm SS algo. Strategy={CFG.NAME}")
+    print(f"  IS_TEST={IS_TEST}  SEND_TRADES={SEND_TRADES}")
+
+    if is_month_end():
+        # We already include month_end in the special-day multiplier so this is
+        # informational rather than a skip.
+        print(f"  NOTE: today is month-end (will trigger 2x multiplier)")
+
+    tickers = list(CFG.UNIVERSE.keys())
+    today_is_special = is_special_day()
+    account = TEST_ACCOUNTS[CFG.ACCOUNT] if IS_TEST else CFG.ACCOUNT
+    # Sending test orders to v8 -> route to the v8 test account (T.AGM* only exists on v7).
+    if IS_TEST and SEND_V8 and str(account).startswith("T.AGM"):
+        account = "T.AGMV8.01"
+    print(f"  Universe: {tickers}")
+    print(f"  Account: {CFG.ACCOUNT} -> {account} (IS_TEST={IS_TEST})")
+    print(f"  today_is_special: {today_is_special}")
+
+    if not IS_TEST and not SEND_TRADES:
+        raise AssertionError("SEND_TRADES=False with IS_TEST=False is not allowed")
+
+    # Pre-check: are 0DTE single-stock options listed today for ANY universe name?
+    # Probes the whole universe (NVDA-as-sentinel broke 8/26/2026: NVDA skipped a
+    # daily while the other 7 had listings). Exit only if NONE have 0DTE today.
+    _today = dt.date.today()
+    _probe_sql = f"""SELECT 1 FROM {_srof.IMPLIED_QUOTE_TABLE}
+                     WHERE okey_tk IN ({','.join(f"'{t}'" for t in tickers)})
+                       AND okey_yr = {_today.year}
+                       AND okey_mn = {_today.month}
+                       AND okey_dy = {_today.day}
+                     LIMIT 1"""
+    if run_query(_probe_sql).empty:
+        print(f"{pretty_time()} -- No 0DTE SS options today, exiting")
+        sys.exit(0)
+
+    # Startup chat ping (concise, matches 350pm_script.py format). Stale-calendar
+    # warning is appended on a second line only if it fires.
+    start_msg = (f"{getNowEst().time().strftime('%I:%M:%S %p')} "
+                 f"Starting 350pm SS algo. Special day: {today_is_special}")
+    stale_warning = likely_stale_calendars()
+    if stale_warning:
+        start_msg += f"\n{stale_warning}"
+
+    print(f"{pretty_time()} -- {start_msg}")
+    try:
+        send_message(start_msg, my_chat)
+    except Exception as e:
+        print(f"WARNING: startup chat send failed: {e}")
+
+    # Phase 1: data pulls (3pm prices, 3:50 spot, imbals).
+    signal_data = pull_signal_data(tickers)
+    if signal_data is None:
+        print(f"{pretty_time()} -- No SS imbal data. Exiting.")
+        post_no_trade_summary(tickers, None, today_is_special,
+                               "No SS imbal data, exiting")
+        sys.exit(0)
+
+    # Phase 2: per-ticker decisions (qualifiers, chain pull, build trades).
+    decisions = decide_trades(tickers, signal_data, today_is_special)
+    if not any(d['will_trade'] for d in decisions):
+        print(f"{pretty_time()} -- No trades to send. Exiting.")
+        post_no_trade_summary(tickers, signal_data, today_is_special,
+                               "No qualifying signals, no trades sent")
+        sys.exit(0)
+
+    # Phase 3: send option orders. Returns at W2-fire (~t+4s), not W2-expiry.
+    # Records t=0 for LOC delay.
+    t_options_send = send_option_orders(decisions, account, today_is_special)
+
+    # Phase 4: post chat recap IMMEDIATELY (W1 fills + any W2 shown as working).
+    post_chat_summary(decisions, signal_data, today_is_special, account)
+
+    # Phase 4b: wait out the W2 windows, fold W2 fills into decisions.
+    collect_w2_fills(decisions)
+
+    # Phase 4c: write Bloomberg OI-format backup file BEFORE LOCs so it's on disk
+    # in case the LOC sends fail and the user needs to upload manually. Needs
+    # final fill counts -> must follow collect_w2_fills.
+    write_bbg_exit_file(decisions)
+
+    # Phase 4d: short follow-up chat message with final W2 fills (if any W2 sent).
+    post_w2_final_summary(decisions)
+
+    # Phase 5: wait LOC_DELAY_S after option send, then fire stock unwinds.
+    # (LOC timing unchanged: W2 expires ~t+41s, LOC target is t+LOC_DELAY_S.)
+    send_stock_unwinds(decisions, account, t_options_send)
+
+    print(f"{pretty_time()} -- Done.")

@@ -1,0 +1,73 @@
+"""
+Large index flows -- step 3c: strangle cost vs the name's one-day realized-vol move.
+
+Per event and entry time:
+  * sigma_30d = Bloomberg VOLATILITY_30D (annualized 30-day close-to-close realized vol, %) as of
+    the PRIOR trading day's close, via the cached my_bdh
+  * one_day_move_bps = sigma_30d / sqrt(252) x 100
+  * strangle_bps = closest-OTM call + put cost at the entry time in bps of spot (same fills as the
+    backtest: bid + 70% x spread, 10-sec median, rounded up; no cost-cap push)
+  * ratio = strangle_bps / one_day_move_bps   (higher = pricier relative to how the name moves)
+PnL / payout per event come from backtest_strangle.run_backtest at the same entry (max_pushes=0).
+
+Run from Git Bash:  python /d/agent_projects/large_index_flows/realized_vol_richness.py [--entry 15:00 15:40]
+Output: realized_vol_richness_<HHMM>.csv per entry time, table printed per entry.
+"""
+import argparse
+import datetime as dt
+import os
+
+import numpy as np
+import pandas as pd
+import vbam_utilities as vbam
+from sqlalchemy import create_engine
+from vbam_utilities.bloomberg import my_bdh
+
+import backtest_strangle as bs
+
+VOL_FIELD = 'VOLATILITY_30D'
+OUT_TMPL = os.path.join(bs.PROJ_DIR, 'realized_vol_richness_{}.csv')
+
+
+def realized_vol_tm1(symbol, date):
+    """VOLATILITY_30D (annualized %) as of the prior trading day's close; NaN if Bloomberg has none."""
+    d = vbam.prev_trading_day(date)
+    try:
+        return float(my_bdh(f'{symbol} US Equity', VOL_FIELD, d, d, adjust='-').iloc[0, 0])
+    except Exception as e:
+        print(f"  {symbol} {d}: {VOL_FIELD} failed: {e}", flush=True)
+        return np.nan
+
+
+def build(eng, entry_time):
+    """One row per event: sigma_30d, one-day move bps, strangle cost bps, ratio, pnl, payout; sorted by ratio."""
+    label = entry_time.strftime('%H:%M')
+    events = bs.load_events(spot_col=label)
+    bt = bs.run_backtest(events, eng, entry_time=entry_time, otm_bps=0, max_pushes=0)
+    bt['sigma_30d'] = [realized_vol_tm1(s, d) for s, d in zip(bt.symbol, bt.eff_date)]
+    bt['one_day_move_bps'] = bt['sigma_30d'] / np.sqrt(252) * 100
+    bt['strangle_bps'] = bt['cost_bps']
+    bt['ratio'] = bt['strangle_bps'] / bt['one_day_move_bps']
+    bt['payout'] = (bt['payoff_bps'] - bt['cost_bps']) / bt['cost_bps']
+    bt['entry'] = label
+    cols = ['entry', 'eff_date', 'symbol', 'est_flow_bn', 'spot_1500', 'call_strike', 'put_strike', 'call_px', 'put_px',
+            'sigma_30d', 'one_day_move_bps', 'strangle_bps', 'ratio', 'move_bps', 'pnl_hold_bps', 'payout']
+    out = bt[cols].rename(columns={'spot_1500': 'spot', 'pnl_hold_bps': 'pnl_bps'})
+    out = out.sort_values('ratio', ascending=False).reset_index(drop=True)
+    out.to_csv(OUT_TMPL.format(entry_time.strftime('%H%M')), index=False)
+    return out
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--entry', nargs='+', default=['15:00', '15:40'])
+    a = ap.parse_args()
+    eng = create_engine(bs.vbam_helpers.dev_connection_string, pool_pre_ping=True)
+    pd.set_option('display.width', 300)
+    show = ['eff_date', 'symbol', 'est_flow_bn', 'sigma_30d', 'one_day_move_bps', 'strangle_bps', 'ratio', 'pnl_bps', 'payout']
+    for e in a.entry:
+        t = dt.datetime.strptime(e, '%H:%M').time()
+        df = build(eng, t)
+        print(f"\n=== entry {e} ===")
+        print(df[show].to_string(index=False, float_format=lambda x: f'{x:,.2f}'))
+        print(f"median ratio {df.ratio.median():.2f}, mean {df.ratio.mean():.2f}; corr(ratio, payout) {df.ratio.corr(df.payout):.2f}")

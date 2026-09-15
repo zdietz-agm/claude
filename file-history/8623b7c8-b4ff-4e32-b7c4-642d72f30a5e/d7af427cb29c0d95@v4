@@ -1,0 +1,333 @@
+REVIEW GUIDE -- how to write the daily automated algo review
+============================================================
+
+Read this file, then review_corrections.txt, at the start of every run. The scheduled task
+prompt is the driver; this file is the detail and the style contract. Zach edits both this
+file and review_corrections.txt as he corrects the output, so THIS FILE WINS over habit.
+
+1. WHAT THE REVIEW IS
+---------------------
+A tight, skimmable account of how yesterday's EOD algos actually behaved, aimed at three
+decisions Zach makes: make dynamic edge sizing more/less aggressive, change the backtest or
+prod infra when they disagree, and size a strategy up or down.
+
+It is NOT a log dump, not a tutorial, and not a hedge. If a fact is not verified, leave it
+out entirely (see section 6).
+
+TWO HARD RULES, from corrections #3-#8. These outrank everything else in this file:
+
+  SCOPE: every line must be about a script in run_algos.sh. Anything else gets deleted, even
+  if it is true and short. No whole-book PnL, no non-algo strategies, no prior-day
+  corroboration, no root-cause derivation, no reasoning about what a fix would be.
+
+  FLAG, DO NOT ADJUDICATE: state the finding and stop. Where it matters, use his severity
+  words -- "Needs attention." / "May need attention." / "THIS SHOULD BE REVIEWED." Never
+  write "cost nothing", "was the good outcome", "correctly", or any verdict that closes the
+  question for him. He makes the call; the review surfaces the fact.
+
+The review exists to SAVE HIM TIME. A shorter review that flags the right three things beats
+a complete one he has to read twice.
+
+2. INPUTS, IN READING ORDER
+---------------------------
+a) packs/<YYYY_MM_DD>/digest.txt   -- every number, already computed. Read this FIRST and
+   in full. It contains: input freshness, prod-vs-backtest PnL by strategy, PnL streaks,
+   market state and trade-gate distances, fills by wave, fill verdicts, V8 size-ratio check,
+   sprc-vs-NBBO flags, slowness flags, per-script inventory with order activity and errors.
+b) packs/<YYYY_MM_DD>/<script>_clean.txt -- the cleaned prod logs. Read 350pm_script and
+   355pm_script every day. Read any other script the digest flagged (error lines, an
+   unexplained gap, an unfilled order, a missing log). Skim the rest.
+c) On demand only: fill_price_review, prod_change_logs, git history (section 5).
+d) The 355PM hacker check lives INSIDE the digest's 355pm_script and 355pm_script_v8 blocks
+   as a "355 HACKER -- prod vs hacker backtest" sub-block. It prints ONLY when prod has a
+   HACK_ row in algo_trade_log for that script or the hacker backtest
+   (Downloads/hacking_355_backtest_cap*_last5_*.xlsx, built 8:19 by CreateBacktestsHacker at
+   prod's HACK_MAX_PRICE, --all-parents, --last-days 5) attempted a hack on the review date.
+   No sub-block = no hack activity = write nothing about hacking. When it prints, the review
+   gets ONE hacker line in that script's block: what prod sent/filled at what debit, what the
+   model did, and any line under "HACKER FLAGS". Only the flags are discrepancies (section 7
+   lists what is by design).
+
+The digest is derived, not authoritative. When the digest and a log disagree, the log wins
+-- and say so in the review, because it means build_review_pack.py needs a fix.
+
+3. STRUCTURE OF THE OUTPUT FILE
+-------------------------------
+Write D:/PycharmProjects/scratch/algos/automated_algo_reviews/<MM_DD_YYYY>.txt, where the
+date is the TRADE DATE REVIEWED (not today). ASCII only, CRLF. Overwrite on a re-run.
+
+HARD WRAP AT 120 CHARACTERS (correction #1). No line in the .txt may exceed 120 chars --
+wrap a long bullet onto continuation lines indented 2 spaces so the "- " bullets stay
+scannable. This applies ONLY to the .txt. Do NOT wrap the Google Chat message; Chat inserts
+its own line breaks, so send that text unwrapped.
+
+Line 1:   PROD PNL <x>k, Backtest PNL <y>k
+          Totals across the algo strategies only. If prod or backtest is unavailable, say
+          which and why on that line instead of guessing a number.
+
+Then one block per script that traded, most important first (350pm_script and 355pm_script
+lead unless something else dominated the day). Each block:
+
+    <script_name>:
+    - <finding>
+    - <finding>
+
+Findings, in this order when they apply:
+  1. Slowness / data-pull problems. If clean, one line: "No notable slow data issues."
+  2. Fills: which wave, whether anything was underfilled, and what that implies about edge
+     aggressiveness. Name the option and the sprc-vs-fill or sprc-vs-NBBO numbers.
+  3. Reconciliation: lead with the AGGREGATE prod vs backtest (correction #14). If the
+     aggregate reconciles and no algo breaches the #7 materiality bar, the whole thing is
+     "Backtest and prod agree." -- no PnL pair, no lot counts, no idx_at_trade comparison
+     (correction #18). Spend detail only on the algos that actually disagree, and decompose
+     the gap (CLOSER precedence, loss-cap pro-rata, fills) per correction #15.
+  4. Sizing signal: NEVER as a stats readout (correction #11). A streak earns words only if
+     it changes a sizing decision, and then it goes inside that strategy's bullet with the
+     action -- never as its own "N up days in a row, +$X" line.
+  5. Anything unusual: config/infra behavior, caps, month-end/MOC. Two things that are NOT
+     findings: a v8 size that is what V8_SIZE_RATIO implies once floored (correction #19), and
+     a near-miss outside the tight bars -- under 5 bps, under one vol point, or under $100M
+     from a trigger (correction #17). The digest's TRADE-GATE DISTANCES section prints only
+     gates inside those bars; if it says write no near-miss line, write none.
+
+Last block, verbatim shape:
+
+    Didn't trade/does not need human review: <script>.py, <script>.py, ...
+
+A script with a genuine finding (error, unexplained slowness, tried-and-unfilled) does NOT
+belong on that line even if it made no money -- give it its own short block.
+
+EXCEPTION, 4pm_script_v3 (correction #20): it earns a block ONLY for an execution error or an
+open watch item in section 8 naming it. Normal condor fills, resends that eventually fill, and
+expiry settlement -- however large the PnL -- go on the didn't-need-review line. This is a
+higher bar than the other scripts get.
+
+4. VOICE
+--------
+Match the two seed reviews in this folder (08_17_2026.txt, 08_18_2026.txt). Concretely:
+
+  - Bullets are short declarative sentences. Numbers inline. No preamble, no wrap-up.
+  - State the mechanism, not the category: "0 fills because both target prices were below
+    min price so the target rounded up to min price" beats "unfilled due to pricing".
+  - Quantify: "Fill price 1.17 vs sprc 1.083 on the 7750 call" beats "filled well".
+  - Draw the conclusion Zach would draw, in his terms: "Doesn't point to a need to make
+    edge targets more aggressive." / "Needs attention."
+  - Counterfactuals are welcome when the day was a near-miss, with the distance: "had the
+    market been ~3bps lower we would have been in a DOWN market and IMBAL_VS_MARKET would
+    have triggered". Take the distance from the digest's MARKET STATE AND TRADE-GATE
+    DISTANCES section, which computes it for every gate -- and only call something a
+    near-miss if that section marks the binding gate CLOSE. A veto line in the log
+    ("*Don't trade X* because <veto>") is evaluation order, not near-ness: see correction
+    #16. The closest gate is often market type or a vol bin edge, not imbal.
+  - No em-dashes, no unicode, no markdown headers/bold inside the .txt.
+  - Whole review target: under ~40 lines. If it runs longer, cut commentary, not facts.
+
+5. WHEN TO DIG (and when not to)
+--------------------------------
+Escalate only on a specific unexplained fact, never routinely:
+
+  - fill_price_review: run
+      python D:/agent_projects/fill_price_review/fill_price_review.py <ALGO> <YYYY-MM-DD>
+    when an order went unfilled or filled oddly and the digest cannot explain why. It needs
+    the SpiderRock VPN (198.102.4.55:3307). If the VPN is down, say the second-by-second
+    check was not available and move on -- do not speculate in its place.
+  - prod_change_logs: read D:/agent_projects/eod_option_algos/prod_change_logs/ before
+    suggesting any size change, so the review never proposes reverting a deliberate one.
+  - git log on a config in D:/PycharmProjects/scratch/algos/configs*/ when a trigger or
+    size looks different from what the backtest assumed.
+  - The reconcile-backtests skill: load it when a discrepancy needs real chasing. Its
+    known-divergence checklist covers most daily gaps -- min-price-on-replay, SR uPrc vs
+    ThetaData index straddling the $1 min-strike-distance gate, CLOSER-takes-precedence
+    over BUMPED, loss-cap pro-rata that no backtest models, month-end and Fed exclusions.
+
+Do not run a full backtest, rebuild combined data, or start any multi-minute job other than
+the regen path the task prompt authorizes.
+
+6. THE CERTAINTY RULE
+---------------------
+This review can drive a sizing or config change, so a wrong conclusion is worse than no
+conclusion. State as fact only what a log line, DB row, workbook cell, or code path shows.
+Everything unverified is OMITTED -- no speculation and no hedge labels either. "Consistent
+with" is the strongest phrase allowed for an arithmetic fit that is not directly confirmed.
+
+Where a number in the review came from a specific place, name the place compactly inline
+(file, table, or workbook), the way the seed reviews name the option and the price.
+
+7. KNOWN-GOOD PATTERNS (do not report these as problems)
+--------------------------------------------------------
+  - A 3s pause after wave-1 send: the orchestrator's designed sleep for SR to work orders.
+    The concurrent hacker has the same 3s window after ITS wave-2; since 9/10/26 it announces
+    itself ("[hacker] HACK_... sleeping 3s for SR to work wave-2", hacker_trades.py) and the
+    digest's announced-sleep windows cover it. In logs BEFORE 9/10/26 that pause shows as an
+    UNEXPLAINED ~2.9s gap after "Phase 6 done" ending in a fill-check SELECT -- designed wait,
+    not a stall. Only a gap OVER ~4s there is real. The
+    concurrent hacker task can print inside it ("[hacker] no adversarial hackers survived gate");
+    since 9/3/26 the digest tracks announced sleep windows so this no longer shows as UNEXPLAINED.
+  - A 60s pause at the end: algo_trade_logger waiting for SR fills to settle.
+  - Long idle stretches between 15:32, 15:40, 15:50, 15:55, 16:00: scheduled phase waits.
+  - The first query of a phase showing a large conn= time: connection-pool miss, expected.
+  - A 1-lot order at a $0.15 credit going unfilled at a $0.30 min_price: the min_price
+    floor, working as designed. Worth ONE line, not analysis.
+  - btic_and_imbal_script printing hundreds of poll lines ~2-4s apart: its poll cadence.
+  - v8 atmVol printing far below v7's at the same snap (e.g. 0.050 vs 0.109 on 9/1, 0.046 vs
+    0.099 on 8/28): KNOWN SpiderRock-side bug, fix promised 9/12/26. Do NOT flag it in any
+    review through 9/12/26. On the first review AFTER 9/12, check v7-vs-v8 atmVol once and
+    report whether the fix landed -- then delete this entry (fixed) or resume flagging (not).
+    Note the bug is in the vol PRINT; if a v8 TRADE decision visibly turned on the bad vol
+    (a regime-edge or BUMPED gate flip), that trade impact is still reportable.
+  - A ~1s pause right after a "Sending start message to chat" / "extra spread orders" line:
+    the Google Chat webhook round trip, at its normal cost. Anything materially above that is
+    NOT benign -- see WATCH ITEM 1 in section 8.
+  - The main backtest showing $5-$35 on a strategy prod never filled: the backtest's
+    min-price replay on a 1-lot, not a missed signal.
+
+  - The 340PM/350PM OUTRIGHT family showing no backtest row: create_backtests.py filters
+    every OUTRIGHT config unless --outright is passed. Structural and already understood --
+    do NOT spend a line on it.
+
+  - EQUITY_ALGO_42 350PM FIRST TICK LIMIT EXIT: never deployed in prod (no PNL LOG NEW.xlsx
+    row ever). An equity-backtest row with no prod row for it is structural -- do NOT report
+    it as a Cat 1.
+
+  - IMBAL GROWS EXTRA PUTS is BOOKED INSIDE IMBAL GROWS in PNL LOG NEW.xlsx (confirmed by
+    Zach 2026-09-11). It trades in prod in its own account (EOD23_C42) and shows its own
+    algo_trade_log fills, but it has never had a PNL LOG row on any date -- its dollars are
+    already inside the IMBAL GROWS row. So: do NOT report it as a Cat 1 "backtest traded,
+    prod did not", and do NOT compare IMBAL GROWS' prod PnL against the IMBAL GROWS backtest
+    sheet alone -- the parent's prod number covers both sheets. build_review_pack.py now
+    encodes this in PNL_LOG_FOLDS: the digest lists the child under "BOOKED INSIDE ANOTHER
+    PNL LOG ROW", folds its backtest PnL into the parent, and prints a "note:" line on the
+    parent's verdict saying how much was folded in. Read the folded number; write nothing
+    about the fold unless a finding turns on it. Any future child booked this way goes in
+    PNL_LOG_FOLDS, not in a review bullet.
+
+  - IMBAL_GROWS CLOSER or BUMPED showing a backtest fire with no prod trade, WITH veto
+    evidence in the 350 logs: since 9/9/26 prod vetoes BOTH layers when the projected 3:55pm
+    levered-ETF rebal is >4.5B adverse to the sold side (backtests model the gate at 5.0B).
+    Veto evidence = the "!!!!... IMBAL_GROWS_CLOSER <Call|Put> VETOED: projected 355 rebal"
+    / "IMBAL_GROWS_BUMPED <Call|Put> VETOED" banners or the "[closer_spread] ... CLOSER
+    VETOED" line in logs/<date>_350pm_script*.txt. Report it as ONE line naming the gate
+    ("GROWS CLOSER backtest-only fire -- prod rebal-vetoed at +X.XB"), not as a Cat 1.
+    Two structural sub-cases, also not Cat 1: adverse rebal in (4.5, 5.0] = prod vetoes but
+    the backtest trades (threshold gap, expected); and small value drift between prod's live
+    ~15:49 estimate and the backtest's 15:50-snap rebal pipeline. On a vetoed-CLOSER day the
+    parent trades at FULL size (no closer decrement), so a parent-size-larger-than-backtest
+    mismatch on that day is part of the same known pattern. A missing prod trade WITHOUT a
+    VETOED line is still reportable as usual. Full detail:
+    eod_option_algos/prod_change_logs/9_9_2026.md.
+
+  - 355 HACKER prod-vs-backtest differences that are BY DESIGN (never flag these; the digest
+    already names them instead of flagging):
+      1. Trigger threshold: backtest |imbal_355| > $1B on T+1 data; prod 950M on the live
+         feed. Inside $0.9-1.1B the two can legitimately disagree on whether a hack fires.
+      2. Fill price/timing: backtest fills at the 15:55:03 cross + slippage under the cap,
+         then a resting bid at exactly the cap to 16:00; prod fires two edge-priced waves
+         ~15:55:02-05 plus a wave-3 rest at the cap. Prod fills are usually BETTER.
+      3. Size basis: backtest hack_size = floor(model size / 2); prod = floor(actual filled
+         size / 2), and the v8 book is ratio-sized (~20%).
+      4. Backtest assumes every modeled leg filled at 3:50; prod only hacks legs with
+         size_filled > 0, and skips 1-lot fills (half-size 0).
+    The FOUR real discrepancies, which the digest prints under "HACKER FLAGS": TRIGGER
+    MISMATCH outside the buffer, CAP VIOLATION (avg debit above HACK_MAX_PRICE), SIZE
+    RELATION (sent != floor(parent filled / 2)), and POSSIBLE WAVE-3 MALFUNCTION (section 8).
+
+Anything the digest labels "UNEXPLAINED" deserves a look, but look before reporting. Timed
+waits are read straight out of the prod script (the digest names which script and how many
+marks it found), so an UNEXPLAINED gap is usually a pause that is not clock-driven at all: a
+webhook round trip, an async send, a slow query. Say which it is. If it does turn out to be a
+timed wait the parser missed, say so -- that means wait_marks_for_script() needs fixing, not
+the fallback list.
+
+8. OPEN WATCH ITEMS
+-------------------
+Things we have already seen once and want caught if they recur. These are NOT in the
+known-good list -- flag them, with the prior observation for comparison, so a one-off can be
+told apart from a trend. Zach adds and retires items here.
+
+WATCH ITEM 1 -- Google Chat recap post latency (first seen 2026-08-20)
+  What to measure: the gap between the recap post and the line after it. In the 350 scripts
+  that is "Finished extra spread orders" -> "Starting algo_trade_logger (60s wait for SR
+  fills)". The only network call in between is send_message() to Google Chat; the summary
+  build itself is string formatting, and myGetSpyEquivalent only runs when a trade fired.
+
+  Baseline and what we saw:
+      date    350pm_script (v7)    350pm_script_v8
+      8/18          1.11s               1.34s
+      8/19          1.05s               2.23s
+      8/20          1.02s               9.99s   <- the observation
+  v7 sits on ~1.0s every day. The 8/20 v8 outlier is 10x that.
+
+  FLAG IT IF: any script's recap post exceeds ~3s, or v7's ~1.0s baseline moves. Report the
+  measured span and compare it to the table above -- one slow day is noise, a second one is a
+  trend and Zach wants to know.
+
+  What NOT to claim: on 8/20 this cost nothing. No orders were live, the stall sits after the
+  send phase, and algo_trade_logger sleeps 60s next anyway, so the 10s consumed slack that was
+  already idle. Do not report it as a trading impact on a day where nothing was pending.
+
+  The reason it is on this list anyway: send_message (D:/PycharmProjects/utils/
+  google_chat_webhook.py:29) builds a fresh httplib2.Http() per call with NO timeout, never
+  reads the response, and has no retry. So there is no bound on how long a hung POST can block,
+  and on a day with orders working that stall would sit between the send phase and the
+  fill-check. Best guess for the 8/20 event was a dropped TCP SYN (Windows ~3s initial RTO
+  doubling to ~6s, which lands near the observed 9.99s), but nothing times the POST itself so
+  that was never confirmed.
+
+  Decision as of 2026-08-21: Zach does NOT want the code changed for now. google_chat_webhook
+  is a shared library in D:/PycharmProjects/utils with 69 referencing files, so a fix needs a
+  signature-compatible change and a heads-up to the team. Do not propose the fix again in a
+  daily review -- just flag the recurrence and point at this item.
+
+WATCH ITEM 2 -- EQUITY_ALGO_42 350PM FIRST TICK losing streak (noted 2026-09-01)
+  As of the 8/31/2026 close, FIRST TICK is on a 5-consecutive-losing-fire-day streak
+  (8/14, 8/24, 8/27, 8/28, 8/31; -$5,881 prod). Streak counting skips no-trade days, same
+  as the digest's CONSECUTIVE PNL STREAKS section.
+
+  FLAG IT IF: the streak reaches 7 or 8 consecutive losing fire days. In the 2021-2026
+  backtest (1,066 trade days) only 3 streaks ever reached 7+ (two 7s, one 8 -- the all-time
+  max), so at 7 write "THIS SHOULD BE REVIEWED" -- something may be broken, not just
+  variance. At 5-6 days, one streak line in the review is enough.
+
+WATCH ITEM 3 -- 355 hacker attempted but unfilled when the model filled (added 2026-09-03)
+  The hacker's wave-3 resting order at HACK_MAX_PRICE is new as of 9/2/26 and has never had a
+  live partial-fill test. The digest prints "*** POSSIBLE WAVE-3 MALFUNCTION" in a 355 script
+  block when prod sent a HACK_ order, filled 0, and the hacker backtest shows hack_filled=True
+  (the cross was at/under the cap somewhere in 15:55:03-16:00). That is the most important
+  hacker failure to surface: write it as its own bullet with "THIS SHOULD BE REVIEWED." and
+  quote prod's sent size and wave limits next to the model's exit price and time.
+  Context: prod hackers fired 7/21, 8/27 and 9/1 only (first fills ever on 9/1), so most days
+  have zero hack activity on both sides and the block simply does not print.
+
+WATCH ITEM 4 -- IMBAL_GROWS CLOSER/BUMPED levered-rebal veto (live 9/9/26; prod 4.5B,
+  backtest 5.0B)
+  Source of truth for the number prod used:
+  D:/PycharmProjects/scratch/algos/levered_rebal_355_daily.csv (one row per trade_date,
+  written by btic_and_imbal_script at ~15:49:03; rebal_355_B is the veto input, + = funds
+  must BUY into the close). The 350 logs print a context line at ~15:49:55 (right after the
+  3:49:55 gate, immediately before the 0DTE vol pull -- so it precedes the 3:50 imbalance work):
+  "-- 355 levered rebal for IMBAL_GROWS CLOSER/BUMPED veto: +X.XXB (row YYYY-MM-DD, ...)".
+
+  FLAG IT IF any of these hold for the review date:
+  a) The CSV has no row for the date, rebal_355_B is blank, or poll_time_et is far from
+     ~15:49 -- that was a fail-open day (layers traded unvetoed).
+  b) The 350 logs' context-line value disagrees with the CSV's rebal_355_B for the same
+     row date.
+  c) |rebal_355_B| > 4.5 adverse to a GROWS CLOSER/BUMPED trigger side: confirm the VETOED
+     banners appear AND algo_trade_log shows no 350PM IMBAL_GROWS_CLOSER / IMBAL_GROWS_BUMPED
+     fill on that side (parent IMBAL_GROWS may still trade, at FULL size). The 355PM family's
+     own ALGO_42_355PM_..._IMBAL_GROWS_CLOSER is NOT vetoed -- its fills are not a violation.
+  d) The "REBAL VETO INACTIVE -- could not read projected 355 rebal" banner appears
+     (btic crash / late write / CSV problem).
+  e) constituency_max_age_td > 30: recommend
+     "cd /d/agent_projects/levered_rebal && python _download_constituents.py --mode daily
+      <date> <date>".
+  f) |rebal_355_B| > 3 AND adverse to a GROWS CLOSER or BUMPED trigger (vetoed or not):
+     add ONE recommendation line to refresh the backtest-side rebal projection history so
+     the day can be verified against the backtest's 5.0B gate model:
+     "cd /d/vbam-data-oracle/projects/levered_rebal && python run_levered_rebal.py <start>
+      <trade date>" with <start> = day after the max date in the newest
+     levered_rebal_by_stock_*.parquet in D:/vbam-data-oracle/outputs; skip if the parquet
+     already covers the trade date.
+  Reconciliation note: adverse rebal in (4.5, 5.0] = prod vetoes, backtest trades --
+  expected, see the section-7 bullet, not a Cat 1.
+

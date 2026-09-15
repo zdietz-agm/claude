@@ -1,0 +1,381 @@
+#%% Imports
+import numpy as np
+import pandas as pd
+
+# Detect interactive (Jupyter/PyCharm cells) vs CLI execution. A CLI run must not pop a
+# chart window or block on plt.show() -- this script runs unattended from the scheduled
+# CreateBacktestsExtraLayers task. Same pattern as limit_spread_backtest.py.
+try:
+    get_ipython()  # noqa: F821 -- only defined under IPython/Jupyter
+    IS_INTERACTIVE = True
+except NameError:
+    IS_INTERACTIVE = False
+
+import matplotlib
+if not IS_INTERACTIVE:
+    matplotlib.use('Agg')   # headless: figures build but never display
+import matplotlib.pyplot as plt
+import datetime as dt
+import os
+import sys
+import warnings
+from IPython.display import display
+
+warnings.filterwarnings('ignore', category=pd.errors.DtypeWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+sys.path.insert(0, 'd:/PycharmProjects/utils/')
+sys.path.insert(0, 'd:/PycharmProjects/scratch/algos/')
+sys.path.insert(0, 'D:/agent_projects/eod_option_algos/')
+
+from create_backtests import (
+    build_combined_data, apply_config, load_single_config,
+    load_configs, calculate_stats,
+)
+
+pd.set_option('display.max_columns', 50)
+
+#%% Reimport helpers (run after making changes to helper files)
+import importlib
+import create_backtests
+importlib.reload(create_backtests)
+from create_backtests import (
+    build_combined_data, apply_config, load_single_config,
+    load_configs, calculate_stats,
+)
+
+from test_new_versions import (
+    PROD_CONFIGS_DIR, TEST_CONFIGS_DIR, ensure_data, find_config,
+)
+
+#%% Global Variables / Configuration
+
+# BUMP_CONFIGS is auto-synced from the prod config so this backtest always reflects
+# what's actually deployed. To override and test alternate sizing/strategies, uncomment
+# the hardcoded block below -- it will replace the prod-imported version.
+from configs_bumped_spreads.bumped_spread_config import BUMPED_PARENT_CONFIGS as _PROD_BUMP
+BUMP_CONFIGS = {
+    name: {"dollar_target": cfg["dollar_target"], "max_size": cfg["max_size"]}
+    for name, cfg in _PROD_BUMP.items()
+}
+print(f"BUMP_CONFIGS loaded from prod ({len(BUMP_CONFIGS)} strategies):")
+for _n, _v in BUMP_CONFIGS.items():
+    print(f"  {_n.split('SPX_')[-1]}: ${_v['dollar_target']:,.0f} / {_v['max_size']}")
+
+# # --- MANUAL OVERRIDE: uncomment to test alternate sizing/strategies ---
+# # (Whatever you set here replaces the prod-imported BUMP_CONFIGS above.)
+# BUMP_CONFIGS = {
+#     "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS": {
+#         "dollar_target": 10000,
+#         "max_size": 20,
+#     },
+#     "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET": {
+#         "dollar_target": 10000,
+#         "max_size": 20,
+#     },
+# }
+
+STRAT_NAMES = list(BUMP_CONFIGS.keys())
+
+SYMBOL = "SPXW"
+STRIKE_STEP = 5        # $5 per SPXW strike index
+BUMP_STEP = 5          # how far to bump short strike toward ATM ($5 = 1 index)
+SPREAD_WIDTH = 15      # distance between short and long legs
+MAX_ATM_VOL = 0.14     # only trade when atmVol < this; set to None to disable
+
+# Double-bump fix (identified 9/10/26 on the 9/9 IMBAL_VS_MARKET put). Default False keeps the
+# legacy behavior exactly: the legacy bumped config BOTH decrements the strike index AND lowers
+# min_strike_distance by BUMP_STEP. In the index-based strike logic the distance filter defines
+# index 0, so on days where the parent's filter dropped the near-ATM strike (spot within
+# min_strike_distance of a strike, ~20% of days) the legacy config lands TWO strikes closer than
+# the parent, while prod (bumped_spread_trader.py) is always parent_short +/- BUMP_STEP.
+# With the flag on, min_strike_distance is kept and only the index is decremented, which is
+# exactly one strike closer in the same survivor ladder = prod. Output file gets a distinct name.
+# CLI: python bumped_spread_backtest.py --fix-double-bump   |   interactive: set the var below.
+FIX_DOUBLE_BUMP = "--fix-double-bump" in sys.argv
+if FIX_DOUBLE_BUMP:
+    print("FIX_DOUBLE_BUMP=True: bumped short = parent short +/- BUMP_STEP (prod semantics)")
+
+# Prod's bumped layer skips any parent whose CLOSER already fired that day
+# (bumped_spread_trader.py: `if trade.get("closer_applied"): continue`). Keep True to match
+# prod; set False only to study the counterfactual where bumped fires on CLOSER days too.
+RESPECT_CLOSER_PRECEDENCE = True
+from closer_precedence import closer_fired_keys, get_opra_lookup
+
+# Adverse levered-rebal veto (mirrors prod change 9/9/26, algos/rebal_veto.py): the IMBAL_GROWS
+# BUMPED layer does not fire a side when the projected 3:55pm levered-ETF rebal is adverse by more
+# than the threshold (Calls vetoed if rebal > +T, Puts if rebal < -T). Backtest models the 5.0B
+# analysis threshold; PROD deliberately runs 4.5B (buffer). Vetoed legs are reported separately.
+# Set REBAL_VETO_ENABLED=False for the counterfactual.
+from rebal_355_history import rebal_355_by_date, adverse_rebal_veto
+REBAL_VETO_ENABLED = True
+REBAL_VETO_THRESHOLD_B = 5.0
+REBAL_VETO_PARENTS = {"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS"}
+REBAL_355_BY_DATE = rebal_355_by_date() if REBAL_VETO_ENABLED else {}
+
+#%% Cache: Combined data (shares combined_data_dict with other scripts)
+if 'combined_data_dict' not in dir():
+    combined_data_dict = {}
+
+if SYMBOL not in combined_data_dict or combined_data_dict[SYMBOL] is None:
+    print(f"Building combined data for {SYMBOL}...")
+    combined_data_dict[SYMBOL], _ = build_combined_data(SYMBOL)
+    print(f"Combined data: {combined_data_dict[SYMBOL].shape[0]} rows")
+else:
+    print(f"Reusing cached combined data for {SYMBOL} ({combined_data_dict[SYMBOL].shape[0]} rows)")
+
+#%% Load configs
+configs = load_configs(PROD_CONFIGS_DIR) + load_configs(TEST_CONFIGS_DIR)
+
+#%% Run bumped backtest -- correct side only, with optional vol filter
+
+def sharpe(s):
+    """Annualized Sharpe ratio."""
+    return s.mean() / s.std() * np.sqrt(252) if len(s) > 1 and s.std() > 0 else 0
+
+spxw_vol = combined_data_dict[SYMBOL][["trade_date", "atmVol 350PM"]]
+
+# OPRA panel used by the CLOSER-precedence check (loaded once, process-cached)
+opra_lookup = get_opra_lookup() if RESPECT_CLOSER_PRECEDENCE else None
+
+bump_results = {}
+for strat_name in STRAT_NAMES:
+    cfg = find_config(configs, strat_name)
+    r_orig = apply_config(combined_data_dict[SYMBOL], cfg)
+
+    min_sz = cfg.get("min_size", 1)
+
+    # Days/sides CLOSER took -- prod suppresses bumped on these (closer_applied).
+    closer_keys = (closer_fired_keys(strat_name, r_orig, combined_data_dict[SYMBOL], opra_lookup,
+                                     rebal_by_date=REBAL_355_BY_DATE if REBAL_VETO_ENABLED else None,
+                                     rebal_threshold_dollars=REBAL_VETO_THRESHOLD_B * 1e9,
+                                     rebal_veto_parents=REBAL_VETO_PARENTS)
+                   if RESPECT_CLOSER_PRECEDENCE else set())
+    n_suppressed = 0
+    rebal_vetoed_legs = []   # (trade_date, cp, pnl) removed by the adverse-rebal veto, for reporting
+
+    # Build bumped config (per-strategy sizing)
+    strat_sizing = BUMP_CONFIGS[strat_name]
+    if FIX_DOUBLE_BUMP:
+        # Prod semantics: same min_strike_distance ladder as the parent, one index closer.
+        bumped = {**cfg, "name": cfg["name"] + " BUMP",
+                  "dollar_target": strat_sizing["dollar_target"], "max_size": strat_sizing["max_size"]}
+        for key in ["short_put_strikes", "short_call_strikes"]:
+            if key in bumped and bumped[key]:
+                if min(bumped[key]) == 0:
+                    raise ValueError(f"{strat_name} {key} idx 0 cannot be bumped by index; "
+                                     f"would need min_strike_distance lowered instead")
+                bumped[key] = [idx - 1 for idx in bumped[key]]
+    else:
+        # Legacy: lowers min_strike_distance too -> double-bumps on near-strike days (see flag note)
+        bumped = {**cfg, "name": cfg["name"] + " BUMP",
+                  "min_strike_distance": max(0, cfg.get("min_strike_distance", 0) - BUMP_STEP),
+                  "dollar_target": strat_sizing["dollar_target"], "max_size": strat_sizing["max_size"]}
+        # Bump short strikes 1 index closer to ATM
+        for key in ["short_put_strikes", "short_call_strikes"]:
+            if key in bumped and bumped[key]:
+                bumped[key] = [max(0, idx - 1) for idx in bumped[key]]
+    # Set long strikes SPREAD_WIDTH/STRIKE_STEP indices further OTM from bumped shorts
+    spread_offset = SPREAD_WIDTH // STRIKE_STEP  # 15/5 = 3 indices
+    for short_key, long_key in [("short_put_strikes", "long_put_strikes"), ("short_call_strikes", "long_call_strikes")]:
+        if short_key in bumped and bumped[short_key] and long_key in bumped:
+            bumped[long_key] = [s + spread_offset for s in bumped[short_key]]
+
+    r_bump = apply_config(combined_data_dict[SYMBOL], bumped)
+
+    # Only keep the side(s) that were 1-lot in the original
+    rows = []
+    for i, orig_row in r_orig.iterrows():
+        orig_put_1lot = orig_row["put_size"] == min_sz and orig_row["put_size"] > 0
+        orig_call_1lot = orig_row["call_size"] == min_sz and orig_row["call_size"] > 0
+
+        if not orig_put_1lot and not orig_call_1lot:
+            continue
+
+        td = orig_row["trade_date"]
+
+        # CLOSER precedence: drop any side CLOSER already took (matches prod closer_applied)
+        td_key = pd.Timestamp(td).date()
+        if orig_put_1lot and (td_key, "Put") in closer_keys:
+            orig_put_1lot = False
+            n_suppressed += 1
+        if orig_call_1lot and (td_key, "Call") in closer_keys:
+            orig_call_1lot = False
+            n_suppressed += 1
+        if not orig_put_1lot and not orig_call_1lot:
+            continue
+
+        bump_match = r_bump[r_bump["trade_date"] == td]
+        if bump_match.empty:
+            continue
+        bump_row = bump_match.iloc[0]
+
+        # Adverse levered-rebal veto (prod rebal_veto.py, IMBAL_GROWS only): drop the vetoed side,
+        # remembering its PnL so the effect can be reported after the atmVol filter below.
+        if REBAL_VETO_ENABLED and strat_name in REBAL_VETO_PARENTS:
+            _rebal = REBAL_355_BY_DATE.get(td_key)
+            if orig_put_1lot and adverse_rebal_veto(_rebal, "Put", REBAL_VETO_THRESHOLD_B * 1e9):
+                orig_put_1lot = False
+                rebal_vetoed_legs.append({"trade_date": td, "cp": "Put", "pnl": bump_row["put_pnl"],
+                                          "rebal_355_B": _rebal / 1e9})
+            if orig_call_1lot and adverse_rebal_veto(_rebal, "Call", REBAL_VETO_THRESHOLD_B * 1e9):
+                orig_call_1lot = False
+                rebal_vetoed_legs.append({"trade_date": td, "cp": "Call", "pnl": bump_row["call_pnl"],
+                                          "rebal_355_B": _rebal / 1e9})
+            if not orig_put_1lot and not orig_call_1lot:
+                continue
+
+        put_pnl = bump_row["put_pnl"] if orig_put_1lot else 0
+        call_pnl = bump_row["call_pnl"] if orig_call_1lot else 0
+        total_pnl = put_pnl + call_pnl
+
+        if total_pnl != 0:
+            rows.append({
+                "trade_date": td,
+                "put_pnl": put_pnl,
+                "call_pnl": call_pnl,
+                "total_pnl": total_pnl,
+                "put_size": bump_row["put_size"] if orig_put_1lot else 0,
+                "call_size": bump_row["call_size"] if orig_call_1lot else 0,
+                "put_price": bump_row["put_price"] if orig_put_1lot else 0,
+                "call_price": bump_row["call_price"] if orig_call_1lot else 0,
+                "sh_strike": bump_row["sh_strike"],
+                "lg_strike": bump_row["lg_strike"],
+                "sh_strike_2": bump_row.get("sh_strike_2", 0),
+                "lg_strike_2": bump_row.get("lg_strike_2", 0),
+                "idx_close": bump_row.get("idx_close", 0),
+            })
+
+    if n_suppressed:
+        print(f"  [closer precedence] {strat_name.split('SPX_')[-1]}: {n_suppressed} bumped leg(s) suppressed (CLOSER took the day)")
+    if rebal_vetoed_legs:
+        _v = pd.DataFrame(rebal_vetoed_legs).merge(spxw_vol, on="trade_date", how="left")
+        if MAX_ATM_VOL is not None:
+            _v = _v[_v["atmVol 350PM"] < MAX_ATM_VOL]   # same vol filter the traded set gets below
+        _v = _v[_v["pnl"] != 0]
+        print(f"  [rebal veto] {strat_name.split('SPX_')[-1]} BUMP: {len(_v)} leg(s) vetoed at "
+              f"+/-{REBAL_VETO_THRESHOLD_B}B | PnL removed=${_v['pnl'].sum():,.0f} | legs: "
+              + ", ".join(f"{r.trade_date} {r.cp} ${r.pnl:,.0f} (rebal {r.rebal_355_B:+.1f}B)" for r in _v.itertuples()))
+
+    traded = pd.DataFrame(rows)
+    if traded.empty:
+        print(f"{strat_name}: no bumped trades")
+        bump_results[strat_name] = traded
+        continue
+
+    # Merge atmVol and apply filter
+    traded = traded.merge(spxw_vol, on="trade_date", how="left")
+    if MAX_ATM_VOL is not None:
+        traded = traded[traded["atmVol 350PM"] < MAX_ATM_VOL]
+
+    traded = traded.sort_values("trade_date").reset_index(drop=True)
+    bump_results[strat_name] = traded
+
+    short_name = strat_name.split("SPREAD_SALES_SPX_")[-1]
+    total = traded["total_pnl"].sum()
+    wr = (traded["total_pnl"] > 0).mean() * 100 if len(traded) > 0 else 0
+    print(f"{short_name} BUMP: N={len(traded)} | PnL=${total:,.0f} | WR={wr:.0f}% | Sharpe={sharpe(traded['total_pnl']):.2f}")
+
+#%% Export to Excel (runs BEFORE the chart so terminal runs save the file even if plt.show() blocks)
+
+from datetime import datetime
+from openpyxl.utils import get_column_letter
+
+timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+# Fixed-run name deliberately does NOT match the daily review pack's glob
+# (bumped_spread_backtest_*.xlsx) so it is never picked up as the prod-comparison file.
+if FIX_DOUBLE_BUMP:
+    filepath = f'C:/Users/zdietz/Downloads/bumped_spread_NO_DOUBLE_BUMP_backtest_{timestamp}.xlsx'
+else:
+    filepath = f'C:/Users/zdietz/Downloads/bumped_spread_backtest_{timestamp}.xlsx'
+
+export_cols = ["trade_date", "atmVol 350PM", "idx_close",
+               "put_size", "call_size", "put_price", "call_price",
+               "sh_strike", "lg_strike", "sh_strike_2", "lg_strike_2",
+               "put_pnl", "call_pnl", "total_pnl"]
+
+dollar_cols = ["put_pnl", "call_pnl", "total_pnl", "put_price", "call_price", "idx_close"]
+
+sheets = {}
+
+# Per-strategy sheets
+for strat_name in STRAT_NAMES:
+    traded = bump_results[strat_name]
+    if traded.empty:
+        continue
+    short_name = strat_name.split("SPREAD_SALES_SPX_")[-1]
+    cols = [c for c in export_cols if c in traded.columns]
+    sheets[short_name + " BUMP"] = traded[cols].copy()
+
+# All sheet
+if sheets:
+    all_dfs = []
+    for sheet_name, df in sheets.items():
+        df_copy = df.copy()
+        df_copy["strategy"] = sheet_name
+        all_dfs.append(df_copy)
+    all_df = pd.concat(all_dfs).sort_values("trade_date")
+    sheets = {"All": all_df, **sheets}
+
+with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+    for sheet_name, df in sheets.items():
+        if df.empty:
+            continue
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+        ws = writer.sheets[sheet_name]
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = 'C2'
+
+        for col_idx, col_name in enumerate(df.columns, 1):
+            col_letter = get_column_letter(col_idx)
+            max_len = max(len(str(col_name)), df[col_name].astype(str).str.len().max())
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 20)
+
+            if col_name in dollar_cols:
+                for row in range(2, len(df) + 2):
+                    ws[f'{col_letter}{row}'].number_format = '_($* #,##0.00_);[Red]_($* (#,##0.00)'
+
+print(f'Saved: {filepath}')
+
+#%% Chart: cumulative PnL
+
+fig, ax = plt.subplots(figsize=(12, 6))
+fig.patch.set_facecolor('#f5f5f5')
+ax.set_facecolor('#f5f5f5')
+
+for strat_name in STRAT_NAMES:
+    traded = bump_results[strat_name]
+    if traded.empty:
+        continue
+    traded = traded.copy()
+    traded["cum_pnl"] = traded["total_pnl"].cumsum()
+    short_name = strat_name.split("SPREAD_SALES_SPX_")[-1]
+    total = traded["total_pnl"].sum()
+    wr = (traded["total_pnl"] > 0).mean() * 100
+    label = f'{short_name} BUMP | Sharpe {sharpe(traded["total_pnl"]):.2f} | ${total:,.0f} | WR {wr:.0f}% | N={len(traded)}'
+    ax.plot(pd.to_datetime(traded["trade_date"]), traded["cum_pnl"], linewidth=1.5, label=label)
+
+# Combined
+all_pnl = pd.concat([df[["trade_date", "total_pnl"]] for df in bump_results.values() if not df.empty])
+if not all_pnl.empty:
+    combined_pnl = all_pnl.groupby("trade_date")["total_pnl"].sum().reset_index().sort_values("trade_date")
+    combined_pnl["cum_pnl"] = combined_pnl["total_pnl"].cumsum()
+    ax.plot(pd.to_datetime(combined_pnl["trade_date"]), combined_pnl["cum_pnl"], linewidth=2, color='#2ca02c', linestyle='--',
+            label=f'Combined | Sharpe {sharpe(combined_pnl["total_pnl"]):.2f} | ${combined_pnl["total_pnl"].sum():,.0f}')
+
+vol_label = f" | atmVol < {MAX_ATM_VOL}" if MAX_ATM_VOL is not None else ""
+if FIX_DOUBLE_BUMP:
+    vol_label += " | NO DOUBLE BUMP"
+sizing_strs = [f"{k.split('SPX_')[-1]}: \\${v['dollar_target']/1000:.0f}k/{v['max_size']}" for k, v in BUMP_CONFIGS.items()]
+ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+ax.set_title(f'Sell Bumped \\${SPREAD_WIDTH}-wide Spreads on 1-lot Days{vol_label} | {", ".join(sizing_strs)}',
+             fontsize=11, fontweight='bold')
+ax.set_ylabel('Cumulative PnL ($)')
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
+ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0)
+ax.grid(True, alpha=0.3)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+if IS_INTERACTIVE:
+    plt.show()

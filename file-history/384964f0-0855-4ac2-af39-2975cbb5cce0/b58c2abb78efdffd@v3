@@ -1,0 +1,171 @@
+"""
+Large index flows -- step 3a: baseline 0DTE quotes on the 5 Fridays BEFORE each effective
+date, so each event's option cost can be normalized against the name's own "normal" Friday.
+
+Per event (symbol, eff_date) in intraday_prices.csv (est flow >= 7B):
+  * baseline dates = eff_date - 7, -14, -21, -28, -35 days, rolled back to the prior trading
+    day if that Friday is a holiday
+  * spot snaps at 15:00 / 15:10 / 15:20 / 15:30 / 15:40 + Bloomberg PX_LAST -> baseline_spots.csv
+    (10-sec DB prices via vbam.get_intraday_prices, Liberator ticks fallback for sessions the
+    DB does not hold, e.g. pre-2024)
+  * 0DTE chain (exp == date) on ThetaData; names without weeklies have a chain only on the
+    monthly (3rd Friday) inside the 5-week window -- the other Fridays are logged as no_chain
+  * strikes within +/-8% of the 15:00 spot, 15:00-16:00 at 1s, appended to
+    optionsResearch.t_opra_quotes exactly like pull_0dte_quotes.py (same pull_pair)
+
+Resumable: _baseline_pull_meta.csv checkpoints each (symbol, date); a pair with DB rows but no
+meta row is wiped and re-pulled. --force wipes and re-pulls everything.
+
+Run from Git Bash:
+    python /d/agent_projects/large_index_flows/pull_baseline_quotes.py
+    python /d/agent_projects/large_index_flows/pull_baseline_quotes.py --dry-run
+"""
+import argparse
+import datetime as dt
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import vbam_utilities as vbam
+from sqlalchemy import create_engine
+from vbam_utilities.bloomberg import my_bdh
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import vbam_helpers
+from calendar_utils import HALF_DAYS
+from thetadata_helpers import check_v3_connection
+
+import pull_0dte_quotes as pq
+
+PROJ_DIR = 'D:/agent_projects/large_index_flows'
+EVENTS_CSV = os.path.join(PROJ_DIR, 'intraday_prices.csv')
+META_CSV = os.path.join(PROJ_DIR, '_baseline_pull_meta.csv')
+SPOTS_CSV = os.path.join(PROJ_DIR, 'baseline_spots.csv')
+N_FRIDAYS = 5
+SNAP_TIMES = [dt.time(15, m) for m in (0, 10, 20, 30, 40)]
+MIN_FLOW_BN = 7.0
+
+
+def log(msg):
+    """Print with flush so progress shows live in Git Bash."""
+    print(msg, flush=True)
+
+
+def baseline_dates(eff_date, n=N_FRIDAYS):
+    """The n Fridays strictly before eff_date (eff_date itself may be a Thursday when Friday is a
+    holiday, e.g. MRVL 2026-06-18), each rolled to the prior trading day if that Friday is a holiday;
+    NYSE half days are dropped (so fewer than n may come back)."""
+    last_friday = eff_date - dt.timedelta(days=(eff_date.weekday() - 4) % 7 or 7)
+    out = []
+    for k in range(n):
+        d = last_friday - dt.timedelta(days=7 * k)
+        if not vbam.is_trading_day(d):
+            d = vbam.prev_trading_day(d)
+        if d in HALF_DAYS:      # early close: 0DTE expired at 13:00, no 15:00 market -- skip (Zach 9/14/26)
+            continue
+        out.append(d)
+    return out
+
+
+def load_events(min_flow_bn=MIN_FLOW_BN):
+    """(eff_date, symbol, est_flow_bn) for events with est flow >= min_flow_bn, newest first."""
+    ev = pd.read_csv(EVENTS_CSV, parse_dates=['eff_date'])
+    ev = ev[ev['est_flow_bn'] >= min_flow_bn].copy()
+    ev['eff_date'] = ev['eff_date'].dt.date
+    return ev[['eff_date', 'symbol', 'est_flow_bn']].sort_values(['eff_date', 'symbol'], ascending=[False, True])
+
+
+def load_meta():
+    """Completed (symbol, date) pairs from the checkpoint CSV."""
+    if not os.path.exists(META_CSV):
+        return set()
+    m = pd.read_csv(META_CSV, parse_dates=['date'])
+    m = m[m['status'].isin(pq.DONE_STATUSES)]
+    return {(r.symbol, r.date.date()) for r in m.itertuples()}
+
+
+def append_row(path, row):
+    """Append one row to a CSV, writing the header if the file is new."""
+    pd.DataFrame([row]).to_csv(path, mode='a', index=False, header=not os.path.exists(path))
+
+
+def spot_snaps(symbol, date):
+    """{'15:00': px, ..., '15:40': px, 'PX_LAST': close} for one (symbol, date); NaN where no print."""
+    df = vbam.get_intraday_prices([symbol], date=date, window=('15:00:00', '16:00:00'))
+    if len(df):
+        s = df.set_index(pd.to_datetime(df['capture_timestamp']))['trade_price'].astype(float).sort_index()
+    else:
+        raw = vbam.get_intraday_prices([symbol], date=date, source='api')
+        if len(raw):
+            ts = pd.to_datetime(raw['timestamp'])
+            keep = (ts >= pd.Timestamp(f'{date} 15:00:00')) & (ts <= pd.Timestamp(f'{date} 16:00:00'))
+            s = raw.loc[keep].set_index(ts[keep])['trade_price'].astype(float).sort_index()
+        else:
+            s = pd.Series(dtype=float)
+    out = {}
+    for t in SNAP_TIMES:
+        target = pd.Timestamp(dt.datetime.combine(date, t))
+        asof = s[s.index <= target]
+        out[t.strftime('%H:%M')] = float(asof.iloc[-1]) if len(asof) else np.nan
+    try:
+        out['PX_LAST'] = float(my_bdh(f'{symbol} US Equity', 'PX_LAST', date, date, adjust='-').iloc[0, 0])
+    except Exception as e:
+        log(f"    PX_LAST lookup failed: {e}")
+        out['PX_LAST'] = np.nan
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--dry-run', action='store_true', help='pull but write nothing (DB, meta, spots)')
+    ap.add_argument('--force', action='store_true', help='wipe and re-pull every pair')
+    args = ap.parse_args()
+
+    events = load_events()
+    pairs = [(ev.symbol, ev.eff_date, d) for ev in events.itertuples(index=False) for d in baseline_dates(ev.eff_date)]
+    done = set() if args.force else load_meta()
+    log(f"{len(events)} events x {N_FRIDAYS} prior Fridays = {len(pairs)} (symbol, date) pairs; "
+        f"{sum((s, d) in done for s, _, d in pairs)} already complete")
+    assert check_v3_connection(), "ThetaData v3 auth failed -- check thetadata_creds.json / THETADATA_API_KEY"
+    eng = create_engine(vbam_helpers.dev_connection_string, pool_pre_ping=True)
+
+    t_all = time.perf_counter()
+    n_pulled = n_skipped = n_nochain = 0
+    for i, (sym, eff, date) in enumerate(pairs, 1):
+        tag = f"[{i}/{len(pairs)}] {sym:<5} {date} (baseline for eff {eff})"
+        if (sym, date) in done:
+            log(f"{tag}  already complete -- skip")
+            n_skipped += 1
+            continue
+        snaps = spot_snaps(sym, date)
+        px = snaps['15:00']
+        if np.isnan(px):
+            log(f"{tag}  no 15:00 spot -- skip")
+            if not args.dry_run:
+                append_row(META_CSV, {'symbol': sym, 'eff_date': eff, 'date': date, 'px_1500': np.nan,
+                                      'status': 'no_spot', 'n_contracts': 0, 'n_with_data': 0, 'n_rows': 0,
+                                      'pulled_at': dt.datetime.now()})
+            continue
+        if pq.rows_in_db(eng, sym, date) and not args.dry_run:
+            n = pq.wipe_db(eng, sym, date)
+            log(f"{tag}  15:00 px {px:.2f}  wiped {n:,} stale rows")
+        else:
+            log(f"{tag}  15:00 px {px:.2f}")
+        meta = pq.pull_pair(eng, sym, date, px, args.dry_run)
+        if meta['status'] == 'no_chain':
+            n_nochain += 1
+        else:
+            n_pulled += 1
+        if not args.dry_run:
+            append_row(SPOTS_CSV, {'symbol': sym, 'eff_date': eff, 'date': date, **snaps})
+            append_row(META_CSV, {'symbol': sym, 'eff_date': eff, 'date': date, 'px_1500': px, **meta,
+                                  'pulled_at': dt.datetime.now()})
+
+    log(f"\nDone in {(time.perf_counter() - t_all) / 60:.1f} min: pulled {n_pulled}, no 0DTE chain {n_nochain}, "
+        f"skipped {n_skipped}. Checkpoints: {META_CSV}; spots: {SPOTS_CSV}")
+
+
+if __name__ == '__main__':
+    main()

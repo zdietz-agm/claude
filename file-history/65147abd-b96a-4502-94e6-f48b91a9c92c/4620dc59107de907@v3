@@ -1,0 +1,1425 @@
+# =============================================================================
+# 4PM ICON (Iron Condor) Script v3
+# =============================================================================
+# Runs near market close (4 PM ET). Loads multiple ICON strategy configs from
+# configs_icon/, evaluates each strategy's trigger condition, and sends iron
+# condor orders (sell or buy) when conditions are met. Supports: daily P&L
+# tracking, implied move CSV, streak-based mean reversion, and double-down
+# premium sizing from log history.
+# =============================================================================
+
+import datetime as dt
+import time
+import asyncio
+import pandas as pd
+import numpy as np
+import importlib.util
+
+import os
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+from google_chat_webhook import send_message, my_chat, aa
+from xbbg import blp
+from calendar_utils import getNowEst, x_days_ago, x_days_ahead, is_mwf, get_mwf_expiry
+from spdr_rock_functions import run_query, getVols
+from math import floor
+from spread_helpers import get_spreads, compute_bid_ask
+from helpers import create_counter, EDGE_TARGET_4_LEGGED_1, MAX_EDGE_4_LEGGED_1, EDGE_TARGET_4_LEGGED_2, MAX_EDGE_4_LEGGED_2, LAST_HOUR, warm_up_bloomberg_connection
+from spdr_rock_order_functions import send_complex_two_waves
+import spdr_rock_order_functions as _srof   # IMPLIED_QUOTE_TABLE read at call time in the chain SQLs
+
+# --- SpiderRock v8 migration toggle (per-script) --------------------------------------------
+# USE_V8=True -> DATA reads on v8: the two inline chain SQLs below read _srof.IMPLIED_QUOTE_TABLE
+# (flipped to msgliveimpliedquoteadj by use_v8), and getVols routes via _host_port_for
+# (msglivesurfaceatm exists on both envs). SEND_V8=True -> orders/cancels/fills on v8 via the
+# SEND_V8-gated send_complex_two_waves (NDXP secKey_ts already handled). USE_V8=False -> v7.
+USE_V8  = False  # back to v7 9/3/2026 (icon accounts repointed to v7 on the SR side); was True 8/24-9/3
+SEND_V8 = False
+if USE_V8:
+	_srof.use_v8(True, send=SEND_V8)
+	# This script sends AFTER the close (~16:00+, next-day expiries). v8 expires RegMkt orders
+	# arriving past 16:00 ("Order Expired On Arrival" -- all icon orders rejected 8/24), so
+	# override the module default. AllDay (not PostMkt) so intraday TEST runs work too.
+	_srof.V8_MARKET_SESSION = "AllDay"
+
+# ========================== Configuration ==========================
+LAST_HOUR = LAST_HOUR + 1   # bumped from 3 PM (algo_globals) to 4 PM ET. set to 12 (13-1) on early close days.
+IS_TEST = False
+SEND_TRADES = True
+
+# Direction-specific order params. Sells use the standard duration/edge; buys rest longer and quote tighter.
+SELL_ORDER_DURATION = 240
+BUY_ORDER_DURATION = 60 * 14   # 840s; buys rest longer than sells
+BUY_EDGE_MULTIPLIER = 0.40     # buys quote at 40% of standard 4-legged edge
+
+IMPLIED_MOVE_FILE = "./one_day_implied_moves.csv"   # trade_date, next_trade_date, implied_move
+DAILY_PNL_FILE = "./iron_condor_daily_pnl.csv"     # One row per trade day for mean-reversion streak (sell/buy PnL)
+
+if IS_TEST:
+	EDGE_TARGET_4_LEGGED_1 *= 3
+	MAX_EDGE_4_LEGGED_1 *= 3
+	EDGE_TARGET_4_LEGGED_2 *= 3
+	MAX_EDGE_4_LEGGED_2 *= 3
+
+# Symbol-specific parameters for strike selection and bid/ask estimation
+SYMBOL_PARAMS = {
+	"SPXW": {
+		"spread_width": 10,
+		"spread_target": 2.55,
+		"bid_ask_offset": 0.03,
+		"bid_ask_tick": 0.05,
+		"settlement_ticker": "SPX INDEX",
+	},
+	"NDXP": {
+		"spread_width": 50,
+		"spread_target": 12.6,
+		"bid_ask_offset": 0.20,
+		"bid_ask_tick": 0.10,
+		"settlement_ticker": "NDX INDEX",
+	},
+}
+
+# Map symbol -> settlement ticker for underlying price lookups
+SETTLEMENT_TICKERS = {sym: p["settlement_ticker"] for sym, p in SYMBOL_PARAMS.items()}
+
+# In-memory cache for run_query by SQL string (same sql reuses data; different expiry/side pulls fresh).
+# Entries expire after CACHE_TTL_S, and the cache is also cleared right after the 4pm wait,
+# so the execution phase can never reuse preview-time rows.
+CACHE_TTL_S = 10
+_run_query_cache = {}
+
+
+def run_query_cached(sql):
+	"""Run SQL via run_query, caching result in memory by sql with a short TTL. Returns a copy on a cache hit."""
+	hit = _run_query_cache.get(sql)
+	if hit is not None and (getNowEst() - hit[0]).total_seconds() < CACHE_TTL_S:
+		return hit[1].copy()
+	df = run_query(sql)
+	_run_query_cache[sql] = (getNowEst(), df)
+	return df
+
+# --- Date anchors (used everywhere for expiry, implied move, and streak logic) ---
+yesterday = x_days_ago(1)
+today = dt.date.today()
+tomorrow = x_days_ahead(1)
+
+# --- Random-ish seed for create_counter (e.g. order IDs); modulo keeps it small ---
+seed = int(dt.datetime.now().strftime("%f")) % 10000
+counter = create_counter(seed)
+
+# ========================== Config Loading ==========================
+def load_icon_configs(directory="./configs_icon"):
+	"""Load all ICON strategy configs from directory."""
+	configs = []
+	for filename in os.listdir(directory):
+		if filename.endswith(".py"):
+			filepath = os.path.join(directory, filename)
+			# Load .py file as a module without adding it to sys.modules by name
+			spec = importlib.util.spec_from_file_location("module.name", filepath)
+			module = importlib.util.module_from_spec(spec)
+			spec.loader.exec_module(module)
+			if hasattr(module, "config"):
+				configs.append(module.config)
+	# Only return configs that are enabled (default True if key missing)
+	return [cfg for cfg in configs if cfg.get("enabled", True)]
+
+
+# ========================== Implied Move Management ==========================
+# Implied move = 1-day vol-derived move (annual vol / sqrt(252) -> %), scaled by 0.8.
+# Used for big_move trigger and for display in recap.
+def get_implied_move_for_tomorrow():
+	"""Calculate tomorrow's implied move using SPX ATM vol."""
+	spxVol = getVols("SPXW", atmOnly=True)
+	tomorrowVol = spxVol.loc[tomorrow].values[0]
+	# Annual vol -> 1-day move in %; 0.8 is an empirical scaling factor
+	implied_move = tomorrowVol / np.sqrt(252) * 100 * 0.8
+	return round(implied_move, 2)
+
+
+def get_yesterday_implied_move():
+	"""Read yesterday's implied move from the CSV file. Returns NaN if unavailable."""
+	if not os.path.exists(IMPLIED_MOVE_FILE):
+		print(f"WARNING: {IMPLIED_MOVE_FILE} not found. Returning NaN.")
+		return np.nan
+
+	df = pd.read_csv(IMPLIED_MOVE_FILE)
+	df["next_trade_date"] = pd.to_datetime(df["next_trade_date"]).apply(lambda x: x.date())
+
+	# CSV stores: trade_date, next_trade_date, implied_move. We want the row where next_trade_date == today (that row was written yesterday).
+	today_row = df[df["next_trade_date"] == today]
+	if today_row.empty:
+		print(f"WARNING: No implied move found for today ({today}). Using latest available.")
+		if df.empty:
+			print(f"WARNING: Implied move file is empty. Returning NaN.")
+			return np.nan
+		return df.iloc[-1]["implied_move"]
+
+	return today_row.iloc[0]["implied_move"]
+
+
+def save_implied_move_for_tomorrow(implied_move):
+	"""Save today's implied move for tomorrow to the CSV file."""
+	if os.path.exists(IMPLIED_MOVE_FILE):
+		df = pd.read_csv(IMPLIED_MOVE_FILE)
+	else:
+		df = pd.DataFrame(columns=["trade_date", "next_trade_date", "implied_move"])
+
+	df["trade_date"] = pd.to_datetime(df["trade_date"]).apply(lambda x: x.date())
+
+	# Upsert: update row for today if present, else append (allows re-runs / test overwrites)
+	if today in df["trade_date"].values:
+		df.loc[df["trade_date"] == today, "implied_move"] = implied_move
+	else:
+		new_row = pd.DataFrame({
+			"trade_date": [today],
+			"next_trade_date": [tomorrow],
+			"implied_move": [implied_move]
+		})
+		df = pd.concat([df, new_row], ignore_index=True)
+
+	df.to_csv(IMPLIED_MOVE_FILE, index=False)
+	print(f"Saved implied move for tomorrow: {implied_move:.2f}%")
+
+
+# ========================== Streak Tracking (Mean Reversion) ==========================
+# Used by mean_reversion trigger: trade when sell or buy side has enough consecutive losses.
+def compute_losing_streak(pnl_array):
+	"""Compute consecutive losing streak ending at each position."""
+	streaks = np.zeros(len(pnl_array))
+	current_streak = 0
+	for i in range(len(pnl_array)):
+		if pnl_array[i] < 0:  # Loss
+			current_streak += 1
+		else:
+			current_streak = 0
+		streaks[i] = current_streak
+	return streaks
+
+
+def get_streak_data(spx=None, settle_in_memory=False):
+	"""Load DAILY_PNL_FILE and return current consecutive losing streaks for sell and buy (mean-reversion trigger).
+	Returns (sell_losing_streak, buy_losing_streak). Only rows with settled P&L are used (no lookahead).
+
+	spx: Normally provided when called from check_mean_reversion (main passes current SPX). If provided together
+	with settle_in_memory=True, any row with exp<=today and PNL_sell NaN is settled in memory (no CSV write).
+	Not provided when called standalone without SPX; then only rows already settled on disk are used.
+
+	settle_in_memory: Normally True when spx is provided (check_mean_reversion sets settle_in_memory = (spx is not None)).
+	True = fill P&L for unsettled exp<=today rows in memory so streaks are up-to-date (test and production). False = use
+	only rows that already have PNL_sell/PNL_buy in the CSV (default; use if no SPX available)."""
+	if not os.path.exists(DAILY_PNL_FILE):
+		print(f"Warning: {DAILY_PNL_FILE} not found. Returning 0 streaks.")
+		return 0, 0
+
+	df = pd.read_csv(DAILY_PNL_FILE, parse_dates=["trade_date", "exp"])
+	if df.empty:
+		return 0, 0
+
+	df["trade_date"] = pd.to_datetime(df["trade_date"]).apply(lambda x: x.date() if hasattr(x, 'date') else x)
+	df["exp"] = pd.to_datetime(df["exp"]).apply(lambda x: x.date() if hasattr(x, 'date') else x)
+	df = df.sort_values("trade_date").reset_index(drop=True)
+
+	# If settle_in_memory, calculate P&L for unsettled rows where exp <= today
+	if settle_in_memory and spx is not None:
+		for idx, row in df.iterrows():
+			if row["exp"] <= today and pd.isna(row["PNL_sell"]):
+				short_call = row["lower_call_strike"]
+				long_call = row["higher_call_strike"]
+				short_put = row["higher_put_strike"]
+				long_put = row["lower_put_strike"]
+
+				call_sell = calc_expiry_pnl_sell(short_call, long_call, spx, "Call")
+				put_sell = calc_expiry_pnl_sell(short_put, long_put, spx, "Put")
+				pnl_sell = row["bid_price"] + call_sell + put_sell
+
+				call_buy = calc_expiry_pnl_buy(short_call, long_call, spx, "Call")
+				put_buy = calc_expiry_pnl_buy(short_put, long_put, spx, "Put")
+				pnl_buy = call_buy + put_buy - row["ask_price"]
+
+				df.loc[idx, "PNL_sell"] = round(pnl_sell, 2)
+				df.loc[idx, "PNL_buy"] = round(pnl_buy, 2)
+				print(f"  [In-memory settle] {row['trade_date']}: PNL_sell={pnl_sell:.2f}, PNL_buy={pnl_buy:.2f}")
+
+	# Only use rows with settled P&L (no lookahead: today's trade is not settled yet)
+	df_settled = df.dropna(subset=["PNL_sell", "PNL_buy"])
+	if df_settled.empty:
+		return 0, 0
+
+	# Ensure exactly one row per calendar day (hypothetical streak is per day). Keep last if duplicates exist.
+	df_settled = df_settled.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date").reset_index(drop=True)
+
+	sell_streaks = compute_losing_streak(df_settled["PNL_sell"].values)
+	buy_streaks = compute_losing_streak(df_settled["PNL_buy"].values)
+
+	# Streak at last row = current streak as of yesterday
+	sell_losing_streak = int(sell_streaks[-1]) if len(sell_streaks) > 0 else 0
+	buy_losing_streak = int(buy_streaks[-1]) if len(buy_streaks) > 0 else 0
+
+	return sell_losing_streak, buy_losing_streak
+
+
+def save_daily_pnl(trade_date, expiry, calls, puts, bid_price, ask_price, spx_at_trade, atmVol):
+	"""Save daily trade data for streak tracking. P&L calculated at settlement."""
+	if os.path.exists(DAILY_PNL_FILE):
+		df = pd.read_csv(DAILY_PNL_FILE, parse_dates=["trade_date", "exp"])
+	else:
+		df = pd.DataFrame(columns=["trade_date", "exp", "lower_put_strike", "higher_put_strike",
+								   "lower_call_strike", "higher_call_strike", "PNL_buy", "PNL_sell",
+								   "bid_price", "ask_price", "spx_on_trade_date", "spx_on_exp", "atmVol"])
+
+	df["trade_date"] = pd.to_datetime(df["trade_date"]).apply(lambda x: x.date() if hasattr(x, 'date') else x)
+	trade_date_val = trade_date.date() if hasattr(trade_date, 'date') else trade_date
+
+	# Upsert: update strikes/prices for today if row exists, else append (PNL left NaN until settle_daily_pnl)
+	if trade_date_val in df["trade_date"].values:
+		# Update existing row (don't overwrite P&L if already settled)
+		idx = df[df["trade_date"] == trade_date_val].index[0]
+		# Column names match "long_put = lower, short_put = higher" etc. for iron condor
+		df.loc[idx, "exp"] = expiry
+		df.loc[idx, "lower_put_strike"] = puts["long_strike"]
+		df.loc[idx, "higher_put_strike"] = puts["short_strike"]
+		df.loc[idx, "lower_call_strike"] = calls["short_strike"]
+		df.loc[idx, "higher_call_strike"] = calls["long_strike"]
+		df.loc[idx, "bid_price"] = bid_price
+		df.loc[idx, "ask_price"] = ask_price
+		df.loc[idx, "spx_on_trade_date"] = spx_at_trade
+		df.loc[idx, "atmVol"] = atmVol
+	else:
+		# Add new row
+		new_row = pd.DataFrame({
+			"trade_date": [trade_date_val],
+			"exp": [expiry],
+			"lower_put_strike": [puts["long_strike"]],
+			"higher_put_strike": [puts["short_strike"]],
+			"lower_call_strike": [calls["short_strike"]],
+			"higher_call_strike": [calls["long_strike"]],
+			"PNL_buy": [np.nan],
+			"PNL_sell": [np.nan],
+			"bid_price": [bid_price],
+			"ask_price": [ask_price],
+			"spx_on_trade_date": [spx_at_trade],
+			"spx_on_exp": [np.nan],
+			"atmVol": [atmVol]
+		})
+		df = pd.concat([df, new_row], ignore_index=True)
+
+	# Ensure date columns are written without time (date-only strings in CSV)
+	df["trade_date"] = df["trade_date"].apply(lambda x: x.date() if hasattr(x, "date") else x)
+	df["exp"] = df["exp"].apply(lambda x: x.date() if hasattr(x, "date") else x)
+	# Enforce exactly one row per calendar day (keep last so today's upsert wins)
+	df = df.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date").reset_index(drop=True)
+	df.to_csv(DAILY_PNL_FILE, index=False)
+	print(f"Saved daily trade data for {trade_date_val}")
+
+
+def settle_daily_pnl(spx):
+	"""Settle any unsettled daily P&L entries where exp <= today."""
+	if not os.path.exists(DAILY_PNL_FILE):
+		return
+
+	df = pd.read_csv(DAILY_PNL_FILE, parse_dates=["trade_date", "exp"])
+	if df.empty:
+		return
+
+	df["trade_date"] = pd.to_datetime(df["trade_date"]).apply(lambda x: x.date() if hasattr(x, 'date') else x)
+	df["exp"] = pd.to_datetime(df["exp"]).apply(lambda x: x.date() if hasattr(x, 'date') else x)
+	df = df.sort_values("trade_date").reset_index(drop=True)
+
+	settled_count = 0
+	for idx, row in df.iterrows():
+		if row["exp"] <= today and pd.isna(row["PNL_sell"]):
+			short_call = row["lower_call_strike"]
+			long_call = row["higher_call_strike"]
+			short_put = row["higher_put_strike"]
+			long_put = row["lower_put_strike"]
+
+			call_sell = calc_expiry_pnl_sell(short_call, long_call, spx, "Call")
+			put_sell = calc_expiry_pnl_sell(short_put, long_put, spx, "Put")
+			pnl_sell = row["bid_price"] + call_sell + put_sell
+
+			call_buy = calc_expiry_pnl_buy(short_call, long_call, spx, "Call")
+			put_buy = calc_expiry_pnl_buy(short_put, long_put, spx, "Put")
+			pnl_buy = (call_buy + put_buy) - row["ask_price"]
+
+			df.loc[idx, "spx_on_exp"] = spx
+			df.loc[idx, "PNL_sell"] = round(pnl_sell, 2)
+			df.loc[idx, "PNL_buy"] = round(pnl_buy, 2)
+			settled_count += 1
+			print(f"DEBUG settle_daily_pnl: trade_date={row['trade_date']} exp={row['exp']} | SPX={spx:.2f} | "
+			      f"PNL_sell={pnl_sell:.2f} (bid={row['bid_price']:.2f}+call_sell+put_sell), PNL_buy={pnl_buy:.2f} (call_buy+put_buy-ask={row['ask_price']:.2f})")
+
+	if settled_count > 0:
+		# Ensure date columns are written without time (date-only strings in CSV)
+		df["trade_date"] = df["trade_date"].apply(lambda x: x.date() if hasattr(x, "date") else x)
+		df["exp"] = df["exp"].apply(lambda x: x.date() if hasattr(x, "date") else x)
+		# One row per calendar day (keep last)
+		df = df.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date").reset_index(drop=True)
+		df.to_csv(DAILY_PNL_FILE, index=False)
+		print(f"Settled {settled_count} daily P&L entries with SPX={spx:.2f}")
+
+
+# ========================== Trigger Evaluation ==========================
+# Each config has trigger_condition: always | end_of_week | two_consecutive_losses | big_move | mean_reversion.
+
+def is_max_loss(row, pnl_override=None, tolerance=10):
+	"""Check if a trade hit max loss (within tolerance). Max loss = 1000 * size - premium_sold."""
+	# Per spread max loss = width (10 pts) * 100 - premium; total = size * that
+	max_loss_amount = 1000 * row["size"] - row["premium_sold"]
+	pnl = pnl_override if pnl_override is not None else row["pnl"]
+	# Max loss means pnl == -max_loss_amount; we allow a small tolerance ($10)
+	return abs(pnl + max_loss_amount) <= tolerance
+
+
+def calculate_trade_pnl(row, spx):
+	"""Calculate the P&L for a trade given current SPX price."""
+	call_pnl = calc_expiry_pnl_sell(row["short_call_strike"], row["long_call_strike"], spx, "Call")
+	put_pnl = calc_expiry_pnl_sell(row["short_put_strike"], row["long_put_strike"], spx, "Put")
+	premium_collected = row["price"] * row["size"] * 100
+	return ((call_pnl + put_pnl) * row["size"] * 100) + premium_collected
+
+
+def check_two_consecutive_losses(reference_log_folder, spx=None):
+	"""Returns True if the last 2 trades (including unsettled) in the reference log were MAX losses.
+	Used by two_consecutive_losses trigger: 'regular' strategy log is the reference."""
+	max_date = dt.date(2020, 1, 1)
+	for file in os.listdir(reference_log_folder):
+		if file.endswith(".csv"):
+			try:
+				file_date = dt.datetime.strptime(file.split(".csv")[0], "%Y_%m_%d").date()
+				if file_date > max_date:
+					max_date = file_date
+			except ValueError:
+				continue
+
+	if max_date == dt.date(2020, 1, 1):
+		print("No log files found in reference folder for two_consecutive_losses check.")
+		return False
+
+	log_data = pd.read_csv(f"{reference_log_folder}/{max_date.strftime('%Y_%m_%d')}.csv")
+	if log_data.empty:
+		return False
+
+	# Sort chronologically by trade_date to ensure correct order
+	log_data["trade_date"] = pd.to_datetime(log_data["trade_date"])
+	log_data = log_data.sort_values(by="trade_date", ascending=True).reset_index(drop=True)
+
+	# We need the last 2 trades - including any unsettled trade
+	if len(log_data) < 2:
+		return False
+
+	last_two = log_data.tail(2)
+	max_loss_checks = []
+
+	print(f"DEBUG check_two_consecutive_losses: Checking last 2 trades (spx={spx})")
+
+	for i, (_, row) in enumerate(last_two.iterrows()):
+		max_loss_amt = 1000 * row["size"] - row["premium_sold"]
+
+		# If pnl is NaN (unsettled trade), calculate it using current SPX
+		if pd.isna(row["pnl"]):
+			if spx is None:
+				print(f"DEBUG check_two_consecutive_losses: Trade {i+1}: pnl=NaN (unsettled), but no SPX provided - skipping")
+				return False  # Can't evaluate without SPX
+			calculated_pnl = calculate_trade_pnl(row, spx)
+			is_max = is_max_loss(row, pnl_override=calculated_pnl)
+			print(f"DEBUG check_two_consecutive_losses: Trade {i+1}: pnl=NaN->calculated={calculated_pnl:.0f}, max_loss_amt={max_loss_amt:.0f}, is_max_loss={is_max}")
+		else:
+			calculated_pnl = None
+			is_max = is_max_loss(row)
+			print(f"DEBUG check_two_consecutive_losses: Trade {i+1}: pnl={row['pnl']:.0f}, max_loss_amt={max_loss_amt:.0f}, is_max_loss={is_max}")
+
+		max_loss_checks.append(is_max)
+
+	return all(max_loss_checks)
+
+
+def get_pnl_tracker_from_log(log_folder, spx=None):
+	"""Returns the ACTUAL current pnl_tracker, including P&L from unsettled trades.
+	Used to decide if we 'need recovery' (pnl_tracker < 0) for two_consecutive_losses trigger."""
+	if log_folder is None:
+		return 0
+
+	if not os.path.exists(log_folder):
+		return 0
+
+	# Find latest log file
+	max_date = dt.date(2020, 1, 1)
+	for file in os.listdir(log_folder):
+		if file.endswith(".csv"):
+			try:
+				file_date = dt.datetime.strptime(file.split(".csv")[0], "%Y_%m_%d").date()
+				if file_date > max_date:
+					max_date = file_date
+			except ValueError:
+				continue
+
+	if max_date == dt.date(2020, 1, 1):
+		return 0
+
+	log_data = pd.read_csv(f"{log_folder}/{max_date.strftime('%Y_%m_%d')}.csv")
+	if log_data.empty:
+		return 0
+
+	last_row = log_data.iloc[-1]
+	stored_pnl_tracker = last_row["pnl_tracker"]
+
+	# If there's an unsettled trade (pnl is NaN) and we have SPX, calculate the actual P&L
+	if spx is not None and pd.isna(last_row["pnl"]):
+		# Calculate P&L from the last trade based on current SPX
+		call_pnl = calc_expiry_pnl_sell(last_row["short_call_strike"], last_row["long_call_strike"], spx, "Call")
+		put_pnl = calc_expiry_pnl_sell(last_row["short_put_strike"], last_row["long_put_strike"], spx, "Put")
+		premium_collected = last_row["price"] * last_row["size"] * 100
+		trade_pnl = ((call_pnl + put_pnl) * last_row["size"] * 100) + premium_collected
+
+		actual_pnl_tracker = stored_pnl_tracker + trade_pnl
+		print(f"DEBUG get_pnl_tracker_from_log: stored={stored_pnl_tracker}, trade_pnl={trade_pnl:.0f}, actual={actual_pnl_tracker:.0f}")
+		return actual_pnl_tracker
+
+	return stored_pnl_tracker
+
+
+def check_big_move(yesterday_implied_move):
+	"""Returns (triggered, info_dict). Triggered if SPX moved > 1.6x implied move OR VVIX < 82.
+	Note: returns tuple (bool, dict); should_trade expects that for big_move."""
+	if pd.isna(yesterday_implied_move):
+		print("Big Move Check: Cannot evaluate - yesterday's implied move is NaN")
+		return False, {
+			"spx_pct_chg": np.nan,
+			"implied_move": np.nan,
+			"move_ratio": np.nan,
+			"vvix": np.nan,
+			"big_move_triggered": False,
+			"vvix_triggered": False,
+			"reason": "Cannot evaluate - yesterday's implied move is unavailable (NaN)"
+		}
+
+	# Get VVIX
+	try:
+		vvix = blp.bdh("VVIX Index", "PX_LAST", today, today).iloc[0, 0]
+	except Exception as e:
+		print(f"Error fetching VVIX: {e}")
+		vvix = 100  # Default to not triggering
+
+	# Get SPX 1-day % change
+	try:
+		spx_pct_chg = abs(blp.bdh("SPX Index", "CHG_PCT_1D", today, today).iloc[0, 0])
+	except Exception as e:
+		print(f"Error fetching SPX CHG_PCT_1D: {e}")
+		spx_pct_chg = 0  # Default to not triggering
+
+	# Check conditions
+	move_ratio = spx_pct_chg / yesterday_implied_move if yesterday_implied_move > 0 else 0
+	big_move_triggered = move_ratio > 1.58 # slightly lower to catch borderline days
+	vvix_triggered = vvix < 82
+
+	print(f"Big Move Check: SPX chg={spx_pct_chg:.2f}%, implied={yesterday_implied_move:.2f}%, ratio={move_ratio:.2f}x, VVIX={vvix:.2f}")
+	print(f"  -> big_move_triggered={big_move_triggered}, vvix_triggered={vvix_triggered}")
+
+	# Build reason string
+	triggered = big_move_triggered or vvix_triggered
+	if triggered:
+		reasons = []
+		if big_move_triggered:
+			reasons.append(f"SPX moved {move_ratio:.2f}x implied (>{1.6}x threshold)")
+		if vvix_triggered:
+			reasons.append(f"VVIX={vvix:.2f} (<82 threshold)")
+		reason = " AND ".join(reasons)
+	else:
+		reason = f"SPX move {move_ratio:.2f}x (move={spx_pct_chg:.2f}%, implied={yesterday_implied_move:.2f}%, need >1.6x) and VVIX={vvix:.2f} (need <82)"
+
+	return triggered, {
+		"spx_pct_chg": spx_pct_chg,
+		"implied_move": yesterday_implied_move,
+		"move_ratio": move_ratio,
+		"vvix": vvix,
+		"big_move_triggered": big_move_triggered,
+		"vvix_triggered": vvix_triggered,
+		"reason": reason
+	}
+
+
+def check_mean_reversion(config, spx=None):
+	"""Check mean reversion trigger based on losing streaks.
+	Returns (should_trade, trigger_info) where trigger_info includes 'direction'.
+	If spx is provided, unsettled rows with exp<=today are settled in memory so test mode matches production."""
+	sell_streak_threshold = config.get("sell_streak_threshold", 4)
+	buy_streak_threshold = config.get("buy_streak_threshold", 2)
+
+	settle_in_memory = spx is not None
+	sell_losing_streak, buy_losing_streak = get_streak_data(spx=spx, settle_in_memory=settle_in_memory)
+
+	print(f"Mean Reversion Check: sell_streak={sell_losing_streak} (threshold={sell_streak_threshold}), "
+		  f"buy_streak={buy_losing_streak} (threshold={buy_streak_threshold})")
+
+	sell_signal = sell_losing_streak >= sell_streak_threshold
+	buy_signal = buy_losing_streak >= buy_streak_threshold
+
+	# If both sell and buy streaks are at threshold, we still trade once; direction = Sell by preference
+	if sell_signal and buy_signal:
+		return True, {
+			"direction": "Sell",
+			"reason": f"Both signals active (sell_streak={sell_losing_streak}, buy_streak={buy_losing_streak}), choosing SELL",
+			"sell_streak": sell_losing_streak,
+			"buy_streak": buy_losing_streak
+		}
+	elif sell_signal:
+		return True, {
+			"direction": "Sell",
+			"reason": f"SELL signal: {sell_losing_streak} consecutive sell losses (>= {sell_streak_threshold})",
+			"sell_streak": sell_losing_streak,
+			"buy_streak": buy_losing_streak
+		}
+	elif buy_signal:
+		return True, {
+			"direction": "Buy",
+			"reason": f"BUY signal: {buy_losing_streak} consecutive buy losses (>= {buy_streak_threshold})",
+			"sell_streak": sell_losing_streak,
+			"buy_streak": buy_losing_streak
+		}
+	else:
+		return False, {
+			"reason": f"No signal: sell_streak={sell_losing_streak} (need {sell_streak_threshold}), "
+					  f"buy_streak={buy_losing_streak} (need {buy_streak_threshold})",
+			"sell_streak": sell_losing_streak,
+			"buy_streak": buy_losing_streak
+		}
+
+
+def should_trade(config, end_of_week, yesterday_implied_move, spx=None):
+	"""Evaluate if a strategy should trade based on its trigger_condition. Returns (should_trade, trigger_info)."""
+	trigger = config.get("trigger_condition", "always")
+
+	if trigger == "always":
+		return True, {"reason": "Always trades daily"}
+	elif trigger == "end_of_week":
+		# END_OF_WEEK is True when (tomorrow - today).days >= 3 (e.g. Friday -> Monday)
+		if end_of_week:
+			return True, {"reason": f"End of week (next trading day is {(tomorrow - today).days} days away)"}
+		else:
+			return False, {"reason": f"Not end of week (next trading day is {(tomorrow - today).days} day(s) away)"}
+	elif trigger == "two_consecutive_losses":
+		ref_folder = config.get("reference_log_folder", "./iron_condor_logs/")   # "Regular" strategy log
+		own_log_folder = config.get("log_folder")   # This strategy's log (e.g. recovery strategy)
+
+		regular_two_losses = check_two_consecutive_losses(ref_folder, spx=spx)
+		own_pnl_tracker = get_pnl_tracker_from_log(own_log_folder, spx=spx)
+
+		print(f"DEBUG two_consecutive_losses: own_log_folder={own_log_folder}, actual_pnl_tracker={own_pnl_tracker}")
+		print(f"DEBUG two_consecutive_losses: regular_two_losses={regular_two_losses}")
+
+		needs_recovery = own_pnl_tracker < 0
+
+		# Trade if we're in the hole (recover) OR if regular just had 2 max losses (fresh trigger)
+		if needs_recovery:
+			return True, {"reason": f"Recovering losses (pnl_tracker={own_pnl_tracker:,.0f})"}
+		elif regular_two_losses:
+			return True, {"reason": "Regular strategy lost 2 days in a row (fresh trigger)"}
+		else:
+			return False, {"reason": "Regular did NOT lose 2 in a row AND no losses to recover"}
+	elif trigger == "big_move":
+		return check_big_move(yesterday_implied_move)  # Returns (bool, dict)
+	elif trigger == "mean_reversion":
+		return check_mean_reversion(config, spx=spx)  # Returns (bool, dict) with direction for Buy/Sell
+	elif trigger == "mwf":
+		# MWF: trade on Monday (0), Wednesday (2), Friday (4)
+		if is_mwf(today):
+			return True, {"reason": f"MWF day ({today.strftime('%A')})"}
+		else:
+			return False, {"reason": f"Not an MWF day ({today.strftime('%A')})"}
+	else:
+		print(f"Unknown trigger_condition: {trigger}")
+		return False, {"reason": f"Unknown trigger: {trigger}"}
+
+
+# ========================== Spread Helpers ==========================
+def get_expiry_for_config(config):
+	"""Determine expiry date based on config trigger condition."""
+	trigger = config.get("trigger_condition", "always")
+
+	if trigger == "end_of_week":
+		# Weekly: 5 trading days from today; if that lands on Monday, use prior Friday
+		expiry = x_days_ahead(5, today)
+		if expiry.weekday() == 0:  # Monday
+			expiry = x_days_ago(1, expiry)
+
+		# Require option to span a weekend: next trading day after expiry must be 3+ calendar days later
+		next_day_after_expiry = x_days_ahead(1, expiry)
+		days_gap = (next_day_after_expiry - expiry).days
+
+		if days_gap < 3:
+			expiry = x_days_ago(1, expiry)
+			next_day_after_expiry = x_days_ahead(1, expiry)
+			days_gap = (next_day_after_expiry - expiry).days
+			if days_gap < 3:
+				raise ValueError(f"Weekly expiry calculation failed: expiry {expiry} has only {days_gap} day gap to next trading day {next_day_after_expiry}. Expected 3+ days.")
+
+		print(f"Weekly expiry: {expiry} (next trading day {next_day_after_expiry} is {days_gap} days later)")
+		return expiry
+	elif trigger == "mwf":
+		# MWF expiry with holiday-aware fallback (from calendar_utils)
+		expiry = get_mwf_expiry(today)
+		print(f"MWF expiry: {expiry} ({expiry.strftime('%A')})")
+		return expiry
+	else:
+		return tomorrow  # Daily strategies: 1DTE
+
+
+def get_spreads_for_expiry(cp, spx_price, expiry, symbol="SPXW", target=None, limit=30):
+	"""Fetch live option data and select spread strikes nearest to target mid price.
+
+	Uses shared get_spreads() for strike selection, then wraps result with
+	prod-specific fields needed for order submission.
+	"""
+	params = SYMBOL_PARAMS[symbol]
+	if target is None:
+		target = params["spread_target"]
+	spread_width = params["spread_width"]
+
+	# Quote table read at call time from _srof.IMPLIED_QUOTE_TABLE: v7 default is
+	# sranalytics.msgoptionimpliedquote (byte-identical SQL); use_v8 flips it to the v8
+	# msgliveimpliedquoteadj (the v7 name does not exist on the v8 host).
+	if cp == "Call":
+		sql = f"""SELECT * FROM {_srof.IMPLIED_QUOTE_TABLE}
+		WHERE okey_tk = '{symbol}' AND okey_xx > uprc AND okey_cp = 'Call' AND okey_yr = {expiry.year} AND okey_mn = {expiry.month} AND okey_dy = {expiry.day} ORDER BY okey_xx ASC LIMIT {limit};"""
+	else:
+		sql = f"""SELECT * FROM {_srof.IMPLIED_QUOTE_TABLE}
+		WHERE okey_tk = '{symbol}' AND okey_xx < uprc AND okey_cp = 'Put' AND okey_yr = {expiry.year} AND okey_mn = {expiry.month} AND okey_dy = {expiry.day} ORDER BY okey_xx DESC LIMIT {limit};"""
+
+	df = run_query_cached(sql).rename(columns={"okey_xx": "strike", "sprc": "srPrc", "obid": "bidPrc", "oask": "askPrc", "svol": "srVol"})
+
+	result = get_spreads(df, spx_price, cp, spread_width, target, normalize_targets_and_widths=False)
+	if result is None:
+		return None
+
+	short_leg = result["short_leg"]
+	long_leg = result["long_leg"]
+
+	return {
+		"cp": cp,
+		"long_option": long_leg.rename({"srPrc": "sprc", "strike": "okey_xx"}),
+		"short_option": short_leg.rename({"srPrc": "sprc", "strike": "okey_xx"}),
+		"long_strike": result["long_strike"],
+		"short_strike": result["short_strike"],
+		"long_bid": long_leg.bidPrc,
+		"long_ask": long_leg.askPrc,
+		"short_bid": short_leg.bidPrc,
+		"short_ask": short_leg.askPrc,
+		"long_mid": long_leg.srPrc,
+		"short_mid": short_leg.srPrc,
+		"spread_price_cross": short_leg.bidPrc - long_leg.askPrc,
+		"spread_price_mid": result["spread_price_mid"],
+		"vol": long_leg.srVol
+	}
+
+
+def calc_expiry_pnl_sell(short_strike, long_strike, close_price, cp):
+	"""Seller's expiry P&L component per share for a credit spread; negative when ITM, 0 when OTM. Caller: pnl_sell = bid_price + call_sell + put_sell."""
+	if cp == "Call":
+		if close_price <= short_strike:
+			return 0
+		elif close_price <= long_strike:
+			return short_strike - close_price  # In the spread: loss (negative)
+		else:
+			return short_strike - long_strike  # Max loss: minus width
+	else:
+		if close_price >= short_strike:
+			return 0
+		elif close_price >= long_strike:
+			return close_price - short_strike  # In the spread: loss (negative)
+		else:
+			return long_strike - short_strike  # Below both: max loss (negative; for puts long < short)
+
+
+def calc_expiry_pnl_buy(short_strike, long_strike, close_price, cp):
+	"""Buyer's expiry P&L component per share for a debit spread; positive when ITM, 0 when OTM. Caller: pnl_buy = call_buy + put_buy - ask_price."""
+	if cp == "Call":
+		if close_price <= short_strike:
+			return 0
+		elif close_price <= long_strike:
+			return close_price - short_strike  # In the spread: receive (positive)
+		else:
+			return long_strike - short_strike  # Max: width
+	else:
+		if close_price >= short_strike:
+			return 0
+		elif close_price >= long_strike:
+			return short_strike - close_price  # In the spread: receive (positive)
+		else:
+			return short_strike - long_strike  # Max: width (positive; for puts short > long)
+
+
+def calculate_daily_pnl_for_streaks(spx_at_trade, spx_at_expiry, calls, puts, bid_price_spread):
+	"""Calculate what the P&L would have been for both selling and buying (for streak tracking). Per-share (no multiplier)."""
+	call_pnl_sell = calc_expiry_pnl_sell(calls["short_strike"], calls["long_strike"], spx_at_expiry, "Call")
+	put_pnl_sell = calc_expiry_pnl_sell(puts["short_strike"], puts["long_strike"], spx_at_expiry, "Put")
+	pnl_sell = bid_price_spread + call_pnl_sell + put_pnl_sell
+
+	call_pnl_buy = calc_expiry_pnl_buy(calls["short_strike"], calls["long_strike"], spx_at_expiry, "Call")
+	put_pnl_buy = calc_expiry_pnl_buy(puts["short_strike"], puts["long_strike"], spx_at_expiry, "Put")
+	ask_price_spread = (calls["short_ask"] - calls["long_bid"]) + (puts["short_ask"] - puts["long_bid"])
+	pnl_buy = call_pnl_buy + put_pnl_buy - ask_price_spread
+
+	return pnl_sell, pnl_buy
+
+
+# ========================== Log Processing ==========================
+# Per-strategy CSV logs: trade_date, exp, strikes, size, price, pnl_tracker, pnl, premium_sold, is_buy, etc.
+# Filenames: YYYY_MM_DD.csv (one file per calendar day; contains that day's trade and history for premium calc).
+def get_latest_log_file(log_folder):
+	"""Find the most recent log file in a folder (by date in filename)."""
+	max_date = dt.date(2020, 1, 1)
+	for file in os.listdir(log_folder):
+		if file.endswith(".csv"):
+			try:
+				file_date = dt.datetime.strptime(file.split(".csv")[0], "%Y_%m_%d").date()
+				if file_date > max_date:
+					max_date = file_date
+			except ValueError:
+				continue
+	return max_date if max_date > dt.date(2020, 1, 1) else None
+
+
+def settle_previous_trade(config, spx):
+	"""Settle only rows whose exp == today and pnl is NaN. Never overwrite already-settled PnL. Call only when not IS_TEST."""
+	log_folder = config.get("log_folder")
+	if log_folder is None:
+		return
+	if not os.path.exists(log_folder):
+		return
+
+	latest_date = get_latest_log_file(log_folder)
+	if latest_date is None:
+		return
+
+	log_path = f"{log_folder}/{latest_date.strftime('%Y_%m_%d')}.csv"
+	log_data = pd.read_csv(log_path)
+	if log_data.empty:
+		return
+
+	# Normalize exp to date for comparison
+	log_data["exp"] = pd.to_datetime(log_data["exp"]).apply(lambda x: x.date() if hasattr(x, "date") else x)
+
+	# Only settle rows where exp == today and pnl is NaN (do not overwrite previously settled trades)
+	to_settle = (log_data["exp"] == today) & pd.isna(log_data["pnl"])
+	if not to_settle.any():
+		return
+
+	settled_count = 0
+	for idx in log_data.index[to_settle]:
+		row = log_data.loc[idx]
+		is_buy = row.get("is_buy", False) if "is_buy" in row else False
+
+		if is_buy:
+			call_pnl = calc_expiry_pnl_buy(row["short_call_strike"], row["long_call_strike"], spx, "Call")
+			put_pnl = calc_expiry_pnl_buy(row["short_put_strike"], row["long_put_strike"], spx, "Put")
+			premium_paid = row["price"] * row["size"] * 100
+			pnl = ((call_pnl + put_pnl) * row["size"] * 100) - premium_paid
+		else:
+			call_pnl = calc_expiry_pnl_sell(row["short_call_strike"], row["long_call_strike"], spx, "Call")
+			put_pnl = calc_expiry_pnl_sell(row["short_put_strike"], row["long_put_strike"], spx, "Put")
+			premium_collected = row["price"] * row["size"] * 100
+			pnl = ((call_pnl + put_pnl) * row["size"] * 100) + premium_collected
+
+		log_data.loc[idx, "spx_on_exp"] = spx
+		log_data.loc[idx, "pnl"] = pnl
+		settled_count += 1
+		print(f"{ts()} -- [{config['name']}] Settled trade (exp={today}) P&L: {pnl:,.2f}")
+
+	if settled_count > 0:
+		log_data.to_csv(log_path, index=False)
+
+
+def calculate_premium_and_pnl(config, spx, calls, puts, bid_price_spread, is_test=False):
+	"""Calculate premium target and size for a strategy based on its log history.
+	When is_test and last row is unsettled, uses expiry date's SPX close so sizing matches production."""
+	log_folder = config.get("log_folder")
+	default_premium = config["default_premium"]
+	double_down = config.get("double_down", True)
+
+	# If no log folder or no double-down, just use default premium
+	if log_folder is None or not double_down:
+		return {
+			"premium": default_premium,
+			"pnl_tracker": 0,
+			"pnl": 0,
+			"log_data": pd.DataFrame(),
+			"pnl_total": 0
+		}
+
+	# Find latest log
+	latest_date = get_latest_log_file(log_folder)
+
+	if latest_date is None:
+		# No log exists, start fresh
+		return {
+			"premium": default_premium,
+			"pnl_tracker": 0,
+			"pnl": 0,
+			"log_data": pd.DataFrame(),
+			"pnl_total": 0
+		}
+
+	log_data = pd.read_csv(f"{log_folder}/{latest_date.strftime('%Y_%m_%d')}.csv")
+
+	if log_data.empty:
+		return {
+			"premium": default_premium,
+			"pnl_tracker": 0,
+			"pnl": 0,
+			"log_data": log_data,
+			"pnl_total": 0
+		}
+
+	log_data["trade_date"] = pd.to_datetime(log_data["trade_date"]).apply(lambda x: x.date())
+	log_data["exp"] = pd.to_datetime(log_data["exp"]).apply(lambda x: x.date())
+	log_data.sort_values(by=["trade_date"], inplace=True)
+
+	# Get the last row (most recent trade)
+	last_row = log_data.iloc[[-1]]
+
+	# Check if this was a buy or sell trade
+	is_buy = last_row["is_buy"].values[0] if "is_buy" in last_row.columns else False
+
+	# Last trade P&L: use stored value if settled; else compute. When exp <= today use current spx (settled-as-of-today) so sizing is correct.
+	if pd.notna(last_row["pnl"].values[0]):
+		pnl = last_row["pnl"].values[0]
+	else:
+		exp_date = last_row["exp"].values[0]
+		if exp_date <= today:
+			# Expired trade: always use current SPX so "pnl from last" and size reflect settled outcome (defensive if settle_previous_trade didn't run or file was stale).
+			spx_for_pnl = spx
+		elif is_test:
+			try:
+				spx_for_pnl = blp.bdh(tickers=["SPX INDEX"], flds="PX_LAST", start_date=exp_date, end_date=exp_date)["SPX INDEX"].values[0][0]
+			except Exception as e:
+				print(f"Warning: could not fetch SPX for expiry {exp_date} in test mode ({e}), using current spx")
+				spx_for_pnl = spx
+		else:
+			spx_for_pnl = spx
+
+		if is_buy:
+			call_pnl = calc_expiry_pnl_buy(last_row["short_call_strike"].values[0], last_row["long_call_strike"].values[0], spx_for_pnl, "Call")
+			put_pnl = calc_expiry_pnl_buy(last_row["short_put_strike"].values[0], last_row["long_put_strike"].values[0], spx_for_pnl, "Put")
+			premium_paid = last_row["price"].values[0] * last_row["size"].values[0] * 100
+			pnl = ((call_pnl + put_pnl) * last_row["size"].values[0] * 100) - premium_paid
+		else:
+			call_pnl = calc_expiry_pnl_sell(last_row["short_call_strike"].values[0], last_row["long_call_strike"].values[0], spx_for_pnl, "Call")
+			put_pnl = calc_expiry_pnl_sell(last_row["short_put_strike"].values[0], last_row["long_put_strike"].values[0], spx_for_pnl, "Put")
+			premium_last = last_row["price"].values[0] * last_row["size"].values[0] * 100
+			pnl = ((call_pnl + put_pnl) * last_row["size"].values[0] * 100) + premium_last
+
+	pnl_tracker = last_row["pnl_tracker"].values[0] + pnl
+
+	if pnl_tracker > 0:
+		premium = default_premium
+		pnl_tracker = 0
+	else:
+		premium = default_premium + abs(pnl_tracker)
+
+	return {
+		"premium": premium,
+		"pnl_tracker": pnl_tracker,
+		"pnl": pnl,
+		"log_data": log_data,
+		"pnl_total": last_row["pnl_total"].values[0] if "pnl_total" in last_row.columns else 0
+	}
+
+
+def update_log(config, spx, calls, puts, bid_price_spread, size, expiry, premium_data, is_buy=False):
+	"""Append today's trade to log and write to today's CSV. Assumes previous row was already settled in settle_previous_trade."""
+	log_folder = config.get("log_folder")
+	if log_folder is None:
+		return
+	if not os.path.exists(log_folder):
+		os.makedirs(log_folder)
+
+	# premium_data["log_data"] is the latest log we read in calculate_premium_and_pnl (with last row settled)
+	log_data = premium_data["log_data"]
+	pnl_tracker = premium_data["pnl_tracker"]
+	premium = premium_data["premium"]
+	pnl_total = premium_data["pnl_total"]
+	pnl = premium_data["pnl"]
+
+	# Create new row for today's trade
+	new_row = pd.DataFrame({
+		"trade_date": [today],
+		"exp": [expiry],
+		"long_put_strike": [puts["long_strike"]],
+		"short_put_strike": [puts["short_strike"]],
+		"short_call_strike": [calls["short_strike"]],
+		"long_call_strike": [calls["long_strike"]],
+		"size": [size],
+		"price": [bid_price_spread],
+		"spx_on_trade_date": [spx],
+		"spx_on_exp": [np.nan],
+		"pnl_tracker": [pnl_tracker],
+		"pnl_total": [pnl_total + pnl] if not log_data.empty else [0],
+		"premium_target": [premium],
+		"pnl": [np.nan],
+		"atmVol": [calls["vol"]],
+		"premium_sold": [bid_price_spread * size * 100],
+		"is_buy": [is_buy],
+	})
+
+	if not log_data.empty:
+		# Append new row to existing history
+		log_data = pd.concat([log_data, new_row], ignore_index=True)
+	else:
+		log_data = new_row
+
+	log_data.sort_values(by=["trade_date"], inplace=True)
+	log_data.to_csv(f"{log_folder}/{today.strftime('%Y_%m_%d')}.csv", index=False)
+
+
+# ========================== Helper ==========================
+def ts():
+	"""Return current timestamp string for logging with milliseconds."""
+	now = getNowEst()
+	return now.strftime('%I:%M:%S') + f'.{now.microsecond // 1000:03d}' + now.strftime(' %p')
+
+
+# ========================== Preview ==========================
+def generate_preview(configs, end_of_week, yesterday_implied_move):
+	"""Generate a preview of today's trades at current market levels. Sent to chat before the 4pm wait.
+
+	Purely informational - no state is mutated (no log writes, no orders). Each config
+	is wrapped in its own try/except so one failure doesn't block the rest. The entire
+	function is also wrapped so a preview failure never prevents the real trading flow.
+	"""
+	from math import ceil
+	try:
+		spx_snap = blp.bdp("SPX Index", "PX_LAST")
+		spx = spx_snap.iloc[0, 0]
+		# Cache underlying prices by settlement ticker (SPX always needed; NDX only if configs use it)
+		_underlying_cache = {"SPX INDEX": spx}
+		lines = [f"PREVIEW (at current levels, SPX: {spx:,.2f}):\n"]
+
+		for config in configs:
+			name = config["name"]
+			try:
+				# Get underlying price for this config's symbol
+				_sym = config.get("symbol", "SPXW")
+				_ticker = SETTLEMENT_TICKERS.get(_sym, "SPX INDEX")
+				if _ticker not in _underlying_cache:
+					_snap = blp.bdp(_ticker, "PX_LAST")
+					_underlying_cache[_ticker] = _snap.iloc[0, 0]
+				_upx = _underlying_cache[_ticker]
+
+				triggered, trigger_info = should_trade(config, end_of_week, yesterday_implied_move, spx=_upx)
+				reason = trigger_info.get("reason", "") if trigger_info else ""
+
+				if not triggered:
+					lines.append(f"[{name}] Would skip - {reason}")
+					continue
+
+				# Direction
+				config_direction = config.get("direction", "Sell")
+				if config_direction == "Buy/Sell":
+					direction = trigger_info.get("direction", "Sell")
+				else:
+					direction = config_direction
+				is_sale = (direction == "Sell")
+
+				# Expiry and spreads
+				expiry = get_expiry_for_config(config)
+				limit_for_sql_query = 100 if config.get("trigger_condition") == "end_of_week" else 60
+				calls = get_spreads_for_expiry("Call", _upx, expiry, symbol=_sym, limit=limit_for_sql_query)
+				puts = get_spreads_for_expiry("Put", _upx, expiry, symbol=_sym, limit=limit_for_sql_query)
+
+				if calls is None or puts is None:
+					lines.append(f"[{name}] Trigger: {reason}. Could not fetch spreads.")
+					continue
+
+				# Price calc via shared compute_bid_ask
+				_params = SYMBOL_PARAMS[_sym]
+				bid, ask = compute_bid_ask(calls, puts, offset=_params["bid_ask_offset"], tick=_params["bid_ask_tick"])
+				price = bid if is_sale else ask
+
+				# Premium and size (read-only log access)
+				premium_data = calculate_premium_and_pnl(config, spx, calls, puts, price, is_test=False)
+				premium = premium_data["premium"]
+				pnl = premium_data["pnl"]
+
+				fixed_size = config.get("fixed_size")
+				if fixed_size is not None:
+					size = fixed_size
+				elif price > 0:
+					size = max(round(premium / 100 / price), 1)
+				else:
+					size = 0
+
+				max_trade_size = config["max_trade_size"]
+				size_to_send = min(size, max_trade_size)
+
+				# Format
+				direction_str = "SELL" if is_sale else "BUY"
+				exp_str = expiry.strftime("%m/%d")
+				p_long = puts["long_strike"]
+				p_short = puts["short_strike"]
+				c_short = calls["short_strike"]
+				c_long = calls["long_strike"]
+
+				_idx_label = "NDX" if _sym == "NDXP" else "SPX"
+				line = f"[{name}] {_idx_label}: {_upx:,.2f}. *Trigger: {reason}.*"
+				if config.get("double_down", True) and config.get("log_folder") is not None:
+					line += f" Pnl from last: {pnl:,.2f}. Premium target: {premium:,.2f}."
+				else:
+					line += f" Premium: {premium:,.2f} (fixed)."
+				direction_word = "Selling" if is_sale else "Buying"
+				line += f"\n  {direction_word} ~{size_to_send} lot(s) of {exp_str} {p_long:.0f}/{p_short:.0f}/{c_short:.0f}/{c_long:.0f} IC @ ~{price:.2f}."
+
+				if size > max_trade_size:
+					line += f"\n  *Must manually {direction_word.lower()} ~{size - max_trade_size} lot(s) for ~{price:.2f} additional.*"
+
+				lines.append(line)
+
+			except Exception as e:
+				lines.append(f"[{name}] Preview error: {e}")
+
+		preview_msg = "\n".join(lines)
+		print(preview_msg)
+		send_message(f"{ts()}\n{preview_msg}", my_chat)
+
+	except Exception as e:
+		print(f"{ts()} -- Preview generation failed (non-fatal): {e}")
+
+
+# ========================== Main ==========================
+if __name__ == "__main__":
+	print(f"{ts()} -- Script starting...")
+
+	# Prevent running with SEND_TRADES=False in production (would only update implied move and exit)
+	if not SEND_TRADES and not IS_TEST:
+		raise AssertionError("SEND_TRADES is set to False but IS_TEST is False. This is not allowed.")
+
+	try:
+		configs = load_icon_configs()
+		print(f"{ts()} -- Loaded {len(configs)} ICON configs: {[c['name'] for c in configs]}")
+	except Exception as e:
+		print(f"{ts()} -- ERROR loading configs: {e}")
+		raise
+
+	# True when next trading day is 3+ calendar days away (e.g. Friday -> Monday); used for end_of_week trigger and weekly expiry
+	END_OF_WEEK = (tomorrow - today).days >= 3
+	print(f"{ts()} -- END_OF_WEEK={END_OF_WEEK} (tomorrow={tomorrow}, today={today}, days_diff={(tomorrow - today).days})")
+
+	# Get yesterday's implied move for big_move trigger evaluation
+	print(f"{ts()} -- Getting yesterday's implied move...")
+	try:
+		yesterday_implied_move = get_yesterday_implied_move()
+		if pd.isna(yesterday_implied_move):
+			print(f"{ts()} -- Yesterday's implied move for today: NaN (ICON_BIG_MOVE will not trade)")
+		else:
+			print(f"{ts()} -- Yesterday's implied move for today: {yesterday_implied_move:.2f}%")
+	except Exception as e:
+		print(f"{ts()} -- ERROR getting yesterday's implied move: {e}. Setting to NaN (ICON_BIG_MOVE will not trade).")
+		yesterday_implied_move = np.nan
+
+	# Start message
+	if not IS_TEST:
+		print(f"{ts()} -- Sending start message to chat...")
+		try:
+			send_message(f"{ts()} Starting ICON v3 script.", my_chat)
+		except Exception as e:
+			print(f"{ts()} -- ERROR sending start message: {e}")
+
+	# Preview of today's trades at current market levels (non-test only)
+	warm_up_bloomberg_connection()   # startup: generate_preview below is this script's first Bloomberg call (see helpers)
+	if not IS_TEST:
+		generate_preview(configs, END_OF_WEEK, yesterday_implied_move)
+
+	summary = f"{dt.date.today().strftime('%m/%d/%Y')} {'4pm Condor v3' if not IS_TEST else 'TEST'} RECAP:\n\n"
+
+	if END_OF_WEEK:
+		summary += "Today is end of week, also trading weekly ICONS.\n\n"
+
+	# Wait until 4:00:15 PM (or LAST_HOUR + 1)
+	print(f"{ts()} -- Waiting until {LAST_HOUR}:00:15...")
+	while getNowEst().time() <= dt.time(7 if IS_TEST else LAST_HOUR - 1, 59, 20):
+		time.sleep(30)
+	while getNowEst().time() <= dt.time(7 if IS_TEST else LAST_HOUR, 0, 15):
+		time.sleep(1)
+	print(f"{ts()} -- Wait complete. Proceeding with data collection...")
+
+	# Drop preview-time cache entries so every phase-2 chain pull is fresh.
+	_run_query_cache.clear()
+
+	# Get SPX price (always needed for daily PnL tracking and SPX configs)
+	print(f"{ts()} -- Fetching SPX price from Bloomberg...")
+	try:
+		spx = blp.bdp("SPX Index", "PX_LAST").iloc[0, 0]
+		print(f"{ts()} -- SPX price: {spx:.2f}")
+	except Exception as e:
+		print(f"{ts()} -- ERROR fetching SPX price: {e}")
+		raise
+
+	# Cache underlying prices by settlement ticker; fetch additional tickers if any config needs them
+	underlying_prices = {"SPX INDEX": spx}
+	needed_tickers = set(SETTLEMENT_TICKERS[cfg.get("symbol", "SPXW")] for cfg in configs) - {"SPX INDEX"}
+	for ticker in needed_tickers:
+		try:
+			px = blp.bdp(ticker, "PX_LAST").iloc[0, 0]
+			underlying_prices[ticker] = px
+			print(f"{ts()} -- {ticker} price: {px:.2f}")
+		except Exception as e:
+			print(f"{ts()} -- ERROR fetching {ticker} price: {e}")
+			raise
+
+	summary += f"SPX (settlement): {spx:,.2f}\n\n"
+
+	# Settle any expired rows in iron_condor_daily_pnl.csv (so mean_reversion streak is up to date)
+	if not IS_TEST:
+		print(f"{ts()} -- Settling daily P&L for streak tracking...")
+		try:
+			settle_daily_pnl(spx)
+		except Exception as e:
+			print(f"{ts()} -- ERROR settling daily P&L: {e}")
+
+	# Tomorrow's implied move: used in recap; saved to CSV only when not IS_TEST
+	print(f"{ts()} -- Calculating tomorrow's implied move...")
+	try:
+		tomorrow_implied_move = get_implied_move_for_tomorrow()
+		print(f"{ts()} -- Tomorrow's implied move: {tomorrow_implied_move:.2f}%")
+		if not IS_TEST:
+			save_implied_move_for_tomorrow(tomorrow_implied_move)
+			print(f"{ts()} -- Saved implied move to {IMPLIED_MOVE_FILE}")
+	except Exception as e:
+		print(f"{ts()} -- ERROR calculating/saving implied move: {e}")
+		tomorrow_implied_move = None
+
+	if tomorrow_implied_move is not None:
+		summary += f"Tomorrow's implied move: {tomorrow_implied_move:.2f}%\n\n"
+
+	if not SEND_TRADES:
+		msg = f"{ts()} -- SEND_TRADES=False. Exiting without sending trades."
+		if not IS_TEST:
+			msg = f"{ts()} -- SEND_TRADES=False. Updated implied move file. Exiting without sending trades."
+		print(msg)
+		summary += "SEND_TRADES=False. No trades sent.\n"
+		print(summary)
+		try:
+			send_message(f"{ts()}\n" + summary, my_chat)
+		except Exception as e:
+			print(f"{ts()} -- ERROR sending summary message: {e}")
+		exit()
+
+	# Daily P&L tracking: one row per day with tomorrow's expiry spreads; used only for mean_reversion streak (sell/buy PnL). Saved so we can settle tomorrow.
+	print(f"{ts()} -- Fetching spreads for daily P&L tracking...")
+	try:
+		calls_for_tracking = get_spreads_for_expiry("Call", spx, tomorrow, limit=60)
+		puts_for_tracking = get_spreads_for_expiry("Put", spx, tomorrow, limit=60)
+		_params = SYMBOL_PARAMS["SPXW"]
+		bid_price_tracking, ask_price_tracking = compute_bid_ask(calls_for_tracking, puts_for_tracking, offset=_params["bid_ask_offset"], tick=_params["bid_ask_tick"])
+
+		if not IS_TEST:
+			save_daily_pnl(
+				trade_date=today,
+				expiry=tomorrow,
+				calls=calls_for_tracking,
+				puts=puts_for_tracking,
+				bid_price=bid_price_tracking,
+				ask_price=ask_price_tracking,
+				spx_at_trade=spx,
+				atmVol=calls_for_tracking["vol"]
+			)
+	except Exception as e:
+		print(f"{ts()} -- ERROR with daily P&L tracking: {e}")
+
+	trades = []           # Coroutines from send_complex_two_waves (awaited later)
+	trade_summaries = []  # Lines for recap message
+	errors = []
+
+	print(f"{ts()} -- Processing {len(configs)} strategies...")
+	for config in configs:
+		name = config["name"]
+		print(f"{ts()} -- [{name}] Starting evaluation...")
+
+		try:
+			# Resolve symbol and underlying price for this config
+			_sym = config.get("symbol", "SPXW")
+			_ticker = SETTLEMENT_TICKERS.get(_sym, "SPX INDEX")
+			_upx = underlying_prices[_ticker]
+
+			# Settle last row of this strategy's log with today's underlying (so premium/size calc and pnl_tracker are correct). Skip in test to avoid overwriting with wrong price.
+			if not IS_TEST and config.get("log_folder") is not None:
+				print(f"{ts()} -- [{name}] Settling previous trade if needed...")
+				settle_previous_trade(config, _upx)
+
+			print(f"{ts()} -- [{name}] Checking trigger condition '{config.get('trigger_condition')}'...")
+			should_trade_result, trigger_info = should_trade(config, END_OF_WEEK, yesterday_implied_move, spx=_upx)
+
+			if not should_trade_result:
+				trigger_cond = config.get('trigger_condition')
+				skip_msg = f"[{name}] Skipped - trigger condition '{trigger_cond}' not met."
+				if trigger_info and "reason" in trigger_info:
+					skip_msg += f" ({trigger_info['reason']})"
+				print(f"{ts()} -- {skip_msg}")
+				trade_summaries.append(skip_msg + "\n")
+				continue
+
+			print(f"{ts()} -- [{name}] Trigger condition met. Processing trade...")
+
+			# Determine direction based on config
+			config_direction = config.get("direction", "Sell")
+			if config_direction == "Buy/Sell":
+				# Dynamic direction from trigger_info
+				direction = trigger_info.get("direction", "Sell")
+			else:
+				direction = config_direction
+
+			is_sale = (direction == "Sell")
+			print(f"{ts()} -- [{name}] Direction: {direction} (is_sale={is_sale})")
+
+			# Determine account
+			account = config["test_account"] if IS_TEST else config["account"]
+			# Sending test orders to v8 -> route to the v8 test account (T.AGM* only exists on v7).
+			if IS_TEST and SEND_V8 and str(account).startswith("T.AGM"):
+				account = "T.AGMV8.01"
+			max_trade_size = config["max_trade_size"]
+			print(f"{ts()} -- [{name}] Account: {account}, Max size: {max_trade_size}")
+
+			# Get expiry for this strategy
+			expiry = get_expiry_for_config(config)
+			limit_for_sql_query = 100 if config.get("trigger_condition") == "end_of_week" else 60
+			print(f"{ts()} -- [{name}] Expiry: {expiry}, Query limit: {limit_for_sql_query}")
+
+			# Get spreads
+			print(f"{ts()} -- [{name}] Fetching call spreads...")
+			calls = get_spreads_for_expiry("Call", _upx, expiry, symbol=_sym, limit=limit_for_sql_query)
+			print(f"{ts()} -- [{name}] Call spread: {calls['short_strike']:.0f}/{calls['long_strike']:.0f} @ {calls['spread_price_mid']:.2f}")
+
+			print(f"{ts()} -- [{name}] Fetching put spreads...")
+			puts = get_spreads_for_expiry("Put", _upx, expiry, symbol=_sym, limit=limit_for_sql_query)
+			print(f"{ts()} -- [{name}] Put spread: {puts['long_strike']:.0f}/{puts['short_strike']:.0f} @ {puts['spread_price_mid']:.2f}")
+
+			# Price used for sizing and log: for sell use bid (we receive); for buy use ask (we pay).
+			_params = SYMBOL_PARAMS[_sym]
+			_bid, _ask = compute_bid_ask(calls, puts, offset=_params["bid_ask_offset"], tick=_params["bid_ask_tick"])
+			if is_sale:
+				bid_price_spread = _bid
+				print(f"{ts()} -- [{name}] SELL price (bid): {bid_price_spread:.2f}")
+			else:
+				bid_price_spread = _ask  # Reuse var for "price of the trade"
+				print(f"{ts()} -- [{name}] BUY price (ask): {bid_price_spread:.2f}")
+
+			# Calculate premium and P&L (reads log from disk here; no cache, so settled pnl from settle_previous_trade above is visible)
+			print(f"{ts()} -- [{name}] Calculating premium and P&L...")
+			premium_data = calculate_premium_and_pnl(config, spx, calls, puts, bid_price_spread, is_test=IS_TEST)
+			premium = premium_data["premium"]
+			pnl = premium_data["pnl"]
+			print(f"{ts()} -- [{name}] Premium: {premium:.2f}, P&L from last: {pnl:.2f}")
+
+			if not premium > 0:
+				raise ValueError(f"Premium is not greater than 0 ({premium}). Cannot proceed.")
+
+			# Calculate size
+			fixed_size = config.get("fixed_size")
+			if fixed_size is not None:
+				# Use fixed size (e.g., mean reversion strategy)
+				size = fixed_size
+				print(f"{ts()} -- [{name}] Using fixed size: {size}")
+			else:
+				# Use premium-based sizing (existing behavior)
+				size = max([round(premium / 100 / bid_price_spread), 1])
+			size_to_send = min([size, max_trade_size])
+			size_unsent = size - size_to_send
+			print(f"{ts()} -- [{name}] Size: {size}, size_to_send: {size_to_send}, size_unsent: {size_unsent}")
+
+			# send_complex_two_waves expects short_legs/long_legs; for buy we pass legs reversed so we buy the former short and sell the former long. is_sale=True is API convention (we're still "selling" the combo to the venue).
+			# Sells use standard duration/edge; buys rest longer (BUY_ORDER_DURATION) and quote tighter (BUY_EDGE_MULTIPLIER).
+			print(f"{ts()} -- [{name}] Creating trade order (is_sale={is_sale})...")
+			if is_sale:
+				short_legs = [calls["short_option"], puts["short_option"]]
+				long_legs = [calls["long_option"], puts["long_option"]]
+				order_duration, edge_mult = SELL_ORDER_DURATION, 1.0
+			else:
+				# Buy: swap legs (buy the normally-long, sell the normally-short)
+				short_legs = [calls["long_option"], puts["long_option"]]
+				long_legs = [calls["short_option"], puts["short_option"]]
+				order_duration, edge_mult = BUY_ORDER_DURATION, BUY_EDGE_MULTIPLIER
+
+			# 8/28/2026: bad SR surface (uPrcAdjResult=OtherError) mheld fills ~2 min; refresh_legs now logs
+			# surface health at W2. If it recurs, consider a wave-3 with simple limit prices (no surface check).
+			trades.append(send_complex_two_waves(
+				symbol=_sym,
+				size=size_to_send,
+				short_legs=short_legs,
+				long_legs=long_legs,
+				exp=expiry,
+				account=account,
+				edge_target1=EDGE_TARGET_4_LEGGED_1 * edge_mult,
+				max_edge1=MAX_EDGE_4_LEGGED_1 * edge_mult,
+				edge_target2=EDGE_TARGET_4_LEGGED_2 * edge_mult,
+				max_edge2=MAX_EDGE_4_LEGGED_2 * edge_mult,
+				is_sale=True,
+				orderDuration=order_duration,
+				userData=f"4PM {name}" + ("" if is_sale else " BUY")
+			))
+			print(f"{ts()} -- [{name}] Trade order created.")
+
+			# Update log (only in production and if strategy has a log folder)
+			if not IS_TEST:
+				print(f"{ts()} -- [{name}] Updating log file...")
+				try:
+					update_log(config, _upx, calls, puts, bid_price_spread, size, expiry, premium_data, is_buy=not is_sale)
+					print(f"{ts()} -- [{name}] Log updated.")
+				except Exception as log_e:
+					print(f"{ts()} -- [{name}] ERROR updating log: {log_e}")
+
+			# Recap line: trigger reason, premium/pnl_tracker, direction, size, strikes, price; mention if size capped
+			trigger_cond = config.get("trigger_condition")
+			direction_str = "Buying" if not is_sale else "Selling"
+			_idx_label = "NDX" if _sym == "NDXP" else "SPX"
+			strat_summary = f"[{name}] {_idx_label}: {_upx:,.2f}."
+			if trigger_info and "reason" in trigger_info:
+				strat_summary += f" *Trigger: {trigger_info['reason']}.*"
+
+			if config.get("double_down", True) and config.get("log_folder") is not None:
+				strat_summary += f" Pnl from last: {pnl:,.2f}. Premium target: {premium:,.2f}."
+			else:
+				strat_summary += f" Premium: {premium:,.2f} (fixed)."
+
+			strat_summary += f"\n  {direction_str} {size_to_send} lot(s) of {expiry.strftime('%m/%d')} {puts['long_strike']:.0f}/{puts['short_strike']:.0f}/{calls['short_strike']:.0f}/{calls['long_strike']:.0f} IC @ {bid_price_spread:.2f}.\n"
+
+			if size_unsent > 0:
+				strat_summary += f"  *Must manually {direction_str.lower()} {size_unsent} lot(s) for {bid_price_spread:.2f} additional.*\n"
+
+			trade_summaries.append(strat_summary)
+			print(f"{ts()} -- [{name}] Processing complete.")
+
+		except Exception as e:
+			error_msg = f"[{name}] ERROR: {str(e)}"
+			print(f"{ts()} -- {error_msg}")
+			errors.append(error_msg)
+			trade_summaries.append(f"[{name}] FAILED - {str(e)}\n")
+			continue  # Process remaining configs
+
+	# Fire all orders concurrently (send_complex_two_waves returns coroutines)
+	print(f"{ts()} -- Sending {len(trades)} trade(s)...")
+	if trades:
+		try:
+			async def send_all_trades():
+				await asyncio.gather(*trades)
+			asyncio.run(send_all_trades())
+			print(f"{ts()} -- All trades sent successfully.")
+		except Exception as e:
+			print(f"{ts()} -- ERROR sending trades: {e}")
+			errors.append(f"Trade sending error: {str(e)}")
+
+	# Final summary
+	summary += "\n".join(trade_summaries)
+
+	if errors:
+		summary += "\n\n*ERRORS:*\n" + "\n".join(errors)
+
+	print(f"{ts()} -- Final summary:")
+	print(summary)
+
+	print(f"{ts()} -- Sending summary to chat...")
+	try:
+		send_message(f"{ts()}\n" + summary, my_chat)
+		print(f"{ts()} -- Summary sent.")
+	except Exception as e:
+		print(f"{ts()} -- ERROR sending summary: {e}")
+
+	print(f"{ts()} -- Script complete.")

@@ -1,0 +1,16 @@
+---
+name: large-index-flows-project
+description: "large_index_flows project (started 2026-09-10) -- >$7B single-name index flow events, next step ThetaData 0DTE strangle test at 3pm on eff date"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 384964f0-0855-4ac2-af39-2975cbb5cce0
+  modified: 2026-09-10T12:45:13.691Z
+---
+
+Project dir: `D:/agent_projects/large_index_flows/`. Step 1 done 2026-09-10: `build_flow_list.py` -> `large_flow_events.csv`
+(18 regular-cycle S&P adds from sp500_helpers.INDIVIDUAL_ADDS + manual AVGO sell 12/19/25 = $16B and AAPL buy 12/20/24 = $30B per Zach; flow proxy = 12% x CUR_MKT_CAP on annc date). Working cut is >= $10B (`passes_10b`, 13 events); $7B keeps all 20.
+
+**Why:** Zach wants to know if buying 0DTE OTM call + OTM put (~10-20 bps of spot) at ~3pm on the effective date pays off when index flow is huge.
+
+**How to apply:** Step 2 = pull 0DTE options via ThetaData (`thetadata_helpers`, see `data-sources` skill) around 15:00 on each eff date, price the strangle, test payoff into close. Reuse sp500_adds conventions (AST-read of sp500_helpers, my_bdh raw cached). Related: [[hacker-backtest-open-items]].

@@ -1,0 +1,98 @@
+"""
+Large index flows -- step 3b: how expensive was the effective-date 0DTE strangle vs the
+name's own baseline Fridays?
+
+For each event and each baseline Friday (pull_baseline_quotes.py; the announcement Friday --
+from large_flow_events.annc_date -- is EXCLUDED for S&P adds, leaving up to 4; special events such as the
+AAPL up-weight / AVGO down-weight have no annc_date and keep all 5), price the closest-OTM call +
+put at ENTRY_TIME exactly as the event backtest does (fill = bid + 70% x spread, median over the
+10-sec window, rounded up to the penny, no cost-cap push-out) and express the cost in bps of
+that day's spot. baseline_bps = MEAN of the available baseline days (Zach 9/14/26, was median); richness =
+event / baseline.
+
+Run from Git Bash:  python /d/agent_projects/large_index_flows/baseline_richness.py [--entry 15:00]
+"""
+import argparse
+import datetime as dt
+import os
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine
+
+import backtest_strangle as bs
+import pull_baseline_quotes as pb
+
+SPOTS_CSV = os.path.join(bs.PROJ_DIR, 'baseline_spots.csv')
+EVENTS_CSV = os.path.join(bs.PROJ_DIR, 'large_flow_events.csv')
+OUT_CSV = os.path.join(bs.PROJ_DIR, 'baseline_richness.csv')
+
+
+def strangle_cost_bps(eng, symbol, date, spot, entry_time, otm_bps=0, window_sec=bs.ENTRY_WINDOW_SEC):
+    """Closest-OTM (>= otm_bps) call + put cost in bps of spot at entry_time on one day; NaN if no chain."""
+    end = (dt.datetime.combine(dt.date.today(), entry_time) + dt.timedelta(seconds=window_sec)).time()
+    q = bs.load_entry_quotes(eng, symbol, date, entry_time, end)
+    if q.empty or np.isnan(spot):
+        return np.nan, np.nan, np.nan
+    k_call, k_put = bs.pick_strikes(q.strike.values, spot, otm_bps)
+    if np.isnan(k_call) or np.isnan(k_put):
+        return np.nan, np.nan, np.nan
+    call_px, _ = bs.median_fill(q, k_call, 'Call')
+    put_px, _ = bs.median_fill(q, k_put, 'Put')
+    return (call_px + put_px) / spot * 1e4, k_call, k_put
+
+
+def build(eng, entry_time, save=True):
+    """One row per event: event cost_bps, each baseline Friday's cost_bps, baseline median, richness."""
+    label = entry_time.strftime('%H:%M')
+    spots = pd.read_csv(SPOTS_CSV, parse_dates=['eff_date', 'date'])
+    spots['eff_date'] = spots['eff_date'].dt.date
+    spots['date'] = spots['date'].dt.date
+    events = bs.load_events(spot_col=label)
+    flows = pd.read_csv(EVENTS_CSV, parse_dates=['eff_date', 'annc_date'])
+    flows['eff_date'] = flows['eff_date'].dt.date
+
+    rows = []
+    for ev in events.itertuples(index=False):
+        ev_bps, kc, kp = strangle_cost_bps(eng, ev.symbol, ev.eff_date, ev.spot_1500, entry_time)
+        fridays = pb.baseline_dates(ev.eff_date)
+        # S&P adds: exclude the quarterly announcement Friday (from large_flow_events.csv). Special events
+        # (AAPL up-weight, AVGO down-weight, ...) have no annc_date and use every prior Friday (Zach 9/14/26).
+        fl = flows[(flows.eff_date == ev.eff_date) & (flows.symbol == ev.symbol)]
+        annc = pd.Timestamp(fl.annc_date.iloc[0]).date() if len(fl) and pd.notna(fl.annc_date.iloc[0]) else None
+        base = {}
+        for d in fridays:
+            if d == annc:
+                continue
+            row = spots[(spots.symbol == ev.symbol) & (spots.date == d)]
+            spot = float(row[label].iloc[0]) if len(row) and pd.notna(row[label].iloc[0]) else np.nan
+            base[d], _, _ = strangle_cost_bps(eng, ev.symbol, d, spot, entry_time)
+        vals = pd.Series(base).dropna()
+        rec = {'eff_date': ev.eff_date, 'symbol': ev.symbol, 'est_flow_bn': ev.est_flow_bn,
+               'event_bps': ev_bps, 'call_k': kc, 'put_k': kp, 'annc_excluded': annc,
+               'n_base': len(vals), 'base_mean_bps': vals.mean() if len(vals) else np.nan,
+               'base_median_bps': vals.median() if len(vals) else np.nan,
+               'base_min_bps': vals.min() if len(vals) else np.nan, 'base_max_bps': vals.max() if len(vals) else np.nan}
+        rec['richness'] = rec['event_bps'] / rec['base_mean_bps'] if rec['n_base'] else np.nan
+        for i, d in enumerate([f for f in fridays if f != annc]):
+            rec[f'base{i + 1}_date'] = d
+            rec[f'base{i + 1}_bps'] = base.get(d, np.nan)
+        rows.append(rec)
+    out = pd.DataFrame(rows).sort_values('richness', ascending=False).reset_index(drop=True)
+    if save:
+        out.to_csv(OUT_CSV, index=False)
+    return out
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--entry', default='15:00')
+    a = ap.parse_args()
+    entry = dt.datetime.strptime(a.entry, '%H:%M').time()
+    eng = create_engine(bs.vbam_helpers.dev_connection_string, pool_pre_ping=True)
+    pd.set_option('display.width', 300)
+    df = build(eng, entry)
+    show = ['eff_date', 'symbol', 'est_flow_bn', 'event_bps', 'base1_bps', 'base2_bps', 'base3_bps', 'base4_bps',
+            'base5_bps', 'n_base', 'base_mean_bps', 'richness', 'annc_excluded']
+    print(df[show].to_string(index=False, float_format=lambda x: f'{x:,.1f}'))
+    print(f"\nmedian richness {df.richness.median():.2f}, mean {df.richness.mean():.2f}; saved {OUT_CSV}")

@@ -1,0 +1,1136 @@
+import datetime as dt
+import asyncio
+import time
+import pandas as pd
+import numpy as np
+
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+from calendar_utils import x_days_ahead, getNowEst
+from spdr_rock_functions import run_query
+import spdr_rock_functions as _srf   # read _srf.SEND_V8 at call time for v8 order-payload shape
+from price_compare import a_lt_b, round_price
+today = dt.date.today()
+
+WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE = 3 # seconds
+ORDER_DURATION = 30 # seconds
+PREMIUM_LIMIT = 27000  # max premium per order ($); system hard-rejects at $30k
+MULTIPLIER = 100       # SPX option contract multiplier
+
+# Thread-safe accumulator for send-time warnings raised deep in the send path (e.g. size dropped by
+# the 4-order cap in trade_complex, which runs in concurrent asyncio.to_thread workers and has no
+# trade_dict). Scripts drain this at chat-summary time so the warning also reaches the Google-chat recap.
+import threading as _threading
+_SEND_WARNINGS = []
+_SEND_WARNINGS_LOCK = _threading.Lock()
+
+def record_send_warning(msg):
+	"""Thread-safe: stash a send-time warning for the script to surface in the chat recap."""
+	with _SEND_WARNINGS_LOCK:
+		_SEND_WARNINGS.append(msg)
+
+def drain_send_warnings():
+	"""Return + clear all accumulated send warnings. Call once, at chat-summary build time."""
+	with _SEND_WARNINGS_LOCK:
+		out = _SEND_WARNINGS[:]
+		_SEND_WARNINGS.clear()
+	return out
+
+
+seed = int(dt.datetime.now().strftime("%f")) % 10000
+from helpers import (create_counter, pretty_time,
+                     compute_premium_add_on, compute_wave1_underfill_add_on, W1_UNDERFILL_RATIO)
+counter = create_counter(seed)
+
+
+def to_v8_id(n):
+	"""v8 groupingCode/riskGroupId format: 16 hex digits as XXXX-XXXX-XXXX-XXXX. Mask to 63 bits so
+	the leading digit is 0-7 -- v8 rejects ids that parse as negative (high bit set)."""
+	n &= 0x7FFFFFFFFFFFFFFF
+	h = f"{n:016x}"
+	return f"{h[0:4]}-{h[4:8]}-{h[8:12]}-{h[12:16]}"
+
+def _gen_id():
+	"""Next order id: v8 hex string when SEND_V8, else the plain v7 decimal counter int. The value's
+	TYPE (str vs int) also drives SQL quoting downstream (hex ids get quoted, v7 ints don't)."""
+	n = counter()
+	return to_v8_id(n) if _srf.SEND_V8 else n
+
+# SpiderRock option-quote table. v7 default = sranalytics.msgoptionimpliedquote; use_v8(True)
+# flips it to sranalytics.msgliveimpliedquoteadj (identical columns for everything we read).
+IMPLIED_QUOTE_TABLE = "sranalytics.msgoptionimpliedquote"
+
+# v8 marketSession sent for orders (v7 always sends timeInForce='Day'). Default 'RegMkt' fits
+# every intraday script (15:38-15:56 sends). Scripts that send AFTER the close must override
+# this module global (4pm_script_v3 sets 'PostMkt') -- v8 kills RegMkt orders arriving past
+# 16:00 with "Order Expired On Arrival" (all icon orders rejected that way on 8/24).
+V8_MARKET_SESSION = "RegMkt"
+
+def _build_quote_sql():
+	"""(Re)build the get_closest_* SQL strings from IMPLIED_QUOTE_TABLE. Called at import (v7) and
+	by use_v8() so the table swap propagates to these otherwise-import-time f-strings."""
+	global get_closest_calls_sql, get_closest_puts_sql
+	global get_closest_and_slightly_itm_calls_sql, get_closest_and_slightly_itm_puts_sql
+	global get_closest_ndxp_calls_sql, get_closest_ndxp_puts_sql
+	t = IMPLIED_QUOTE_TABLE
+	get_closest_calls_sql = f"""SELECT * FROM {t}
+WHERE okey_tk = 'SPXW' AND okey_xx > uprc AND okey_cp = 'Call' AND okey_yr = {today.year}  AND okey_mn = {today.month} AND okey_dy = {today.day} ORDER BY okey_xx ASC LIMIT 10;"""
+	get_closest_puts_sql = f"""SELECT * FROM {t}
+WHERE okey_tk = 'SPXW' AND okey_xx < uprc AND okey_cp = 'Put' AND okey_yr = {today.year}  AND okey_mn = {today.month} AND okey_dy = {today.day} ORDER BY okey_xx DESC LIMIT 10;"""
+
+	# Wider chain that also includes up to 1 ITM strike (within $1 of uprc).
+	# Used by the CLOSER variant which can pick strikes up to $1 ITM. All other algos
+	# should filter this to OTM-only to preserve their existing behavior.
+	# (SPX strikes are integer multiples of $5; `uprc - 1` captures any strike that is
+	#  at most $1 ITM and never anything deeper.)
+	get_closest_and_slightly_itm_calls_sql = f"""SELECT * FROM {t}
+WHERE okey_tk = 'SPXW' AND okey_xx >= uprc - 1 AND okey_cp = 'Call' AND okey_yr = {today.year}  AND okey_mn = {today.month} AND okey_dy = {today.day} ORDER BY okey_xx ASC LIMIT 11;"""
+	get_closest_and_slightly_itm_puts_sql = f"""SELECT * FROM {t}
+WHERE okey_tk = 'SPXW' AND okey_xx <= uprc + 1 AND okey_cp = 'Put' AND okey_yr = {today.year}  AND okey_mn = {today.month} AND okey_dy = {today.day} ORDER BY okey_xx DESC LIMIT 11;"""
+
+	get_closest_ndxp_calls_sql = f"""SELECT * FROM {t}
+WHERE okey_tk = 'NDXP' AND okey_xx > uprc AND okey_cp = 'Call' AND okey_yr = {today.year} AND okey_mn = {today.month} AND okey_dy = {today.day} ORDER BY okey_xx ASC LIMIT 15;"""
+	get_closest_ndxp_puts_sql = f"""SELECT * FROM {t}
+WHERE okey_tk = 'NDXP' AND okey_xx < uprc AND okey_cp = 'Put' AND okey_yr = {today.year} AND okey_mn = {today.month} AND okey_dy = {today.day} ORDER BY okey_xx DESC LIMIT 15;"""
+
+_build_quote_sql()   # build at import with the v7 table
+
+def use_v8(enable=True, send=None):
+	"""Migrate this module (and spdr_rock_functions' connection + table selection) to SpiderRock v8,
+	or back to v7 when enable=False. Flips the option-quote table to msgliveimpliedquoteadj (a DATA
+	read, governed by `enable`), rebuilds the get_closest_* SQL, and routes run_query's connection.
+	  enable -- data reads (sranalytics/srlive) on v8.
+	  send   -- srtrade order/fill traffic on v8; defaults to `enable` when None. Pass send=False to
+	            pull data from v8 while still SENDING orders to v7 (staged migration test)."""
+	global IMPLIED_QUOTE_TABLE
+	IMPLIED_QUOTE_TABLE = "sranalytics.msgliveimpliedquoteadj" if enable else "sranalytics.msgoptionimpliedquote"
+	_build_quote_sql()
+	import spdr_rock_functions
+	spdr_rock_functions.use_v8_connection(enable, send=send)
+
+
+def _fmt_row_ts(leg):
+	"""SR row write time (CT) carried on the leg -- from the chain pull's SELECT * at wave-1,
+	re-stamped by batched_refresh_legs_deduped at wave-2. 'n/a' if the leg has no timestamp."""
+	ts = getattr(leg, 'timestamp', None)
+	if ts is None:
+		return 'n/a'
+	us = getattr(leg, 'timestamp_us', None)
+	try:
+		return f"{ts}.{int(us):06d}CT" if us is not None and not pd.isna(us) else f"{ts}CT"
+	except (TypeError, ValueError):
+		return f"{ts}CT"
+
+
+def _fmt_leg_quotes(short_legs, long_legs):
+	"""One line of sprc + SR NBBO + row write time per leg (from the in-memory leg Series -- no
+	query). Printed at wave-fire time so sprc-vs-NBBO dislocations and SR row staleness are
+	diagnosable from the log."""
+	return " | ".join(
+		f"{leg.okey_xx:g}{str(leg.okey_cp)[0]} sprc={float(leg.sprc):.3f} nbbo={float(leg.obid):.2f}/{float(leg.oask):.2f}"
+		f" row_ts={_fmt_row_ts(leg)}"
+		for leg in list(short_legs) + list(long_legs)
+	)
+
+
+# NOTE (2026-09-04): replaced at runtime in the v8 scripts by helpers_v8.refresh_legs_v8 (signature-checked) -- port edits there too.
+def refresh_legs(short_legs, long_legs):
+	"""Re-query SR surface for fresh sprc/bid/ask on each leg. Updates in-place.
+	Also prints surface health (calcErr; plus uPrcAdjResult on v8) so a bad/untradable
+	surface at wave-2 send time is diagnosable from the log (mhold incident 8/28/2026)."""
+	_fmt = '%I:%M:%S.%f %p'
+	_pt = lambda: (s := getNowEst().strftime(_fmt))[:-6] + s[-3:]
+	print(f"{_pt()} -- Starting refresh_legs()")
+	# uPrcAdjResult only exists on the v8 quote table (msgliveimpliedquoteadj); v7 has calcErr only.
+	_surf_cols = ", calcErr, uPrcAdjResult" if _srf.USING_V8 else ", calcErr"
+	for leg in list(short_legs) + list(long_legs):
+		sql = f"""SELECT sprc, obid, oask{_surf_cols} FROM {IMPLIED_QUOTE_TABLE}
+		WHERE okey_tk='{leg.okey_tk}' AND okey_xx={leg.okey_xx} AND okey_cp='{leg.okey_cp}'
+		AND okey_yr={leg.okey_yr} AND okey_mn={leg.okey_mn} AND okey_dy={leg.okey_dy}"""
+		row = run_query(sql)
+		if not row.empty:
+			old_sprc = leg.sprc
+			object.__setattr__(leg, 'sprc', float(row.sprc.iloc[0]))
+			object.__setattr__(leg, 'obid', float(row.obid.iloc[0]))
+			object.__setattr__(leg, 'oask', float(row.oask.iloc[0]))
+			surf_health = f" calcErr={row.calcErr.iloc[0]}"
+			if _srf.USING_V8:
+				surf_health += f" uPrcAdj={row.uPrcAdjResult.iloc[0]}"
+			print(f"Refreshed {leg.okey_tk} {leg.okey_xx} {leg.okey_cp}: sprc {old_sprc:.3f} -> {leg.sprc:.3f} nbbo={leg.obid:.2f}/{leg.oask:.2f}{surf_health}")
+	print(f"{_pt()} -- Finished refresh_legs()")
+
+
+def _send_single_complex_order(symbol, size, short_legs, long_legs, exp, account,
+							   edge_target, limit_price, is_sale, userData, orderDuration,
+							   srtrade_pool=None, t_await=None,
+							   limit_class="Surface", parent_handling="Seeker"):
+	"""Send one complex spread order via SQL INSERT. Returns grouping_code.
+	srtrade_pool/t_await are forwarded to run_query for pooling + split-phase timing prints.
+	limit_class/parent_handling default to the Seeker+Surface behavior every existing caller
+	gets; 'Simple'+'Activetaker' makes orderPrcLimit the actual working price (ss-script
+	style, used by the hacker's NBBO-priced waves 3/4)."""
+	grouping_code = _gen_id()   # v8 hex string when SEND_V8, else v7 int; carried through to fill lookups
+	risk_group_id = _gen_id()
+
+	fields_and_values = {
+		"accnt": account,
+		"spdrActionType": "AddReplace",
+		"groupingCode": grouping_code,
+		"riskGroupId": risk_group_id,
+		"secKey_at": "EQT",
+		"secKey_ts": "NMS" if (_srf.SEND_V8 or symbol == "NDXP") else "CBOE",
+		"secKey_tk": "SPX" if symbol == "SPXW" else "NDX" if symbol == "NDXP" else symbol,
+		"orderSize": size,
+		"secType": "MLeg",
+		"mlegNumLegs": len(short_legs) + len(long_legs),
+		"parentOrderHandling": parent_handling,
+		"parentBalanceHandling": "PostLimit",
+		"orderLimittype": "Prc",
+		"takeLimitClass": limit_class,
+		"makeLimitClass": limit_class,
+		"takesurfPrcoffset": edge_target, # across the whole structure # a positive number is always more aggressive (regardless of buy/sell)
+		"makesurfPrcoffset": edge_target,
+		# v8 dropped 'Immediate' from the progressRule enum. SR recommends 'None' as the v8 default
+		# (AllowImmediate also accepted). v7 keeps 'Immediate'.
+		"progressRule": ("None" if _srf.SEND_V8 else "Immediate"),
+		# v8 renamed timeInForce -> marketSession (Day -> V8_MARKET_SESSION, default RegMkt).
+		# v7 keeps timeInForce/Day. Post-close senders (4pm_script_v3) override the module
+		# global to 'PostMkt' -- v8 expires RegMkt orders arriving after 16:00 ("Expired On
+		# Arrival", seen 8/24).
+		("marketSession" if _srf.SEND_V8 else "timeInForce"): (V8_MARKET_SESSION if _srf.SEND_V8 else "Day"),
+		"traderName": "agm.zdietz",
+		"orderSide": "Buy",
+		"visibleInSV": "Yes",
+		"orderPrcLimit": -limit_price,
+		"optPremium": -limit_price,
+		"userData1": userData,
+		"orderDuration": orderDuration,
+
+		"CHECKSUM": 13
+	}
+	for i, leg in enumerate(short_legs):
+		fields_and_values[f"mlegSecKey{i+1}_at"] = "EQT"
+		fields_and_values[f"mlegSecKey{i+1}_ts"] = "NMS"
+		fields_and_values[f"mlegSecKey{i+1}_tk"] = symbol
+		fields_and_values[f"mlegSecKey{i+1}_yr"] = exp.year
+		fields_and_values[f"mlegSecKey{i+1}_mn"] = exp.month
+		fields_and_values[f"mlegSecKey{i+1}_dy"] = exp.day
+		fields_and_values[f"mlegSecKey{i+1}_xx"] = leg.okey_xx
+		fields_and_values[f"mlegSecKey{i+1}_cp"] = leg.okey_cp
+		fields_and_values[f"mlegMult{i+1}"] = 1
+		fields_and_values[f"mlegSide{i+1}"] = "Sell"
+		fields_and_values[f"mlegPosType{i+1}"] = "Auto"
+		fields_and_values[f"mlegSecType{i+1}"] = "Option"
+		fields_and_values[f"mlegLegId{i+1}"] = counter()
+
+	for j, leg in enumerate(long_legs):
+		k = i + j + 1
+		fields_and_values[f"mlegSecKey{k+1}_at"] = "EQT"
+		fields_and_values[f"mlegSecKey{k+1}_ts"] = "NMS"
+		fields_and_values[f"mlegSecKey{k+1}_tk"] = symbol
+		fields_and_values[f"mlegSecKey{k+1}_yr"] = exp.year
+		fields_and_values[f"mlegSecKey{k+1}_mn"] = exp.month
+		fields_and_values[f"mlegSecKey{k+1}_dy"] = exp.day
+		fields_and_values[f"mlegSecKey{k+1}_xx"] = leg.okey_xx
+		fields_and_values[f"mlegSecKey{k+1}_cp"] = leg.okey_cp
+		fields_and_values[f"mlegMult{k+1}"] = 1
+		fields_and_values[f"mlegSide{k+1}"] = "Buy"
+		fields_and_values[f"mlegPosType{k+1}"] = "Auto"
+		fields_and_values[f"mlegSecType{k+1}"] = "Option"
+		fields_and_values[f"mlegLegId{k+1}"] = counter()
+
+	columns = ", ".join(fields_and_values.keys())
+	values = ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in fields_and_values.values())
+
+	sql = f"REPLACE INTO srtrade.msgparentordergatewayext ({columns}) VALUES ({values});"
+	print(sql)
+	# verbose ONLY when a pool was passed (i.e. 350PM). Keeps 340PM/355PM code path unchanged.
+	run_query(sql, "srtrade", fetch=False,
+	          pool=srtrade_pool, verbose=(srtrade_pool is not None), t_await=t_await,
+	          tag=f"{userData} gc={grouping_code}")
+	return grouping_code
+
+
+# NOTE (2026-09-04): replaced at runtime in the v8 scripts by helpers_v8.compute_spread_limit_v8 (signature-checked) -- port edits there too.
+def compute_spread_limit(short_legs, long_legs, max_edge, min_price=None, verbose=False):
+	"""Net spread limit price sent to SR: sum(short sprc) - sum(long sprc) - max_edge, with the
+	same min_price clamp + 2dp rounding as trade_complex. Single source of truth so callers
+	(orchestrator, send_complex_two_waves) can record the exact wave limit without re-deriving it.
+	verbose=True prints the clamp message (used only by trade_complex to preserve its logging)."""
+	limit_price = 0
+	for short_leg in short_legs:
+		limit_price += short_leg.sprc
+	for long_leg in long_legs:
+		limit_price -= long_leg.sprc
+	limit_price -= max_edge
+	limit_price = round(limit_price, 2)
+	if min_price and a_lt_b(a=limit_price, b=min_price):
+		if verbose:
+			print(f"Limit price {limit_price} below min_price {min_price}, clamping to {min_price}")
+		limit_price = round_price(min_price)
+	return limit_price
+
+
+def compute_spread_srprc(short_legs, long_legs):
+	"""Surface fair of the spread: sum(short sprc) - sum(long sprc). Signed/raw (no clamp/round);
+	debit (Buy) spreads come out negative. This is the surface mid the wave limit is derived from
+	(limit = srprc - max_edge). Logged as srprc1/srprc2 for cross-vs-surface divergence analysis."""
+	return sum(leg.sprc for leg in short_legs) - sum(leg.sprc for leg in long_legs)
+
+
+def compute_spread_cross(short_legs, long_legs):
+	"""Executable cross of the spread: sum(short obid) - sum(long oask) -- the credit obtainable by
+	selling the shorts at their bid and buying the longs at their ask. Signed/raw. Logged as
+	cross_price1/cross_price2; divergence vs the surface fair = srprc - cross."""
+	return sum(leg.obid for leg in short_legs) - sum(leg.oask for leg in long_legs)
+
+
+# NOTE (2026-09-04): the v8 scripts REPLACE this function at runtime with helpers_v8.trade_complex_v8 (signature-checked
+# monkeypatch, process-local). Any edit here (signature, chunking, limit math) must be ported to helpers_v8.py or the v8 scripts fail at startup.
+def trade_complex(symbol, size, short_legs, long_legs, exp, account, edge_target=.1, max_edge=.2, is_sale=True, userData='', orderDuration=ORDER_DURATION, min_price=None,
+                   srtrade_pool=None, t_await=None,
+                   limit_class="Surface", parent_handling="Seeker", explicit_limit=None):
+	"""Send a complex spread order, splitting into sub-$14k premium chunks if needed. Returns list of grouping_codes.
+	srtrade_pool/t_await forwarded to _send_single_complex_order (default None -> current behavior).
+	explicit_limit: when set, used verbatim as the limit (caller owns rounding + min_price
+	clamping) instead of the sprc-based compute_spread_limit; pairs with limit_class='Simple' +
+	parent_handling='Activetaker' for NBBO-priced orders (hacker waves 3/4)."""
+	if explicit_limit is not None:
+		limit_price = round(float(explicit_limit), 2)
+		print(f"Limit price (explicit): {limit_price}")
+	else:
+		limit_price = compute_spread_limit(short_legs, long_legs, max_edge, min_price, verbose=True)
+		print(f"Limit price: {limit_price}")
+
+	estimated_premium = size * abs(limit_price) * MULTIPLIER
+
+	if estimated_premium > PREMIUM_LIMIT and abs(limit_price) > 0:
+		max_chunk = max(1, int(PREMIUM_LIMIT / (abs(limit_price) * MULTIPLIER)))
+		chunks = []
+		remaining = size
+		while remaining > 0:
+			chunks.append(min(remaining, max_chunk))
+			remaining -= chunks[-1]
+
+		# SpiderRock blocks repeat orders sent more than 4 times in a row with identical
+		# quantity/account/price details, and its detection is not fully trusted -- so chunks
+		# 5-8 are ALWAYS sent with unique sizes: chunk 5 = -1, chunk 6 = -2, chunk 7 = -3,
+		# chunk 8 = -4 (floored at 1 lot). Shed lots are picked up by the wave-2 remainder resend.
+		for i in range(4, min(len(chunks), 8)):
+			chunks[i] = max(1, chunks[i] - (i - 3))
+
+		# Anything past 8 chunks is DROPPED (not sent) -- warn loudly so it's obvious in the
+		# log that we underfilled the intended size.
+		if len(chunks) > 8:
+			dropped_size = sum(chunks[8:])
+			chunks = chunks[:8]
+			sent_size = sum(chunks)
+			warn_msg = (f"!!!!!!!!!!!!!!!! FULL SIZE NOT SENT for {userData}: capped at 8 orders -- "
+			            f"{sent_size}/{size} sent, {dropped_size} DROPPED (per-order premium "
+			            f"${PREMIUM_LIMIT:,} x 8 max). VERIFY POSITION. !!!!!!!!!!!!!!!!")
+			print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+			print(warn_msg)
+			print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+			record_send_warning(warn_msg)   # surface in the Google-chat recap too
+
+		if len(chunks) > 4:
+			print(f"Post-decrement chunk sizes: {chunks} -- wave-1 total {sum(chunks)}/{size} "
+			      f"(shed lots picked up by the wave-2 remainder resend)")
+
+		delay = 0.03 if len(chunks) > 3 else 0.01
+		print(f"Splitting order: size={size} into {len(chunks)} chunks of up to {max_chunk} "
+			  f"(premium/chunk ~${max_chunk * abs(limit_price) * MULTIPLIER:,.0f}, delay={delay}s)")
+
+		grouping_codes = []
+		for i, chunk_size in enumerate(chunks):
+			gc = _send_single_complex_order(symbol, chunk_size, short_legs, long_legs, exp, account,
+											edge_target, limit_price, is_sale, userData, orderDuration,
+											srtrade_pool=srtrade_pool, t_await=t_await,
+											limit_class=limit_class, parent_handling=parent_handling)
+			grouping_codes.append(gc)
+			if i < len(chunks) - 1:
+				time.sleep(delay)
+		return grouping_codes
+	else:
+		gc = _send_single_complex_order(symbol, size, short_legs, long_legs, exp, account,
+										edge_target, limit_price, is_sale, userData, orderDuration,
+										srtrade_pool=srtrade_pool, t_await=t_await,
+											limit_class=limit_class, parent_handling=parent_handling)
+		return [gc]
+
+def GetParentNumber(grouping_code):
+	print(f"\nGetting parent number for grouping code: {grouping_code}")
+	sql = f"""SELECT  spdrOrderStatus, spdrCloseReason, parentNumber, fillQuan1 FROM srtrade.msgsrmlegbrkrstate WHERE groupingcode='{grouping_code}'"""
+	results = run_query(sql, "srtrade")
+	print("RESULTS: _____________________________________________________")
+	print(results)
+	# "Done" = order terminal, no more fills coming -> don't cancel. v8 gates on spdrOrderStatus
+	# (terminal = Closed/Rejected/SendReject); a filled v8 order shows spdrOrderStatus='Closed' with
+	# spdrCloseReason='Filled', so the old v7 spdrCloseReason=='Closed' check never matched on v8.
+	if _srf.SEND_V8:
+		done = str(results.spdrOrderStatus.values[0]) in {"Closed", "Rejected", "SendReject"}
+	else:
+		done = results.spdrCloseReason.values[0] == "Closed"
+	if done:
+		print("Order done (terminal) -- no cancel needed.")
+		return False
+	return results.parentNumber.values[0]
+
+def cancel_order(parent_number, grouping_code, account):
+	# v8 renamed userName -> modifiedBy and dropped timestamp_us (timestamp is now yyyy-mm-dd
+	# hh:mm:ss.sssss; NOW() is fine per SR). v7 keeps the original columns.
+	if _srf.SEND_V8:
+		# clientFirm='AGM' required on v8 -- the "AccountMatches" rule keys on accnt+clientFirm (v7 had
+		# no clientFirm and matched on userName). SR-confirmed. All our accounts book under firm AGM.
+		sql = f"""INSERT INTO srtrade.msgsrparentcancel (accnt,parentNumber,cxlReason,modifiedBy,clientFirm,timestamp)
+					VALUES  ('{account}',  '{parent_number}', 'cxlReason', 'agm.zdietz', 'AGM', NOW() )"""
+	else:
+		sql = f"""INSERT INTO srtrade.msgsrparentcancel (accnt,parentNumber,cxlReason,userName,timestamp,timestamp_us)
+					VALUES  ('{account}',  '{parent_number}', 'cxlReason', 'agm.zdietz', NOW(), '0' )"""
+	run_query(sql, "srtrade", fetch=False)
+
+	# v8 package fill = cumSquareQty (fillQuan1 is a per-leg qty); v7 keeps fillquan1.
+	_qty_col = "cumSquareQty" if _srf.SEND_V8 else "fillquan1"
+	sql = f"""SELECT {_qty_col} FROM srtrade.msgsrmlegbrkrstate WHERE groupingcode='{grouping_code}'"""
+	results = run_query(sql, "srtrade")
+	return results.iloc[0, 0]
+
+def _get_fill_quantity(grouping_code):
+	"""Query fill quantity for a fully-filled order (when GetParentNumber returns False)."""
+	# v8 package fill = cumSquareQty (fillQuan1 is a per-leg qty); v7 keeps fillquan1.
+	_qty_col = "cumSquareQty" if _srf.SEND_V8 else "fillquan1"
+	sql = f"""SELECT {_qty_col} FROM srtrade.msgsrmlegbrkrstate WHERE groupingcode='{grouping_code}'"""
+	results = run_query(sql, "srtrade")
+	return results.iloc[0, 0]
+
+async def send_complex_two_waves(symbol, size, short_legs, long_legs, exp, account, edge_target1=.1, max_edge1=.2, edge_target2=.3, max_edge2=.3, is_sale=True, userData='', orderDuration=ORDER_DURATION, min_price=None, capture=None):
+	"""Send a 2-wave complex spread order. Returns list of all grouping_codes generated
+	across both waves (consumed by algo_trade_logger.py to look up fills in SR brkrstate tables).
+	capture: optional dict; if provided, filled with wave1_limit/wave2_limit (the sprc-based
+	limits actually sent) and wave1_codes/wave2_codes so the caller can log per-wave detail.
+	Backward-compatible -- callers that don't pass capture are unaffected (return type unchanged)."""
+	# Every blocking DB call (trade_complex INSERT, GetParentNumber SELECT, cancel_order INSERT+SELECT,
+	# _get_fill_quantity SELECT, refresh_legs SELECT loop) is dispatched via asyncio.to_thread so
+	# concurrent invocations of this coroutine (from asyncio.gather in the caller) actually run in
+	# parallel instead of serialising on the event loop. Requires create_counter to be thread-safe
+	# (fixed via itertools.count in helpers.py -- grouping_code / risk_group_id / legId won't collide).
+	print(f"{pretty_time()} -- send_complex_two_waves called for strategy {userData} with:\nsymbol:\n{symbol}\nsize: {size}\nshort_legs: {short_legs}\nlong_legs: {long_legs}\nexp: {exp}\naccount: {account}\nedge_target1: {edge_target1}\nmax_edge1: {max_edge1}\nedge_target2: {edge_target2}\nmax_edge2: {max_edge2}\nis_sale: {is_sale}\nuserData: {userData}\nmin_price: {min_price}")
+	# w1_*/w2_* below feed the optional `capture` dict (per-wave logging) ONLY -- trade_complex
+	# computes its own order limit. Compute them just when a caller opts into logging (passes
+	# `capture`); otherwise skip entirely, so callers that don't log (4pm v2/v3, 340, month-end,
+	# btic, __main__) never run these helpers on legs that may lack obid/oask/sprc.
+	w1_limit = w1_srprc = w1_cross = None
+	w2_limit = w2_srprc = w2_cross = None
+	if capture is not None:
+		w1_limit = compute_spread_limit(short_legs, long_legs, max_edge1, min_price)
+		w1_srprc = compute_spread_srprc(short_legs, long_legs)
+		w1_cross = compute_spread_cross(short_legs, long_legs)
+	grouping_codes = await asyncio.to_thread(
+		trade_complex,
+		symbol=symbol, size=size, short_legs=short_legs, long_legs=long_legs, exp=exp, account=account,
+		edge_target=edge_target1, max_edge=max_edge1, is_sale=is_sale, userData=userData,
+		orderDuration=orderDuration, min_price=min_price,
+	)
+	all_codes = list(grouping_codes)
+	wave1_codes = list(grouping_codes)
+	wave2_codes = []
+	print(f"Waiting {WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE} seconds for {len(grouping_codes)} order(s): {grouping_codes}")
+	await asyncio.sleep(WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE)
+
+	total_filled = 0
+	for gc in grouping_codes:
+		parent_number = await asyncio.to_thread(GetParentNumber, gc)
+		if not parent_number:
+			total_filled += await asyncio.to_thread(_get_fill_quantity, gc)
+		else:
+			total_filled += await asyncio.to_thread(cancel_order, parent_number=parent_number, grouping_code=gc, account=account)
+
+	if total_filled >= size:
+		print(f"Fully filled ({total_filled}/{size}) for order(s): {grouping_codes}")
+		if capture is not None:
+			capture.update({"wave1_limit": w1_limit, "wave2_limit": None,
+			                "wave1_codes": wave1_codes, "wave2_codes": [],
+			                "cross_price1": w1_cross, "srprc1": w1_srprc,
+			                "cross_price2": None, "srprc2": None})
+		return all_codes
+
+	remainder = size - total_filled
+	if remainder > 0:
+		print(f"Resending order for {remainder} remaining (filled {total_filled}/{size}) for order(s): {grouping_codes}")
+		await asyncio.to_thread(refresh_legs, short_legs, long_legs)
+		if capture is not None:
+			w2_limit = compute_spread_limit(short_legs, long_legs, max_edge2, min_price)
+			w2_srprc = compute_spread_srprc(short_legs, long_legs)
+			w2_cross = compute_spread_cross(short_legs, long_legs)
+		wave2_codes = await asyncio.to_thread(
+			trade_complex,
+			symbol=symbol, size=remainder, short_legs=short_legs, long_legs=long_legs, exp=exp, account=account,
+			edge_target=edge_target2, max_edge=max_edge2, is_sale=is_sale, userData=userData,
+			orderDuration=orderDuration, min_price=min_price,
+		)
+		all_codes.extend(wave2_codes)
+	if capture is not None:
+		capture.update({"wave1_limit": w1_limit, "wave2_limit": w2_limit,
+		                "wave1_codes": wave1_codes, "wave2_codes": list(wave2_codes),
+		                "cross_price1": w1_cross, "srprc1": w1_srprc,
+		                "cross_price2": w2_cross, "srprc2": w2_srprc})
+	return all_codes
+
+async def send_outright_limit_order(symbol, option, size, DIRECTION="Sell", ACCOUNT="T.AGM", offset=.2, userData='', orderDuration=10, min_price=None,
+                                    srtrade_pool=None):
+	print(f"send_outright_limit_order called for strategy {userData} with:\nsymbol: {symbol}\noption: {option}\nsize: {size}\nDIRECTION: {DIRECTION}\nACCOUNT: {ACCOUNT}\noffset: {offset}\nuserData: {userData}\nmin_price: {min_price}")
+	if DIRECTION == "Sell":
+		limit_price = max(round(option.obid * .9, 1), option.obid - offset)
+		if min_price and a_lt_b(a=limit_price, b=min_price):
+			print(f"Limit price {limit_price} below min_price {min_price}, clamping to {min_price}")
+			limit_price = round_price(min_price)
+	elif DIRECTION == "Buy":
+		limit_price = min(round(option.oask * 1.1, 1), option.oask + offset)
+	else:
+		raise AssertionError("Invalid argument for DIRECTION.")
+
+	# v8 send path: column Timeinforce -> marketSession (Day -> V8_MARKET_SESSION), and groupingcode/riskgroupid
+	# in hex XXXX-XXXX-XXXX-XXXX (quoted). v7 keeps the original int ids + Timeinforce/Day.
+	_session_col = "marketSession" if _srf.SEND_V8 else "Timeinforce"
+	_session_val = V8_MARKET_SESSION if _srf.SEND_V8 else "Day"
+	_gc = _gen_id()
+	_gc_sql   = f"'{_gc}'" if isinstance(_gc, str) else str(_gc)
+	_risk_sql = f"'{to_v8_id(1)}'" if _srf.SEND_V8 else "1"
+	order_sql = f"""REPLACE INTO srtrade.msgoptordergateway
+	(okey_at, okey_ts, okey_tk, okey_yr, okey_mn, okey_dy, okey_xx, okey_cp, ordersize, orderPrcLimit, accnt, spdractiontype, groupingcode, orderside, {_session_col}, orderduration, orderlimittype, Parentorderhandling, parentbalancehandling,
+	 takelimitclass, makelimitclass, autohedge, riskgroupid,spdrstagetype, tradername, CHECKSUM, UserData1)
+	VALUES
+	('EQT', 'NMS', '{symbol}', {option.okey_yr}, {option.okey_mn}, {option.okey_dy}, {option.okey_xx}, '{option.okey_cp}', {size}, {limit_price}, '{ACCOUNT}', 'addreplace', {_gc_sql}, '{DIRECTION}', '{_session_val}', {orderDuration}, 'Prc', 'Activetaker', 'postlimit', 'Simple', 'Simple', 'None', {_risk_sql},'None', 'agm.zdietz', 13, '{userData}')"""
+
+	if size > 0:
+		# asyncio.to_thread so concurrent send_outright_limit_order coroutines actually run in
+		# parallel instead of serialising on this blocking MySQLdb INSERT.
+		# verbose ONLY when a pool was passed (i.e. 350PM). Keeps 340PM/355PM code path unchanged.
+		_verbose = srtrade_pool is not None
+		t_await = time.perf_counter() if _verbose else None
+		await asyncio.to_thread(
+			run_query, order_sql, "srtrade", fetch=False,
+			pool=srtrade_pool, verbose=_verbose, t_await=t_await, tag=f"{userData} outright",
+		)
+
+
+# ==================== Batched orchestrator (for scripts opting in to script-level batching) ====================
+# 340pm_script and 355pm_script continue to use send_complex_two_waves (self-contained per-order flow).
+# 350pm_script uses orchestrate_batched_send below, which achieves the same result with batched SR queries:
+#   - 3 SR roundtrips for all fill checks + cancels (vs ~3 per order today)
+#   - Deduped refresh_legs (1 SELECT per unique strike, fan-out results to every leg copy sharing that strike)
+# Result: wave-2 fires several seconds earlier on days with 5+ concurrent orders.
+
+
+async def send_wave1_only(symbol, size, short_legs, long_legs, exp, account,
+                           edge_target1=.1, max_edge1=.2, is_sale=True, userData='',
+                           orderDuration=ORDER_DURATION, min_price=None,
+                           srtrade_pool=None):
+	"""Fire wave-1 INSERT only via trade_complex. Returns list of grouping_codes (possibly multiple
+	if the order was chunked to fit under PREMIUM_LIMIT). Does NOT sleep, check fills, or send wave-2 --
+	the orchestrator handles those phases. Safeguard: returns [] if size <= 0.
+	srtrade_pool: optional ConnPool forwarded down to the INSERT via run_query."""
+	if size <= 0:
+		print(f"{pretty_time()} -- send_wave1_only skipped for {userData}: size={size}")
+		return []
+	print(f"{pretty_time()} -- send_wave1_only called for strategy {userData} size={size} edge_target1={edge_target1} max_edge1={max_edge1}")
+	t_await = time.perf_counter()
+	grouping_codes = await asyncio.to_thread(
+		trade_complex,
+		symbol=symbol, size=size, short_legs=short_legs, long_legs=long_legs, exp=exp, account=account,
+		edge_target=edge_target1, max_edge=max_edge1, is_sale=is_sale, userData=userData,
+		orderDuration=orderDuration, min_price=min_price,
+		srtrade_pool=srtrade_pool, t_await=t_await,
+	)
+	# After the INSERT (zero send latency): sprc + SR NBBO the wave-1 limit was computed from.
+	print(f"{pretty_time()} --   [quotes W1 {userData}] {_fmt_leg_quotes(short_legs, long_legs)}")
+	return grouping_codes
+
+
+# --- Cancel-confirmation polling (oversell fix) ---
+_CANCEL_POLL_INTERVAL_S  = 0.05   # 50ms: batched status SELECT empirically takes ~6ms, so low DB load + quick wave-2
+# 2026-07-24: back to 1.00 after prod validation. Observed cancel->terminal across 7/23-7/24
+# prod runs was <=~153ms (worst case, 3 polls) -- 1.0s is ~6.5x that, ample margin.
+# 2026-08-27: 1.00 -> 1.50. A partially-filled 2-leg parent (gc=636, 27/72, UserCxl) took ~780ms
+# to reach Closed plus >=240ms SR->SQL row publish lag -- total ~1.03s, missing the 1.0s budget
+# by ~30ms and firing the hedge-wave-2 warning (first miss in 44 runs). 1.5s covers that case.
+_CANCEL_POLL_TIMEOUT_S   = 1.50   # give up waiting for terminal after this -> caller hedges wave-2 + warns
+# msgsrmlegbrkrstate.spdrOrderStatus terminal states (V7 SpdrOrderStatus enum). Closed = done;
+# Rejected/SendReject = order never worked (0 fills). PendNew/New/PendClose can STILL fill (per SR
+# support) -> NOT terminal. See memory: spiderrock-enum-and-cancel-terminal.
+# Note that 350PM FAST / 340PM algo use legacy send functions which do not have this protection.
+# The 355 hackers' wave-3 settle (hacker_trades._fire_one) DOES use batched_fill_check_and_cancel
+# since 2026-09-02 -- but only for wave-2 codes: already-cancelled v7 wave-1 codes keep parentNumber
+# after UserCxl, so the v7 `not pn` liveness gate below would re-cancel them (SR 1105 duplicate row).
+_TERMINAL_ORDER_STATUSES = frozenset({"Closed", "Rejected", "SendReject"})
+
+
+def _is_terminal_status(status):
+	return str(status) in _TERMINAL_ORDER_STATUSES
+
+
+async def batched_fill_check_and_cancel(all_grouping_codes, account_by_gc, srtrade_pool=None):
+	"""Batched fill-check + cancel for ALL wave-1 grouping_codes across all orders.
+
+	Steps:
+	  1. Batch SELECT status + fill quantity for every gc.
+	  2. Multi-row INSERT to cancel the still-active ones (those with a live parentNumber).
+	  3. POLL each cancelled parent until spdrOrderStatus is terminal (Closed/Rejected/SendReject),
+	     THEN trust its fillQuan1. (Firing the cancel and reading fillQuan1 immediately -- the old
+	     behavior -- could capture a pre-cancel snapshot while the order was still filling, so a
+	     fast-crossing order kept filling and wave-2 double-filled. That was the 7/16/26 oversell.)
+
+	Returns (filled, unconfirmed):
+	  filled      -- {gc: filled_qty} for every gc in all_grouping_codes.
+	  unconfirmed -- set of gc's still non-terminal at _CANCEL_POLL_TIMEOUT_S (may still be filling)
+	srtrade_pool: optional ConnPool for all srtrade calls (default None -> fresh conns)."""
+	if not all_grouping_codes:
+		return {}, set()
+
+	# --- v8 compatibility shims (all no-ops on v7) ---------------------------------------------
+	# v8 grouping codes are hex strings: to_v8_id emits lowercase but SR returns them UPPERCASE,
+	# and int() on them raises. Map every DB-returned code back to the CALLER's original gc object
+	# so `filled` / `unconfirmed` keys always match what orchestrate_batched_send passed in.
+	# v7 keeps the original int(raw) exactly.
+	_orig_by_norm = {str(gc).strip().upper(): gc for gc in all_grouping_codes}
+	def _row_gc(raw):
+		if _srf.SEND_V8:
+			return _orig_by_norm.get(str(raw).strip().upper())
+		return int(raw)
+	# v8 package fill = cumSquareQty (fillQuan1 is per-leg); v7 keeps fillQuan1.
+	_qty_col = "cumSquareQty" if _srf.SEND_V8 else "fillQuan1"
+
+	codes_csv = ",".join(f"'{gc}'" for gc in all_grouping_codes)
+
+	# Step 1: batch SELECT
+	sql = f"""SELECT groupingcode, spdrOrderStatus, spdrCloseReason, parentNumber, {_qty_col}
+	          FROM srtrade.msgsrmlegbrkrstate WHERE groupingcode IN ({codes_csv})"""
+	print(f"{pretty_time()} --   batched_fill_check_and_cancel: one SELECT for {len(all_grouping_codes)} grouping_codes")
+	t_await = time.perf_counter()
+	df = await asyncio.to_thread(
+		run_query, sql, "srtrade",
+		pool=srtrade_pool, verbose=True, t_await=t_await, tag="fill_check_step1",
+	)
+
+	if df is None or df.empty:
+		print(f"{pretty_time()} --   batched_fill_check_and_cancel: SELECT returned no rows; treating all as 0-filled")
+		return {gc: 0 for gc in all_grouping_codes}, set()
+
+	# Parse: active (need cancel) vs completed (already done)
+	# v7: done <=> parentNumber cleared. v8 KEEPS parentNumber populated on Closed/Filled orders
+	# (validated on the 350PM_FAST migration), so gate "done" on spdrOrderStatus terminal there --
+	# otherwise every filled order would look active and get a spurious cancel.
+	active = []   # list of (gc, parent_number)
+	filled = {}   # gc -> filled_qty (for the ones already done)
+	for _, row in df.iterrows():
+		gc = _row_gc(row.groupingcode)
+		if gc is None:   # v8: DB returned a code we never sent (shouldn't happen; WHERE IN filters)
+			continue
+		pn = row.parentNumber
+		done = _is_terminal_status(row.spdrOrderStatus) if _srf.SEND_V8 else (not pn)
+		if not done and pn:   # still working -> need to cancel (v8 pn is a hex string; no int())
+			active.append((gc, str(pn) if _srf.SEND_V8 else int(pn)))
+		else:
+			filled[gc] = int(getattr(row, _qty_col) or 0)
+
+	# Defensive: any gc not returned by the SELECT -> mark 0-filled
+	seen_gcs = set(filled.keys()) | {a_gc for a_gc, _ in active}
+	for gc in all_grouping_codes:
+		if gc not in seen_gcs:
+			filled[gc] = 0
+
+	print(f"{pretty_time()} --   batched_fill_check_and_cancel: {len(filled)} completed after wave-1, {len(active)} still working (will cancel)")
+
+	unconfirmed = set()
+	if active:
+		# Step 2: multi-row INSERT to batch-cancel.
+		# Dedupe by (account, parentNumber): a chunked complex order produces multiple
+		# grouping_codes but all chunks share the same parentNumber at SR. Without dedupe,
+		# the multi-row INSERT hits msgsrparentcancel's PK (accnt, parentNumber) and fails
+		# the entire batch, aborting wave-2. One cancel per parent kills all its chunks.
+		seen_cancels = set()
+		cancel_values = []
+		for gc, pn in active:
+			acc = account_by_gc.get(gc, "unknown")
+			key = (acc, pn)
+			if key in seen_cancels:
+				continue
+			seen_cancels.add(key)
+			# v8: userName->modifiedBy, timestamp_us dropped, clientFirm='AGM' REQUIRED (AccountMatches
+			# rule -> 1105 without it). Same rewrite as cancel_order. v7 keeps the original columns.
+			if _srf.SEND_V8:
+				cancel_values.append(f"('{acc}', '{pn}', 'cxlReason', 'agm.zdietz', 'AGM', NOW())")
+			else:
+				cancel_values.append(f"('{acc}', '{pn}', 'cxlReason', 'agm.zdietz', NOW(), '0')")
+		if _srf.SEND_V8:
+			cancel_sql = f"""INSERT INTO srtrade.msgsrparentcancel
+			                 (accnt, parentNumber, cxlReason, modifiedBy, clientFirm, timestamp)
+			                 VALUES {','.join(cancel_values)}"""
+		else:
+			cancel_sql = f"""INSERT INTO srtrade.msgsrparentcancel
+			                 (accnt, parentNumber, cxlReason, userName, timestamp, timestamp_us)
+			                 VALUES {','.join(cancel_values)}"""
+		print(f"{pretty_time()} --   batched_fill_check_and_cancel: one multi-row INSERT to cancel {len(cancel_values)} parent(s) "
+		      f"(from {len(active)} active gc's; deduped {len(active) - len(cancel_values)})")
+		t_await = time.perf_counter()
+		await asyncio.to_thread(
+			run_query, cancel_sql, "srtrade", fetch=False,
+			pool=srtrade_pool, verbose=True, t_await=t_await, tag="fill_check_cancel",
+		)
+
+		# Step 3: POLL each cancelled parent until spdrOrderStatus is terminal, THEN trust the fill qty.
+		active_codes_csv = ",".join(f"'{gc}'" for gc, _ in active)
+		poll_sql = f"""SELECT groupingcode, spdrOrderStatus, {_qty_col}
+		               FROM srtrade.msgsrmlegbrkrstate WHERE groupingcode IN ({active_codes_csv})"""
+		pending = {gc for gc, _ in active}
+		print(f"{pretty_time()} --   batched_fill_check_and_cancel: polling {len(pending)} parent(s) until spdrOrderStatus terminal (<= {_CANCEL_POLL_TIMEOUT_S}s)")
+		start = time.monotonic()
+		poll_df = None
+		while pending:
+			t_await = time.perf_counter()
+			poll_df = await asyncio.to_thread(
+				run_query, poll_sql, "srtrade",
+				pool=srtrade_pool, verbose=True, t_await=t_await, tag="fill_check_poll",
+			)
+			if poll_df is not None and not poll_df.empty:
+				for _, row in poll_df.iterrows():
+					gc = _row_gc(row.groupingcode)
+					if gc in pending and _is_terminal_status(row.spdrOrderStatus):
+						filled[gc] = int(getattr(row, _qty_col) or 0)   # final: parent reached a terminal status
+						pending.discard(gc)
+			if not pending or (time.monotonic() - start) >= _CANCEL_POLL_TIMEOUT_S:
+				break
+			await asyncio.sleep(_CANCEL_POLL_INTERVAL_S)
+
+		# Any parent still non-terminal at timeout (New/PendNew/PendClose -- can still fill). Record its
+		# last-seen fill (best effort) and flag it so the caller doesn't fully trust fill.
+		unconfirmed = set(pending)
+		if pending and poll_df is not None and not poll_df.empty:
+			for _, row in poll_df.iterrows():
+				gc = _row_gc(row.groupingcode)
+				if gc in pending:
+					filled[gc] = int(getattr(row, _qty_col) or 0)
+		if unconfirmed:
+			print(f"{pretty_time()} --   batched_fill_check_and_cancel: WARNING {len(unconfirmed)} parent(s) NOT terminal "
+			      f"within {_CANCEL_POLL_TIMEOUT_S}s {sorted(unconfirmed)} -- caller will hedge wave-2")
+		# Defensive: any active gc that didn't come back -> 0-filled
+		for gc, _ in active:
+			if gc not in filled:
+				filled[gc] = 0
+
+	return filled, unconfirmed
+
+
+def _leg_key(leg):
+	"""Normalize a leg's strike identity into a hashable tuple with fixed types so keys built
+	from leg objects and from SQL result rows compare equal (avoids int/float mismatch etc.)."""
+	return (str(leg.okey_tk), float(leg.okey_xx), str(leg.okey_cp),
+	        int(leg.okey_yr), int(leg.okey_mn), int(leg.okey_dy))
+
+
+# NOTE (2026-09-04): replaced at runtime in the v8 scripts by helpers_v8.batched_refresh_legs_deduped_v8 (signature-checked) -- port edits there too.
+async def batched_refresh_legs_deduped(all_legs, sranalytics_pool=None):
+	"""Dedupe legs by strike identity, run ONE SQL SELECT for all unique strikes (multi-column
+	row-value IN), then fan out the fresh sprc/obid/oask to EVERY leg instance sharing that
+	strike via object.__setattr__ (same mutation pattern as refresh_legs()).
+
+	Two algos both holding a 7455 Put have TWO separate pandas Series objects; both get mutated
+	so their .sprc reads return the fresh value. Zero reader-side changes anywhere in the codebase.
+	No shared cache -- just one deduped SQL query + fan-out writes.
+	sranalytics_pool: optional ConnPool for the sranalytics SELECT (default None -> fresh conn).
+	"""
+	if not all_legs:
+		return
+
+	# Group leg objects by strike identity (multiple algos may share the same strike).
+	strike_groups = {}   # (okey_tk, okey_xx, okey_cp, okey_yr, okey_mn, okey_dy) -> [leg objects]
+	for leg in all_legs:
+		strike_groups.setdefault(_leg_key(leg), []).append(leg)
+
+	print(f"{pretty_time()} --   batched_refresh_legs_deduped: {len(all_legs)} leg objects -> {len(strike_groups)} unique strikes")
+
+	# Build ONE SQL query with multi-column row-value IN. Single SR roundtrip regardless
+	# of unique-strike count.
+	tuples_sql = ",".join(
+		f"('{tk}',{xx},'{cp}',{yr},{mn},{dy})"
+		for (tk, xx, cp, yr, mn, dy) in strike_groups.keys()
+	)
+	# Row write-time columns: v7 msgoptionimpliedquote = timestamp (sec, CT) + timestamp_us;
+	# v8 msgliveimpliedquoteadj = timestamp already carries microseconds (no timestamp_us column).
+	_ts_cols = "timestamp" if _srf.USING_V8 else "timestamp, timestamp_us"
+	sql = f"""SELECT okey_tk, okey_xx, okey_cp, okey_yr, okey_mn, okey_dy, sprc, obid, oask, {_ts_cols}
+	          FROM {IMPLIED_QUOTE_TABLE}
+	          WHERE (okey_tk, okey_xx, okey_cp, okey_yr, okey_mn, okey_dy) IN ({tuples_sql})"""
+	print(f"{pretty_time()} --   batched_refresh_legs_deduped: 1 SELECT for {len(strike_groups)} unique strikes")
+	t_await = time.perf_counter()
+	df = await asyncio.to_thread(
+		run_query, sql,
+		pool=sranalytics_pool, verbose=True, t_await=t_await, tag="batched_refresh",
+	)
+
+	if df is None or df.empty:
+		print(f"{pretty_time()} --     WARN: no fresh SR data returned; leaving {len(all_legs)} leg(s) with pre-refresh values")
+		return
+
+	# Fan-out: for each row returned, mutate every leg object holding that strike.
+	updated_keys = set()
+	for _, row in df.iterrows():
+		row_key = (str(row.okey_tk), float(row.okey_xx), str(row.okey_cp),
+		           int(row.okey_yr), int(row.okey_mn), int(row.okey_dy))
+		legs_to_update = strike_groups.get(row_key)
+		if not legs_to_update:
+			continue
+		sprc = float(row.sprc)
+		obid = float(row.obid)
+		oask = float(row.oask)
+		_us = getattr(row, 'timestamp_us', None)
+		old_sprc = legs_to_update[0].sprc
+		for leg in legs_to_update:
+			object.__setattr__(leg, 'sprc', sprc)
+			object.__setattr__(leg, 'obid', obid)
+			object.__setattr__(leg, 'oask', oask)
+			# Re-stamp write time so the [quotes W2] line shows the REFRESHED row's age.
+			object.__setattr__(leg, 'timestamp', row.timestamp)
+			object.__setattr__(leg, 'timestamp_us', _us)
+		updated_keys.add(row_key)
+		# Row write time (CT on the SR host): direct staleness evidence vs our read time.
+		_row_ts = f"{row.timestamp}.{int(_us):06d}" if _us is not None else str(row.timestamp)
+		print(f"{pretty_time()} --     Refreshed {row_key[0]} {row_key[1]} {row_key[2]} across {len(legs_to_update)} leg copies: "
+		      f"sprc {old_sprc:.3f} -> {sprc:.3f} nbbo={obid:.2f}/{oask:.2f} row_ts={_row_ts} CT")
+
+	# Warn on any strike we asked for but didn't get back
+	missing = set(strike_groups.keys()) - updated_keys
+	for key in missing:
+		print(f"{pretty_time()} --     WARN: no fresh SR data for {key[0]} {key[1]} {key[2]}; leaving {len(strike_groups[key])} leg(s) with pre-refresh values")
+
+
+async def send_wave2_for_remainder(symbol, size, short_legs, long_legs, exp, account,
+                                    edge_target2=.3, max_edge2=.3, is_sale=True, userData='',
+                                    orderDuration=ORDER_DURATION, min_price=None,
+                                    srtrade_pool=None):
+	"""Fire wave-2 INSERT for the given remainder size, using edge_target2/max_edge2.
+	Assumes refresh_legs was called externally (orchestrator's batched refresh).
+	Returns list of grouping_codes. Safeguard: returns [] if size <= 0.
+	srtrade_pool: optional ConnPool forwarded down to the INSERT via run_query."""
+	if size <= 0:
+		print(f"{pretty_time()} -- send_wave2_for_remainder skipped for {userData}: size={size}")
+		return []
+	print(f"{pretty_time()} -- send_wave2_for_remainder called for {userData} remainder={size} edge_target2={edge_target2} max_edge2={max_edge2}")
+	t_await = time.perf_counter()
+	grouping_codes = await asyncio.to_thread(
+		trade_complex,
+		symbol=symbol, size=size, short_legs=short_legs, long_legs=long_legs, exp=exp, account=account,
+		edge_target=edge_target2, max_edge=max_edge2, is_sale=is_sale, userData=userData,
+		orderDuration=orderDuration, min_price=min_price,
+		srtrade_pool=srtrade_pool, t_await=t_await,
+	)
+	# After the INSERT (zero send latency): refreshed sprc + SR NBBO the wave-2 limit was computed from.
+	print(f"{pretty_time()} --   [quotes W2 {userData}] {_fmt_leg_quotes(short_legs, long_legs)}")
+	return grouping_codes
+
+
+async def orchestrate_batched_send(trade_dict, orderDuration=ORDER_DURATION,
+                                    srtrade_pool=None, sranalytics_pool=None,
+                                    force_cheap_w2_test=False):
+	"""Orchestrate wave-1 send + fill check + refresh_legs + wave-2 send via batched SR queries.
+
+	6 phases at the script level (rather than per-coroutine like send_complex_two_waves):
+	  1. Build wave-1 coroutines from trade_dict (preserves priority order).
+	  2. Fire wave-1 concurrently (via asyncio.gather).
+	  3. Sleep WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE for SR to work orders.
+	  4. BATCHED fill check + cancel across ALL grouping_codes (3 SR roundtrips total).
+	  5. Identify wave-2 candidates + BATCHED refresh_legs (deduped by strike, parallel).
+	  6. Fire wave-2 concurrently for remainders.
+
+	Complex trades participate in all 6 phases. Outright trades fire once in phase 2 and skip
+	phases 4-6 (no wave-2 semantics for outrights).
+
+	Attaches trade["grouping_codes"] on every complex trade (list of ints) so downstream
+	algo_trade_logger can look up fills in SR fill-state tables. Outrights get None.
+
+	Failure modes: each phase wraps critical SR calls in try/except. Batched fill-check failure
+	skips wave-2 entirely (wave-1 orders remain live at SR for their TTL). Batched refresh failure
+	skips wave-2 (won't fire with stale legs)."""
+
+	# Initialize grouping_codes = None for every trade -- defensive so the key always exists.
+	# Same for the per-wave logging fields (limits + gcs) consumed by algo_trade_logger.
+	for trade in trade_dict["trades"]:
+		trade.setdefault("grouping_codes", None)
+		trade.setdefault("wave1_limit", None)
+		trade.setdefault("wave2_limit", None)
+		trade.setdefault("wave1_grouping_codes", None)
+		trade.setdefault("wave2_grouping_codes", None)
+		trade.setdefault("cross_price1", None)
+		trade.setdefault("srprc1", None)
+		trade.setdefault("cross_price2", None)
+		trade.setdefault("srprc2", None)
+
+	async def _safe(coro, name):
+		try:
+			return await coro
+		except Exception as e:
+			print(f"{pretty_time()} -- ERROR sending trade '{name}': {e}")
+			return None
+
+	def _spread_opt_type(trade):
+		"""Return 'Call'/'Put' for a 2-legged spread from its short leg's okey_cp (None if
+		undeterminable). Used to bucket the wave-1 underfill check by option type."""
+		legs = trade.get("short_legs") or []
+		if legs and getattr(legs[0], "okey_cp", None):
+			return str(legs[0].okey_cp)
+		return None
+
+	# === Add-on #1 (premium): bump all 4 edges (ET1/ME1/ET2/ME2) for large-dollar complex orders,
+	# off the FINAL post-loss-cap size. 2-legged credit spreads only (complex + price > 0). ===
+	for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+		if trade_type != "complex" or trade.get("size", 0) <= 0 or trade.get("price", 0) <= 0:
+			continue
+		prem_add = compute_premium_add_on(trade["size"], trade["price"])
+		if prem_add > 0:
+			trade["edge_target1"] = round(trade["edge_target1"] + prem_add, 3)
+			trade["max_edge1"]    = round(trade["max_edge1"]    + prem_add, 3)
+			trade["edge_target2"] = round(trade["edge_target2"] + prem_add, 3)
+			trade["max_edge2"]    = round(trade["max_edge2"]    + prem_add, 3)
+			premium = trade["size"] * trade["price"] * MULTIPLIER
+			print(f"{pretty_time()} -- [orchestrator] PREMIUM ADD-ON +{prem_add:.3f} to ET1/ME1/ET2/ME2 "
+			      f"for {trade['name']} (size={trade['size']}, sprc={trade['price']:.2f}, "
+			      f"premium=${premium:,.0f}; cap=3% sprc)")
+
+	# === PHASE 1: build wave-1 coroutines from trade_dict (priority order preserved) ===
+	wave1_coros = []
+	send_meta = []   # parallel to wave1_coros: (trade_dict_entry, trade_type)
+	for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+		if trade["size"] == 0:
+			continue
+		if trade_type == "complex":
+			# Record the wave-1 sprc-based limit actually sent (legs are the same snapshot the
+			# wave-1 INSERT will price off; no refresh happens before Phase 2). Also capture the
+			# surface fair + executable cross at W1 for cross-vs-surface divergence analysis.
+			trade["wave1_limit"] = compute_spread_limit(
+				trade["short_legs"], trade["long_legs"], trade["max_edge1"], trade.get("min_price"))
+			trade["srprc1"] = compute_spread_srprc(trade["short_legs"], trade["long_legs"])
+			trade["cross_price1"] = compute_spread_cross(trade["short_legs"], trade["long_legs"])
+			coro = send_wave1_only(
+				symbol=trade["symbol"], size=trade["size"],
+				short_legs=trade["short_legs"], long_legs=trade["long_legs"],
+				exp=trade["exp"], account=trade["account"],
+				edge_target1=trade["edge_target1"], max_edge1=trade["max_edge1"],
+				is_sale=trade["is_sale"], userData=trade["name"],
+				orderDuration=orderDuration, min_price=trade.get("min_price"),
+				srtrade_pool=srtrade_pool,
+			)
+		else:   # outright -- one-shot, no wave-2 semantics
+			coro = send_outright_limit_order(
+				symbol=trade["symbol"], option=trade["option"], size=trade["size"],
+				DIRECTION=trade["direction"], ACCOUNT=trade["account"], offset=trade["offset"],
+				userData=trade["name"], orderDuration=orderDuration, min_price=trade.get("min_price"),
+				srtrade_pool=srtrade_pool,
+			)
+		wave1_coros.append(coro)
+		send_meta.append((trade, trade_type))
+
+	n_complex = sum(1 for _, tt in send_meta if tt == "complex")
+	n_outright = sum(1 for _, tt in send_meta if tt != "complex")
+	print(f"{pretty_time()} -- [orchestrator] Phase 1: prepared {len(wave1_coros)} orders ({n_complex} complex, {n_outright} outright)")
+
+	if not wave1_coros:
+		print(f"{pretty_time()} -- [orchestrator] No trades to send; exiting")
+		return
+
+	# === PHASE 2: fire wave-1 concurrently ===
+	print(f"{pretty_time()} -- [orchestrator] Phase 2: firing wave-1 concurrently ({len(wave1_coros)} orders)")
+	wave1_results = await asyncio.gather(*[_safe(c, m[0]["name"]) for c, m in zip(wave1_coros, send_meta)])
+	print(f"{pretty_time()} -- [orchestrator] Phase 2 done: wave-1 sent for all {len(wave1_coros)} orders")
+
+	# === PHASE 3: sleep for SR to work orders ===
+	print(f"{pretty_time()} -- [orchestrator] Phase 3: sleeping {WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE}s for SR to work orders")
+	await asyncio.sleep(WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE)
+	print(f"{pretty_time()} -- [orchestrator] Phase 3 done")
+
+	# === PHASE 4: batched fill check + cancel for all complex wave-1 grouping_codes ===
+	all_gcs = []
+	account_by_gc = {}
+	for (trade, tt), result in zip(send_meta, wave1_results):
+		if tt == "complex" and isinstance(result, list):
+			for gc in result:
+				all_gcs.append(gc)
+				account_by_gc[gc] = trade["account"]
+
+	print(f"{pretty_time()} -- [orchestrator] Phase 4: batched fill-check + cancel for {len(all_gcs)} grouping_codes")
+	try:
+		fills, unconfirmed = await batched_fill_check_and_cancel(all_gcs, account_by_gc, srtrade_pool=srtrade_pool)
+	except Exception as e:
+		print(f"{pretty_time()} -- [orchestrator] ERROR in Phase 4 batched fill-check ({e}); skipping wave-2. Wave-1 orders remain live at SR until TTL expires.")
+		# Attach whatever grouping_codes we have (wave-1 only) for the logger
+		for (trade, tt), result in zip(send_meta, wave1_results):
+			if tt == "complex" and isinstance(result, list):
+				trade["grouping_codes"] = result
+				trade["wave1_grouping_codes"] = result
+		return
+
+	total_filled = sum(fills.values())
+	print(f"{pretty_time()} -- [orchestrator] Phase 4 done: {total_filled} contracts filled across {len(fills)} grouping_codes")
+
+	# === PHASE 5: identify wave-2 candidates + batched refresh_legs ===
+	needing_wave2 = []   # list of (trade, remainder, wave1_grouping_codes)
+	for (trade, tt), wave1_gcs in zip(send_meta, wave1_results):
+		if tt != "complex" or not isinstance(wave1_gcs, list):
+			continue
+		trade["wave1_grouping_codes"] = wave1_gcs
+		trade_total_filled = sum(fills.get(gc, 0) for gc in wave1_gcs)
+		remainder = trade["size"] - trade_total_filled
+		if remainder <= 0:
+			# Fully filled after wave-1 -- attach wave-1 grouping_codes only
+			trade["grouping_codes"] = wave1_gcs
+			continue
+		if any(gc in unconfirmed for gc in wave1_gcs):
+			# Wave-1 NOT confirmed terminal (still New/PendClose -> can still fill). Hedge: send only
+			# CEIL(50% of the best-effort remainder) and flag LOUD in the chat summary. Prefer a bounded
+			# overfill to a full underfill (user directive). trade_total_filled may be stale-low.
+			hedge = (remainder + 1) // 2   # integer ceil of half -> leans overfill (remainder 1 -> 1)
+			warn = (f"!!!!!!!!!!!!!!!!! {trade['name']}: wave-1 NOT confirmed terminal after "
+			        f"{_CANCEL_POLL_TIMEOUT_S}s (still working / PendClose). Best-effort fill "
+			        f"{trade_total_filled}/{trade['size']} -> sending 50% wave-2 = {hedge}. VERIFY "
+			        f"POSITION (possible over/underfill). !!!!!!!!!!!!!!!!!")
+			print(f"{pretty_time()} -- [orchestrator]   {warn}")
+			trade_dict.setdefault("send_warnings", []).append(warn)
+			needing_wave2.append((trade, hedge, wave1_gcs))
+		else:
+			needing_wave2.append((trade, remainder, wave1_gcs))
+
+	print(f"{pretty_time()} -- [orchestrator] Phase 5: {len(needing_wave2)} of {n_complex} complex orders need wave-2")
+
+	if not needing_wave2:
+		print(f"{pretty_time()} -- [orchestrator] Send phase complete: no wave-2 needed")
+		return
+
+	# === Add-on #2 (wave-1 underfill): PER OPTION TYPE. If W1 filled < W1_UNDERFILL_RATIO of the
+	# total qty sent FOR THAT OPTION TYPE (Call vs Put) -- a near-total W1 miss for that type -- bump
+	# WAVE-2 edges (ET2/ME2) for that type's wave-2 candidates to chase fills. Bucketing by type so a
+	# fully filled put book no longer masks a completely unfilled call book (or vice versa) on days
+	# where both fire. Per-type trigger, per-trade cap (3% of that trade's sprc). Applied before
+	# Phase 5 reprices wave-2. ===
+	sent_by_type = {}
+	filled_by_type = {}
+	for (trade, tt), wave1_gcs in zip(send_meta, wave1_results):
+		if tt != "complex":
+			continue
+		otype = _spread_opt_type(trade)
+		sent_by_type[otype]   = sent_by_type.get(otype, 0) + trade["size"]
+		filled_by_type[otype] = filled_by_type.get(otype, 0) + (
+			sum(fills.get(gc, 0) for gc in wave1_gcs) if isinstance(wave1_gcs, list) else 0)
+	for otype, type_sent in sent_by_type.items():
+		type_filled = filled_by_type.get(otype, 0)
+		if type_sent <= 0 or (type_filled / type_sent) >= W1_UNDERFILL_RATIO:
+			continue
+		print(f"{pretty_time()} -- [orchestrator] WAVE1 UNDERFILL [{otype}]: {type_filled}/{type_sent} "
+		      f"filled ({type_filled / type_sent:.1%} < {W1_UNDERFILL_RATIO:.0%}); bumping W2 {otype} edges.")
+		for trade, _remainder, _gcs in needing_wave2:
+			if _spread_opt_type(trade) != otype or trade.get("price", 0) <= 0:
+				continue
+			uf_add = compute_wave1_underfill_add_on(type_sent, type_filled, trade["price"])
+			if uf_add > 0:
+				trade["edge_target2"] = round(trade["edge_target2"] + uf_add, 3)
+				trade["max_edge2"]    = round(trade["max_edge2"]    + uf_add, 3)
+				print(f"{pretty_time()} -- [orchestrator]   WAVE1_UNDERFILL ADD-ON +{uf_add:.3f} to "
+				      f"ET2/ME2 for {trade['name']} (sprc={trade['price']:.2f}; cap=3% sprc)")
+
+	# Collect all leg objects across the wave-2 candidates, then batched-refresh (deduped)
+	all_legs = []
+	for trade, _remainder, _gcs in needing_wave2:
+		all_legs.extend(trade["short_legs"])
+		all_legs.extend(trade["long_legs"])
+
+	print(f"{pretty_time()} -- [orchestrator] Phase 5: batched refresh_legs for wave-2 candidates")
+	try:
+		await batched_refresh_legs_deduped(all_legs, sranalytics_pool=sranalytics_pool)
+	except Exception as e:
+		print(f"{pretty_time()} -- [orchestrator] ERROR in Phase 5 batched refresh ({e}); skipping wave-2 (won't fire with stale legs).")
+		for trade, _remainder, wave1_gcs in needing_wave2:
+			trade["grouping_codes"] = wave1_gcs
+		return
+	print(f"{pretty_time()} -- [orchestrator] Phase 5 done: legs refreshed")
+
+	# Record the post-refresh wave-2 sprc-based limit per candidate (legs were refreshed in-place
+	# in Phase 5, so this reflects the sprc the wave-2 INSERT prices off). Also capture the
+	# post-refresh surface fair + executable cross at W2.
+	for trade, _remainder, _gcs in needing_wave2:
+		trade["wave2_limit"] = compute_spread_limit(
+			trade["short_legs"], trade["long_legs"], trade["max_edge2"], trade.get("min_price"))
+		trade["srprc2"] = compute_spread_srprc(trade["short_legs"], trade["long_legs"])
+		trade["cross_price2"] = compute_spread_cross(trade["short_legs"], trade["long_legs"])
+
+	# Cheap-price guard (trades tagged with cheap_price_max_size/_threshold, e.g. CLOSER):
+	# if the post-refresh wave-2 limit sits at/below the threshold, cap the wave-2 remainder
+	# so we never offer more than the cap at the price floor. (The decision-time wave-1 check
+	# lives in closer_spread_trader.)
+	capped_wave2 = []
+	for trade, remainder, wave1_gcs in needing_wave2:
+		cap = trade.get("cheap_price_max_size")
+		thresh = trade.get("cheap_price_threshold")
+		if cap and thresh is not None and (trade["wave2_limit"] <= thresh or force_cheap_w2_test) and remainder > cap:
+			forced_str = " [FORCED by TEST_CLOSER_W2_CHEAP]" if (
+				force_cheap_w2_test and trade["wave2_limit"] > thresh) else ""
+			print(f"{pretty_time()} -- [orchestrator]   CHEAP-PRICE CAP: {trade['name']} wave-2 limit "
+			      f"{trade['wave2_limit']:.2f} <= {thresh}{forced_str} -- remainder {remainder} -> {cap}")
+			remainder = cap
+		capped_wave2.append((trade, remainder, wave1_gcs))
+	needing_wave2 = capped_wave2
+
+	# === PHASE 6: fire wave-2 concurrently for remainders ===
+	print(f"{pretty_time()} -- [orchestrator] Phase 6: firing wave-2 concurrently ({len(needing_wave2)} orders)")
+	wave2_coros = [
+		send_wave2_for_remainder(
+			symbol=trade["symbol"], size=remainder,
+			short_legs=trade["short_legs"], long_legs=trade["long_legs"],
+			exp=trade["exp"], account=trade["account"],
+			edge_target2=trade["edge_target2"], max_edge2=trade["max_edge2"],
+			is_sale=trade["is_sale"], userData=trade["name"],
+			orderDuration=orderDuration, min_price=trade.get("min_price"),
+			srtrade_pool=srtrade_pool,
+		)
+		for trade, remainder, _gcs in needing_wave2
+	]
+	wave2_results = await asyncio.gather(
+		*[_safe(c, needing_wave2[i][0]["name"]) for i, c in enumerate(wave2_coros)]
+	)
+
+	# Attach ALL grouping_codes (wave-1 + wave-2) to each trade for algo_trade_logger downstream,
+	# plus the per-wave gc split so the logger can attribute fills/times to each wave.
+	for (trade, _remainder, wave1_gcs), wave2_gcs in zip(needing_wave2, wave2_results):
+		all_gcs_for_trade = list(wave1_gcs)
+		trade["wave1_grouping_codes"] = wave1_gcs
+		if isinstance(wave2_gcs, list):
+			all_gcs_for_trade.extend(wave2_gcs)
+			trade["wave2_grouping_codes"] = wave2_gcs
+		trade["grouping_codes"] = all_gcs_for_trade
+
+	print(f"{pretty_time()} -- [orchestrator] Phase 6 done: wave-2 sent. Send phase complete.")
+
+
+if __name__ == "__main__":
+	calls = run_query(get_closest_calls_sql)
+	second_call = calls.iloc[1]
+	fourth_call = calls.iloc[3]
+	puts = run_query(get_closest_puts_sql)
+	second_put = puts.iloc[1]
+	fourth_put = puts.iloc[3]
+
+	sale_size = 1
+	order = send_complex_two_waves("SPXW", sale_size, [fourth_call], [second_call], dt.date.today(), "T.AGM", edge_target1=.12, max_edge1=.2, edge_target2=.22, max_edge2=.30, is_sale=False)
+
+	trades = [order]
+
+	async def send_trades():
+		await asyncio.gather(
+			*trades
+		)
+
+
+	asyncio.run(send_trades())
+
+	# buy_size = 10
+	# send_complex_two_waves("SPXW", buy_size, [fourth_call], [second_call], dt.date.today(),
+	# 					   edge_target1=.06, max_edge1=.1, edge_target2=.11, max_edge2=.15, is_sale=False)
+
+	# send_orders_with_limits(second_call, 10, second_put, 10, DIRECTION="Sell", ACCOUNT="T.AGM1")

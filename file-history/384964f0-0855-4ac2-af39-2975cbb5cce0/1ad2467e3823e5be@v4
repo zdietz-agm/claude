@@ -1,0 +1,20 @@
+# large_index_flows
+
+Do very large single-name index flows on the effective date make 0DTE strangles worth buying at ~3pm?
+
+## Step 1 (done 9/10/26): event list -- `build_flow_list.py` -> `large_flow_events.csv`
+
+- Population: the 18 regular-cycle S&P 500 adds in `sp500_adds/sp500_helpers.py::INDIVIDUAL_ADDS`
+  (Jun 2023 - Sep 2026), plus two manual non-add events sized by Zach (9/10/26): AVGO sell 2025-12-19 ~$16B, AAPL buy 2024-09-20 ~$30B.
+- Announcement date = the `ANNOUNCEMENT_CYCLES` Friday within 21 days before the effective date.
+- Estimated index flow = **12% x CUR_MKT_CAP on the announcement date** (Bloomberg, via `bloomberg_helpers.my_bdh`, cached).
+- Thresholds: `passes_7b` (every regular-cycle add clears it, min PANW $8.0B) and `passes_10b` (Zach's working cut, 9/10/26 -- 13 of 20 events).
+- Caveat for review: CUR_MKT_CAP is full market cap, not float-adjusted. Names with big insider/affiliate holdings
+  (DELL, KKR, BX, APO, PLTR) would have materially less real index demand under S&P's IWF float factor.
+
+Run: `python -c "exec(open('build_flow_list.py').read())"` (my_bdh spawns a child process; do not run `python build_flow_list.py`).
+
+## Step 2 (next): ThetaData 0DTE strangle test
+
+For each event's effective date, pull 0DTE OTM call + OTM put quotes ~15:00 for the symbol, check whether a
+strangle costing ~10-20 bps of spot pays out on average into the close.

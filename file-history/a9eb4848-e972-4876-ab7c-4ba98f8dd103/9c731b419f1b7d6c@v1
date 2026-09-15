@@ -1,0 +1,927 @@
+"""hacking_355_backtest.py -- Does closing on a 355pm imbal flip improve PnL?
+
+For each strategy (IMBAL_VS_MARKET / IMBAL_GROWS parents + CLOSER variants, plus the
+3 prod BUMPED strategies: GROWS / VS_MARKET / SHRINKS):
+  Original PnL = held to settlement (current behavior).
+  Hacked  PnL = if 355pm imbal flips against trade direction (|imbal_355| > $1B),
+                close spread at 15:55:03 OPRA cross (short_ask - long_bid).
+                Otherwise keep original PnL.
+
+Fill mode (default, capped): the achievable buy-back price each second is the displayed
+cross (short_ask - long_bid, NaN long bid -> 0) PLUS fast-market slippage of
+max(SLIP_FLOOR, SLIP_PCT * cross) (defaults $0.20 / 10%; lower via --slip-floor /
+--slip-pct). A triggered leg fills only when this slipped price is <= MAX_HACK_COST,
+checked at 15:55:03 and then every second through 16:00:00. At 15:55:03 we take the
+market: a slipped price already at or under the cap fills at that slipped price. Any
+later fill models a resting bid at MAX_HACK_COST getting hit, so it fills at exactly
+MAX_HACK_COST. Never under the cap -> leg not hacked (keeps original PnL).
+Legacy mode (pass --uncapped on the CLI): always fill at the raw 15:55:03 cross, any
+price, no slippage.
+
+Hack size (default): HALF the leg (floor), matching prod's hack_size = size_filled // 2 --
+1-lot legs are skipped and the unhacked remainder rides to settlement. --full-size unwinds
+100% of the position (the pre-9/2 research behavior).
+
+Incremental mode: --last-days N restricts everything to the last N trading days in the
+combined panel (shrinks the OPRA pull to N dates; for the daily task). Absent -> full history.
+
+Flip rule (matches prior 6/8/26 research):
+  short Put  + imbal_355 < -$1B  -> hack-close (big sell pressure vs short-put position)
+  short Call + imbal_355 > +$1B  -> hack-close (big buy  pressure vs short-call position)
+
+Output xlsx (Downloads):
+  Sheet 1 = Summary, Sheets 2+ = per-strategy per-leg detail.
+"""
+
+#%% Imports
+import os, sys, math
+import datetime as dt
+import numpy as np
+import pandas as pd
+import warnings
+from datetime import datetime
+from urllib.parse import quote_plus
+from sqlalchemy import create_engine, text
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+sys.path.insert(0, 'D:/PycharmProjects/scratch/algos/')
+sys.path.insert(0, 'D:/agent_projects/eod_option_algos/')
+
+warnings.filterwarnings('ignore', category=pd.errors.DtypeWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+from create_backtests import build_combined_data, apply_config, load_configs
+from test_new_versions import PROD_CONFIGS_DIR, TEST_CONFIGS_DIR, find_config
+from configs_closer_strikes.closer_strike_config import (
+    CLOSER_PARENT_CONFIGS, MAX_ITM_DIST, MAX_OTM_DIST, SPREAD_WIDTH, MAX_BASE_PRICE, FP_EPS,
+)
+from configs_bumped_spreads.bumped_spread_config import (
+    BUMPED_PARENT_CONFIGS,
+    BUMP_STEP as BUMPED_BUMP_STEP,
+    SPREAD_WIDTH as BUMPED_SPREAD_WIDTH,
+    MAX_ATM_VOL as BUMPED_MAX_ATM_VOL,
+)
+from closer_precedence import closer_fired_keys
+
+#%% Configuration
+THRESHOLD          = 1_000_000_000        # $1B 355 imbal threshold for "flip". Backtest stays
+                                          # at 1B deliberately; prod gates at 950M (8/21/26) as a
+                                          # live-vs-T+1 jitter buffer. See README hacker note.
+EXIT_TIME_TARGET   = dt.time(15, 55, 3)   # OPRA cross time for hack-close
+IMBAL_355_SNAP_STR = "15:55:01"           # snap_time WHERE-clause literal (MySQL TIME format)
+MULTIPLIER         = 100
+SYMBOL             = "SPXW"
+OUTPUT_DIR         = "C:/Users/zdietz/Downloads/"
+
+# Hack fill mode (see module docstring). --uncapped on the CLI restores legacy behavior;
+# --max-cost <price> overrides the default cap (e.g. --max-cost 1.60).
+UNCAPPED      = "--uncapped" in sys.argv
+MAX_HACK_COST = (float(sys.argv[sys.argv.index("--max-cost") + 1])
+                 if "--max-cost" in sys.argv else 2.10)
+SCAN_END_TIME = dt.time(16, 0, 0)
+
+# Fast-market slippage (capped mode only): the achievable buy-back price is assumed to be
+# max(SLIP_FLOOR, SLIP_PCT * cross) ABOVE the displayed cross. This slipped price is what
+# gets compared to the cap AND what we pay on a first-second fill (later resting-bid fills
+# still pay exactly the cap). Lower via --slip-floor / --slip-pct (0 0 = no slippage).
+SLIP_FLOOR = (float(sys.argv[sys.argv.index("--slip-floor") + 1])
+              if "--slip-floor" in sys.argv else 0.20)
+SLIP_PCT   = (float(sys.argv[sys.argv.index("--slip-pct") + 1])
+              if "--slip-pct" in sys.argv else 0.10)
+
+# Hack size: default HALF the leg, matching prod (hacker_trades: hack_size = size_filled // 2,
+# so 1-lot legs are skipped). --full-size hacks 100% of the position (pre-9/2 behavior).
+FULL_SIZE = "--full-size" in sys.argv
+
+# --last-days N: incremental mode -- backtest only the last N trading days in the combined
+# panel (for the daily task; shrinks the OPRA pull from ~540 dates to N). Absent -> full history.
+LAST_DAYS = (int(sys.argv[sys.argv.index("--last-days") + 1])
+             if "--last-days" in sys.argv else None)
+
+print(f"Hack fill mode: " + ("UNCAPPED (legacy: always fill at 15:55:03 cross)" if UNCAPPED
+      else f"capped at ${MAX_HACK_COST:.2f}, per-second scan 15:55:03->16:00:00, "
+           f"slippage max(${SLIP_FLOOR:.2f}, {SLIP_PCT:.0%} of cross)")
+      + (", FULL-size unwind" if FULL_SIZE else ", HALF-size unwind (prod)")
+      + (f", last {LAST_DAYS} trading days only" if LAST_DAYS else ""))
+
+PARENT_NAMES = [
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET",
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS",
+]
+# --all-parents: test EVERY prod 350PM SPX credit-spread-sale parent config (SPXW only;
+# the NDX variant is excluded -- this backtest's combined data and OPRA panel are SPXW).
+if "--all-parents" in sys.argv:
+    import glob as _glob
+    PARENT_NAMES = sorted(
+        os.path.basename(p)[:-3]
+        for p in _glob.glob(os.path.join(PROD_CONFIGS_DIR, "ALGO_42_350PM_SPREAD_SALES_SPX*.py"))
+    )
+    print(f"--all-parents: {len(PARENT_NAMES)} parent strategies:")
+    for _n in PARENT_NAMES:
+        print(f"  {_n}")
+# CLOSER variants exist only for parents in the prod closer config.
+CLOSER_NAMES = [n + "_CLOSER" for n in PARENT_NAMES if n in CLOSER_PARENT_CONFIGS]
+
+# BUMPED strategies: all 3 in the prod bumped book (GROWS, VS_MARKET, SHRINKS).
+BUMPED_PARENT_NAMES = list(BUMPED_PARENT_CONFIGS.keys())
+BUMPED_NAMES = [n + "_BUMP" for n in BUMPED_PARENT_NAMES]
+STRIKE_STEP = 5   # $5 per SPXW strike index (for bumped long-leg offset)
+
+# Prod's bumped layer skips any parent whose CLOSER already fired that day
+# (bumped_spread_trader.py: `if trade.get("closer_applied"): continue`). Keep True to match
+# prod; set False only to study the counterfactual where bumped fires on CLOSER days too.
+RESPECT_CLOSER_PRECEDENCE = True
+
+def _parent_label(n):
+    """Short display/sheet label for a parent config name ('' -> 'BASE' for the base config)."""
+    s = n.split("SPREAD_SALES_SPX")[-1].lstrip("_")
+    return s if s else "BASE"
+
+SHORT_LABELS = {n: _parent_label(n) for n in PARENT_NAMES}
+SHORT_LABELS.update({n + "_CLOSER": _parent_label(n) + " CLOSER"
+                     for n in PARENT_NAMES if n in CLOSER_PARENT_CONFIGS})
+SHORT_LABELS.update({
+    n + "_BUMP": n.split("SPREAD_SALES_SPX_")[-1] + " BUMP" for n in BUMPED_PARENT_NAMES
+})
+
+ALL_NAMES = [*PARENT_NAMES, *CLOSER_NAMES, *BUMPED_NAMES]
+
+# VBAM auctionResearch (prod) -- 355 imbal source
+VBAM_HOST = "alpine-vbam-prod.c7wvpkbyvjzb.us-east-1.rds.amazonaws.com"
+VBAM_DB   = "auctionResearch"
+VBAM_USER = "VBAM_Read"
+VBAM_PASS = "read-VBAM-^6"
+
+# optionsResearch (dev) -- t_opra_quotes for hack-exit pricing
+OPT_HOST = "alpine-vbam-dev.c7wvpkbyvjzb.us-east-1.rds.amazonaws.com"
+OPT_DB   = "optionsResearch"
+OPT_USER = "options_research_user"
+OPT_PASS = "P@9xZt5#Lq"
+
+def get_vbam_engine():
+    return create_engine(f'mysql+pymysql://{VBAM_USER}:{VBAM_PASS}@{VBAM_HOST}/{VBAM_DB}')
+
+def get_options_engine():
+    return create_engine(f'mysql+pymysql://{OPT_USER}:{quote_plus(OPT_PASS)}@{OPT_HOST}:3306/{OPT_DB}')
+
+pd.set_option('display.max_columns', 60)
+
+#%% Cache: combined data (shared with other backtest scripts)
+if 'combined_data_dict' not in dir():
+    combined_data_dict = {}
+if SYMBOL not in combined_data_dict or combined_data_dict[SYMBOL] is None:
+    print(f"Building combined data for {SYMBOL}...")
+    combined_data_dict[SYMBOL], _ = build_combined_data(SYMBOL)
+combined = combined_data_dict[SYMBOL]
+print(f"Combined: {combined.shape[0]:,} rows, dates {combined['trade_date'].min()} -> {combined['trade_date'].max()}")
+
+#%% 350 imbal per date (sourced from combined -- no SQL needed)
+imbal_350_df = (combined[["trade_date", "350pm_imbal 350PM"]]
+                .drop_duplicates("trade_date")
+                .rename(columns={"350pm_imbal 350PM": "imbal_350"})
+                .reset_index(drop=True))
+imbal_350_df["trade_date"] = pd.to_datetime(imbal_350_df["trade_date"]).dt.date
+print(f"imbal_350_df: {len(imbal_350_df):,} dates")
+
+#%% Cache: 355 imbal history (15:55:01 spy_net_imbalance)
+if 'imbal_355_df' not in dir():
+    print("Pulling 355 imbal history from t_report_consolidated_imbalances...")
+    eng = get_vbam_engine()
+    _sql = f"""
+        SELECT business_date AS trade_date, spy_net_imbalance AS imbal_355
+        FROM auctionResearch.t_report_consolidated_imbalances
+        WHERE snap_time = '{IMBAL_355_SNAP_STR}'
+    """
+    imbal_355_df = pd.read_sql_query(text(_sql), eng)
+    eng.dispose()
+    imbal_355_df["trade_date"] = pd.to_datetime(imbal_355_df["trade_date"]).dt.date
+    imbal_355_df = imbal_355_df.dropna(subset=["imbal_355"]).reset_index(drop=True)
+    print(f"  {len(imbal_355_df):,} dates, {imbal_355_df['trade_date'].min()} -> {imbal_355_df['trade_date'].max()}")
+else:
+    print(f"Reusing cached imbal_355_df ({len(imbal_355_df):,} rows)")
+
+#%% Cache: OPRA chain lookup for CLOSER strike selection (15:50:07 -- matches closer_strike_backtest)
+if 'opra_lookup' not in dir():
+    OPRA_TRADE_TIME = "15:50:07"
+    opra_path = "D:/agent_projects/eod_option_algos/SPXW_0DTE_opra_panel.csv"
+    print(f"Loading OPRA panel for chain lookup @ {OPRA_TRADE_TIME}...")
+    _opra = pd.read_csv(opra_path, parse_dates=["trade_date"])
+    _opra["trade_date"] = _opra["trade_date"].dt.date
+    _opra = _opra[_opra["timestamp"].astype(str).str.contains(OPRA_TRADE_TIME)].copy()
+    _opra["cp"] = _opra["cp"].str[0]
+    opra_lookup = _opra.set_index(["trade_date", "cp", "strike"])[["bid", "ask"]].sort_index()
+    print(f"  OPRA chain lookup: {len(opra_lookup):,} entries")
+else:
+    print(f"Reusing cached opra_lookup ({len(opra_lookup):,} entries)")
+
+#%% Load configs (parents come from PROD/TEST dirs; CLOSER rules come from prod CLOSER_PARENT_CONFIGS)
+configs_all = load_configs(PROD_CONFIGS_DIR) + load_configs(TEST_CONFIGS_DIR)
+CLOSER_CONFIGS = {
+    name: {"ratio_to_parent": cfg["ratio_to_parent"], "well_within": cfg["well_within"]}
+    for name, cfg in CLOSER_PARENT_CONFIGS.items()
+}
+print(f"Loaded {len(configs_all)} configs; CLOSER rules: {list(CLOSER_CONFIGS.keys())}")
+
+#%% Helpers -- build per-leg DataFrames
+
+def find_config_exact(configs, name):
+    """Exact (case-insensitive) config-name match; falls back to find_config's substring
+    behavior. Needed because parent names can be substrings of each other (e.g. the base
+    SPREAD_SALES_SPX config vs all its variants)."""
+    exact = [c for c in configs if c["name"].upper() == name.upper()]
+    return exact[0] if exact else find_config(configs, name)
+
+
+def build_parent_legs(strat_name, combined):
+    """Run apply_config for parent strategy, expand per-day result into one row per traded side (put/call)."""
+    cfg = find_config_exact(configs_all, strat_name)
+    if cfg is None:
+        raise ValueError(f"Config not found: {strat_name}")
+    r = apply_config(combined, cfg)
+    r = r[(r["put_size"] > 0) | (r["call_size"] > 0)].copy()
+    rows = []
+    for _, row in r.iterrows():
+        if row["put_size"] > 0:
+            # When put trades, put strikes are always primary (cp in {'P','P+C'})
+            rows.append({
+                "trade_date": row["trade_date"], "cp": "Put",
+                "sh_strike": row["sh_strike"], "lg_strike": row["lg_strike"],
+                "size": row["put_size"], "credit": row["put_price"],
+                "idx_close": row["idx_close"], "original_pnl": row["put_pnl"],
+            })
+        if row["call_size"] > 0:
+            # cp == 'P+C' -> call is secondary; cp == 'C' -> call is primary
+            if row["cp"] == "P+C":
+                c_sh, c_lg = row["sh_strike_2"], row["lg_strike_2"]
+            else:
+                c_sh, c_lg = row["sh_strike"], row["lg_strike"]
+            rows.append({
+                "trade_date": row["trade_date"], "cp": "Call",
+                "sh_strike": c_sh, "lg_strike": c_lg,
+                "size": row["call_size"], "credit": row["call_price"],
+                "idx_close": row["idx_close"], "original_pnl": row["call_pnl"],
+            })
+    out = pd.DataFrame(rows, columns=None if rows else
+                       ["trade_date","cp","sh_strike","lg_strike","size","credit","idx_close","original_pnl"])
+    if len(out):
+        out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
+        out["sh_strike"]  = out["sh_strike"].astype(float)
+        out["lg_strike"]  = out["lg_strike"].astype(float)
+    return out
+
+
+def _pick_closer_short_strike(spot, cp_label, chain_strikes):
+    if cp_label == "Put":
+        candidates = [s for s in chain_strikes if (spot - MAX_OTM_DIST) <= s <= (spot + MAX_ITM_DIST + FP_EPS)]
+    else:
+        candidates = [s for s in chain_strikes if (spot - MAX_ITM_DIST - FP_EPS) <= s <= (spot + MAX_OTM_DIST)]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda s: abs(s - spot))
+
+
+def build_closer_legs(strat_name_closer, combined):
+    """Replicate closer_strike_backtest.py logic. Returns per-leg rows with CLOSER's own PnL only."""
+    parent_name = strat_name_closer.replace("_CLOSER", "")
+    cfg_base = find_config_exact(configs_all, parent_name)
+    if cfg_base is None:
+        raise ValueError(f"Parent config not found: {parent_name}")
+    r_base = apply_config(combined, cfg_base)
+
+    cl_cfg = CLOSER_CONFIGS[parent_name]
+    ratio = cl_cfg["ratio_to_parent"]
+    closer_dollar_target = cfg_base["dollar_target"] * ratio
+    closer_max_size      = max(1, math.ceil(cfg_base["max_size"] * ratio))
+    closer_min_size      = cfg_base.get("min_size") or 1
+
+    sig_cols = [c for c in [
+        "spy_market_ratio 350PM", "350pm_imbal 350PM", "340pm_imbal 350PM",
+        "qqq_350pm_imbal 350PM", "spy_paired_imbal_recreated 350PM", "factor_is_serial",
+    ] if c in combined.columns]
+    sigs = combined[["trade_date"] + sig_cols].drop_duplicates("trade_date")
+    merged = r_base.merge(sigs, on="trade_date", how="left")
+
+    rows = []
+    for _, row in merged.iterrows():
+        td = row["trade_date"]
+        spot = row["idx_at_trade"]
+        idx_close = row["idx_close"]
+        raw_signals = {
+            "market_ratio":                     row.get("spy_market_ratio 350PM", 0),
+            "imbal_350":                        row.get("350pm_imbal 350PM", 0),
+            "imbal_340":                        row.get("340pm_imbal 350PM", 0),
+            "qqq_350pm_imbal 350PM":            row.get("qqq_350pm_imbal 350PM", 0),
+            "spy_paired_imbal_recreated 350PM": row.get("spy_paired_imbal_recreated 350PM", 0),
+            "factor_is_serial":                 row.get("factor_is_serial", 0),
+        }
+        for cp_label, side_lower, cp_letter in [("Put", "put", "P"), ("Call", "call", "C")]:
+            base_size = row.get(f"{side_lower}_size", 0) or 0
+            base_price = row.get(f"{side_lower}_price", 0) or 0
+            if base_size <= 0:
+                continue
+            if base_price > MAX_BASE_PRICE:
+                continue
+            try:
+                ok = bool(cl_cfg["well_within"][side_lower](raw_signals))
+            except Exception:
+                ok = False
+            if not ok:
+                continue
+            try:
+                chain = opra_lookup.loc[(td, cp_letter)]
+            except KeyError:
+                continue
+            if isinstance(chain, pd.Series):
+                continue
+            chain_strikes = chain.index.tolist()
+            closer_short = _pick_closer_short_strike(spot, cp_label, chain_strikes)
+            if closer_short is None:
+                continue
+            closer_long = (closer_short - SPREAD_WIDTH) if cp_label == "Put" else (closer_short + SPREAD_WIDTH)
+            if closer_long not in chain_strikes:
+                continue
+            sh_bid = chain.loc[closer_short, "bid"]
+            lg_ask = chain.loc[closer_long, "ask"]
+            if pd.isna(sh_bid) or pd.isna(lg_ask):
+                continue
+            credit = sh_bid - lg_ask
+            if credit <= 0:
+                credit = 0.05
+            size = min(math.ceil(closer_dollar_target / (credit * MULTIPLIER)), closer_max_size)
+            size = max(size, closer_min_size)
+            if size <= 0:
+                continue
+            # CLOSER's own PnL at settlement
+            if cp_label == "Put":
+                short_intrinsic = max(closer_short - idx_close, 0)
+                long_intrinsic  = max(closer_long  - idx_close, 0)
+            else:
+                short_intrinsic = max(idx_close - closer_short, 0)
+                long_intrinsic  = max(idx_close - closer_long,  0)
+            per_share = max(credit - (short_intrinsic - long_intrinsic), credit - SPREAD_WIDTH)
+            pnl = per_share * size * MULTIPLIER
+            rows.append({
+                "trade_date": td, "cp": cp_label,
+                "sh_strike": closer_short, "lg_strike": closer_long,
+                "size": size, "credit": credit,
+                "idx_close": idx_close, "original_pnl": pnl,
+            })
+    out = pd.DataFrame(rows, columns=None if rows else
+                       ["trade_date","cp","sh_strike","lg_strike","size","credit","idx_close","original_pnl"])
+    if len(out):
+        out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
+        out["sh_strike"]  = out["sh_strike"].astype(float)
+        out["lg_strike"]  = out["lg_strike"].astype(float)
+    return out
+
+
+def build_bumped_legs(strat_name_bumped, combined):
+    """Replicate bumped_spread_backtest.py logic: on days the parent's traded side was 1-lot
+    (min_size), sell a bumped spread (short 1 index closer to ATM, $15-wide, prod bumped
+    sizing, atmVol < 0.14 filter). Returns per-leg rows with the BUMP's own settlement PnL."""
+    parent_name = strat_name_bumped.replace("_BUMP", "")
+    cfg = find_config_exact(configs_all, parent_name)
+    if cfg is None:
+        raise ValueError(f"Parent config not found: {parent_name}")
+    r_orig = apply_config(combined, cfg)
+    min_sz = cfg.get("min_size", 1)
+
+    # Build bumped config exactly as bumped_spread_backtest.py does
+    sizing = BUMPED_PARENT_CONFIGS[parent_name]
+    bumped = {**cfg, "name": cfg["name"] + " BUMP",
+              "min_strike_distance": max(0, cfg.get("min_strike_distance", 0) - BUMPED_BUMP_STEP),
+              "dollar_target": sizing["dollar_target"], "max_size": sizing["max_size"]}
+    for key in ["short_put_strikes", "short_call_strikes"]:
+        if key in bumped and bumped[key]:
+            bumped[key] = [max(0, idx - 1) for idx in bumped[key]]
+    spread_offset = BUMPED_SPREAD_WIDTH // STRIKE_STEP  # 15/5 = 3 indices
+    for short_key, long_key in [("short_put_strikes", "long_put_strikes"),
+                                ("short_call_strikes", "long_call_strikes")]:
+        if short_key in bumped and bumped[short_key] and long_key in bumped:
+            bumped[long_key] = [s + spread_offset for s in bumped[short_key]]
+    r_bump = apply_config(combined, bumped)
+
+    vol_by_date = (combined[["trade_date", "atmVol 350PM"]]
+                   .drop_duplicates("trade_date")
+                   .set_index("trade_date")["atmVol 350PM"])
+
+    # Days/sides CLOSER took -- prod suppresses bumped on these (closer_applied).
+    closer_keys = (closer_fired_keys(parent_name, r_orig, combined, opra_lookup)
+                   if RESPECT_CLOSER_PRECEDENCE else set())
+    n_suppressed = 0
+
+    rows = []
+    for _, orig_row in r_orig.iterrows():
+        orig_put_1lot  = orig_row["put_size"]  == min_sz and orig_row["put_size"]  > 0
+        orig_call_1lot = orig_row["call_size"] == min_sz and orig_row["call_size"] > 0
+        if not orig_put_1lot and not orig_call_1lot:
+            continue
+        td = orig_row["trade_date"]
+        # atmVol filter (NaN vol -> excluded, matching bumped_spread_backtest's < comparison)
+        if BUMPED_MAX_ATM_VOL is not None and not (vol_by_date.get(td, np.nan) < BUMPED_MAX_ATM_VOL):
+            continue
+        bump_match = r_bump[r_bump["trade_date"] == td]
+        if bump_match.empty:
+            continue
+        bump_row = bump_match.iloc[0]
+        td_key = pd.Timestamp(td).date()
+        if orig_put_1lot and (td_key, "Put") in closer_keys:
+            orig_put_1lot = False
+            n_suppressed += 1
+        if orig_call_1lot and (td_key, "Call") in closer_keys:
+            orig_call_1lot = False
+            n_suppressed += 1
+        if orig_put_1lot and bump_row["put_size"] > 0:
+            # When put trades, put strikes are always primary (cp in {'P','P+C'})
+            rows.append({
+                "trade_date": td, "cp": "Put",
+                "sh_strike": bump_row["sh_strike"], "lg_strike": bump_row["lg_strike"],
+                "size": bump_row["put_size"], "credit": bump_row["put_price"],
+                "idx_close": bump_row["idx_close"], "original_pnl": bump_row["put_pnl"],
+            })
+        if orig_call_1lot and bump_row["call_size"] > 0:
+            if bump_row["cp"] == "P+C":
+                c_sh, c_lg = bump_row["sh_strike_2"], bump_row["lg_strike_2"]
+            else:
+                c_sh, c_lg = bump_row["sh_strike"], bump_row["lg_strike"]
+            rows.append({
+                "trade_date": td, "cp": "Call",
+                "sh_strike": c_sh, "lg_strike": c_lg,
+                "size": bump_row["call_size"], "credit": bump_row["call_price"],
+                "idx_close": bump_row["idx_close"], "original_pnl": bump_row["call_pnl"],
+            })
+    if n_suppressed:
+        print(f"    [closer precedence] {parent_name.split('SPX_')[-1]}: {n_suppressed} bumped leg(s) suppressed (CLOSER took the day)")
+    out = pd.DataFrame(rows, columns=None if rows else
+                       ["trade_date","cp","sh_strike","lg_strike","size","credit","idx_close","original_pnl"])
+    if len(out):
+        out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
+        out["sh_strike"]  = out["sh_strike"].astype(float)
+        out["lg_strike"]  = out["lg_strike"].astype(float)
+    return out
+
+
+#%% Build per-leg dataframes for all strategies
+print("\nBuilding per-leg DataFrames...")
+legs_by_strat = {}
+for n in PARENT_NAMES:
+    legs_by_strat[n] = build_parent_legs(n, combined)
+    print(f"  {SHORT_LABELS[n]:<25}: {len(legs_by_strat[n])} legs")
+for n in CLOSER_NAMES:
+    legs_by_strat[n] = build_closer_legs(n, combined)
+    print(f"  {SHORT_LABELS[n]:<25}: {len(legs_by_strat[n])} legs")
+for n in BUMPED_NAMES:
+    legs_by_strat[n] = build_bumped_legs(n, combined)
+    print(f"  {SHORT_LABELS[n]:<25}: {len(legs_by_strat[n])} legs")
+
+#%% Apply prod's CLOSER precedence to the parents
+# Prod (closer_spread_trader.py) partially replaces the parent when its CLOSER fires:
+# parent size is decremented by the closer's size, floored at the parent's min_size.
+# Mirror that here: on each (trade_date, cp) where the CLOSER leg exists, shrink the
+# parent leg and rescale original_pnl pro-rata (PnL is linear in size).
+for _pn in PARENT_NAMES:
+    _cn = _pn + "_CLOSER"
+    if _cn not in legs_by_strat:
+        continue
+    _p, _c = legs_by_strat[_pn], legs_by_strat[_cn]
+    if _p.empty or _c.empty:
+        continue
+    _min_sz = find_config_exact(configs_all, _pn).get("min_size") or 1
+    _p = _p.merge(
+        _c[["trade_date", "cp", "size"]].rename(columns={"size": "closer_size"}),
+        on=["trade_date", "cp"], how="left",
+    )
+    _p["closer_size"] = _p["closer_size"].fillna(0)
+    _hit = _p["closer_size"] > 0
+    _new_size = np.maximum(_p["size"] - _p["closer_size"], _min_sz)
+    _p.loc[_hit, "original_pnl"] = _p.loc[_hit, "original_pnl"] * _new_size[_hit] / _p.loc[_hit, "size"]
+    _p.loc[_hit, "size"] = _new_size[_hit]
+    legs_by_strat[_pn] = _p.drop(columns=["closer_size"])
+    print(f"    [closer precedence] {SHORT_LABELS[_pn]}: {int(_hit.sum())} parent leg(s) decremented (floor min_size={_min_sz})")
+
+#%% Incremental mode: keep only the last N trading days (before the OPRA pull, so the
+# quote loop only queries those dates).
+if LAST_DAYS:
+    _keep_dates = set(pd.to_datetime(pd.Series(sorted(combined["trade_date"].unique())[-LAST_DAYS:])).dt.date)
+    _n_before = sum(len(v) for v in legs_by_strat.values())
+    for _n in list(legs_by_strat):
+        _df = legs_by_strat[_n]
+        if len(_df):
+            legs_by_strat[_n] = _df[_df["trade_date"].isin(_keep_dates)].reset_index(drop=True)
+    _n_after = sum(len(v) for v in legs_by_strat.values())
+    print(f"Incremental mode: last {LAST_DAYS} trading days ({min(_keep_dates)} -> {max(_keep_dates)}); "
+          f"legs {_n_before} -> {_n_after}")
+
+
+#%% Pull OPRA quote window for all unique (date, cp, strike) legs
+SNAP_WIN_LO     = "15:54:30"   # legacy snap window around 15:55:03
+SNAP_WIN_HI     = "15:55:30"
+SNAP_WIN_HI_SEC = 15*3600 + 55*60 + 30
+SCAN_START_SEC  = EXIT_TIME_TARGET.hour*3600 + EXIT_TIME_TARGET.minute*60 + EXIT_TIME_TARGET.second
+SCAN_END_SEC    = SCAN_END_TIME.hour*3600 + SCAN_END_TIME.minute*60 + SCAN_END_TIME.second
+
+
+def _ts_to_sec(x):
+    """timestmp (timedelta or string) -> integer seconds since midnight."""
+    if isinstance(x, dt.timedelta):
+        return int(x.total_seconds())
+    t = pd.to_datetime(str(x)).time()
+    return t.hour*3600 + t.minute*60 + t.second
+
+
+def get_opra_window_quotes(legs_all_strats, wide_dates):
+    """Pull per-second OPRA quotes for every leg strike. Window per date: 15:54:30-15:55:30
+    (legacy snap window), extended to 16:00:00 on wide_dates (flip-eligible dates that need
+    the capped-mode per-second scan). Returns tidy df: trade_date, cp, strike, t_sec, bid, ask."""
+    if legs_all_strats.empty:
+        return pd.DataFrame(columns=["trade_date","cp","strike","t_sec","bid","ask"])
+
+    # Build (date, cp_full, strike) probe set covering both legs.
+    # t_opra_quotes.cp stores full words ('Put'/'Call') -- use those, NOT first-char.
+    probes = set()
+    for _, r in legs_all_strats.iterrows():
+        if pd.isna(r["sh_strike"]) or pd.isna(r["lg_strike"]):
+            continue
+        cp_full = r["cp"]
+        probes.add((r["trade_date"], cp_full, float(r["sh_strike"])))
+        probes.add((r["trade_date"], cp_full, float(r["lg_strike"])))
+
+    dates_needed = sorted({d for d, _, _ in probes})
+    n_wide = sum(1 for d in dates_needed if d in wide_dates)
+    print(f"  Pulling OPRA quotes for {len(dates_needed)} dates ({n_wide} wide-window), {len(probes)} (date,cp,strike) probes...")
+    eng = get_options_engine()
+
+    quotes_frames = []
+    for i, d in enumerate(dates_needed):
+        date_probes = [(cp, s) for dd, cp, s in probes if dd == d]
+        # Build a strike-list filter for this date (cast to nearest int via *1000 to dodge float-match issues)
+        strikes_x1000 = sorted({int(round(s * 1000)) for _, s in date_probes})
+        strikes_str   = ",".join(str(x) for x in strikes_x1000)
+        hi = "16:00:00" if d in wide_dates else SNAP_WIN_HI
+        sql = text(f"""
+            SELECT trade_date, strike, cp, bidPrc AS bid, askPrc AS ask, timestmp
+            FROM optionsResearch.t_opra_quotes
+            WHERE symbol = :sym
+              AND trade_date = :td
+              AND exp = :td
+              AND ROUND(strike * 1000) IN ({strikes_str})
+              AND timestmp >= '{SNAP_WIN_LO}'
+              AND timestmp <= '{hi}'
+        """)
+        df = pd.read_sql_query(sql, eng, params={"sym": SYMBOL, "td": d.strftime('%Y-%m-%d')})
+        if len(df):
+            quotes_frames.append(df)
+        if (i + 1) % 50 == 0:
+            print(f"    {i+1}/{len(dates_needed)} dates fetched")
+    eng.dispose()
+    if not quotes_frames:
+        return pd.DataFrame(columns=["trade_date","cp","strike","t_sec","bid","ask"])
+
+    q = pd.concat(quotes_frames, ignore_index=True)
+    q["trade_date"] = pd.to_datetime(q["trade_date"]).dt.date
+    q["t_sec"]  = q["timestmp"].apply(_ts_to_sec)
+    q["strike"] = q["strike"].astype(float)
+    q["bid"]    = q["bid"].astype(float)
+    q["ask"]    = q["ask"].astype(float)
+    # One row per (date, cp, strike, second)
+    q = (q.sort_values(["trade_date","cp","strike","t_sec"])
+          .drop_duplicates(["trade_date","cp","strike","t_sec"], keep="first")
+          [["trade_date","cp","strike","t_sec","bid","ask"]]
+          .reset_index(drop=True))
+    return q
+
+
+def snap_exits(q, legs_all_strats):
+    """Legacy 15:55:03 snapshot: per leg, short_ask + long_bid from the quote row closest to
+    EXIT_TIME_TARGET within the 15:54:30-15:55:30 window (same pick as the original script)."""
+    empty = pd.DataFrame(columns=["trade_date","cp","sh_strike","lg_strike","short_ask","long_bid"])
+    if q.empty or legs_all_strats.empty:
+        return empty
+
+    qq = q[q["t_sec"] <= SNAP_WIN_HI_SEC].copy()
+    qq["abs_dt"] = (qq["t_sec"] - SCAN_START_SEC).abs()
+    picked = qq.sort_values(["trade_date","cp","strike","abs_dt"]).drop_duplicates(["trade_date","cp","strike"], keep="first")
+
+    bid_lookup = picked.set_index(["trade_date","cp","strike"])["bid"]
+    ask_lookup = picked.set_index(["trade_date","cp","strike"])["ask"]
+
+    out_rows = []
+    seen = set()
+    for _, r in legs_all_strats.iterrows():
+        key = (r["trade_date"], r["cp"], r["sh_strike"], r["lg_strike"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if pd.isna(r["sh_strike"]) or pd.isna(r["lg_strike"]):
+            out_rows.append({"trade_date": r["trade_date"], "cp": r["cp"],
+                             "sh_strike": r["sh_strike"], "lg_strike": r["lg_strike"],
+                             "short_ask": np.nan, "long_bid": np.nan})
+            continue
+        cp_full = r["cp"]  # 'Put' or 'Call' -- matches t_opra_quotes.cp
+        sh = float(r["sh_strike"]); lg = float(r["lg_strike"])
+        try:
+            sa = ask_lookup.loc[(r["trade_date"], cp_full, sh)]
+            sa = float(sa.iloc[0]) if hasattr(sa, "iloc") else float(sa)
+        except KeyError:
+            sa = np.nan
+        try:
+            lb = bid_lookup.loc[(r["trade_date"], cp_full, lg)]
+            lb = float(lb.iloc[0]) if hasattr(lb, "iloc") else float(lb)
+        except KeyError:
+            lb = np.nan
+        out_rows.append({"trade_date": r["trade_date"], "cp": r["cp"],
+                         "sh_strike": sh, "lg_strike": lg,
+                         "short_ask": sa, "long_bid": lb})
+    return pd.DataFrame(out_rows)
+
+
+# Flip-eligible dates need the wide (to-16:00) window for the capped-mode scan.
+_flip_dates = (set() if UNCAPPED else
+               set(imbal_355_df.loc[imbal_355_df["imbal_355"].abs() > THRESHOLD, "trade_date"]))
+
+if 'opra_quotes_win' not in dir() or globals().get('_opra_win_wide') != bool(_flip_dates):
+    print("\nPulling OPRA quote window (one-time cache)...")
+    _all_legs = pd.concat(
+        [legs_by_strat[n][["trade_date","cp","sh_strike","lg_strike"]] for n in legs_by_strat],
+        ignore_index=True
+    ).drop_duplicates()
+    opra_quotes_win = get_opra_window_quotes(_all_legs, _flip_dates)
+    opra_exits_all  = snap_exits(opra_quotes_win, _all_legs)
+    _opra_win_wide  = bool(_flip_dates)
+    n_missing_sa = opra_exits_all["short_ask"].isna().sum()
+    n_missing_lb = opra_exits_all["long_bid"].isna().sum()
+    print(f"  OPRA exits: {len(opra_exits_all):,} legs, {n_missing_sa} missing short_ask, {n_missing_lb} missing long_bid")
+else:
+    print(f"Reusing cached opra_quotes_win ({len(opra_quotes_win):,} rows)")
+
+
+#%% Per-second scan lookups + fill logic (capped mode)
+if not UNCAPPED:
+    _ask_ser, _bid_ser = {}, {}
+    for _key, _g in opra_quotes_win.groupby(["trade_date","cp","strike"]):
+        _s = _g.set_index("t_sec")
+        _ask_ser[_key] = _s["ask"]
+        _bid_ser[_key] = _s["bid"]
+    _scan_seconds = np.arange(SCAN_START_SEC, SCAN_END_SEC + 1)
+
+
+def scan_hack_fill(td, cp, sh, lg):
+    """First second in [15:55:03, 16:00:00] where the SLIPPED cross -- (short_ask - long_bid,
+    NaN long bid -> 0) plus max(SLIP_FLOOR, SLIP_PCT * cross) fast-market slippage -- is
+    <= MAX_HACK_COST. Quotes forward-filled from the last update at or before each second.
+    Fill price: at scan start (15:55:03) we take the market and pay the slipped cross. Any
+    LATER fill models our resting bid at MAX_HACK_COST getting hit, so it fills at exactly
+    MAX_HACK_COST -- never at a lower price the market gapped down to.
+    Returns (exit_cost, exit_sec, priced, cross_at_fill): (nan, None, False, nan) if the short
+    strike never quotes; (nan, None, True, nan) if priced but never at or under the cap.
+    cross_at_fill is the raw (unslipped) displayed cross at the fill second, so
+    exit_cost - cross_at_fill is the per-spread slippage paid."""
+    sa = _ask_ser.get((td, cp, sh))
+    if sa is None:
+        return np.nan, None, False, np.nan
+    sa_ff = sa.reindex(_scan_seconds, method="ffill").to_numpy(dtype=float)
+    lbs = _bid_ser.get((td, cp, lg))
+    if lbs is None:
+        lb_ff = np.zeros(len(_scan_seconds))
+    else:
+        lb_ff = np.nan_to_num(lbs.reindex(_scan_seconds, method="ffill").to_numpy(dtype=float), nan=0.0)
+    cross = sa_ff - lb_ff
+    eff = cross + np.maximum(SLIP_FLOOR, SLIP_PCT * cross)   # achievable price after slippage
+    priced = ~np.isnan(eff)
+    if not priced.any():
+        return np.nan, None, False, np.nan
+    ok = priced & (eff <= MAX_HACK_COST + 1e-9)
+    if not ok.any():
+        return np.nan, None, True, np.nan
+    i = int(np.argmax(ok))
+    cost = float(eff[i]) if i == 0 else MAX_HACK_COST
+    return cost, int(_scan_seconds[i]), True, float(cross[i])
+
+
+#%% Apply the hack rule
+def apply_hack(legs):
+    """Adds imbal_350/355, hack_triggered, hack_size (half the leg by default; see FULL_SIZE),
+    short_ask/long_bid (15:55:03 snap), hack_exit_cost, hack_exit_time, attempted_hacked,
+    hack_filled, slippage_cost, hacked_pnl (always-hack hack_size at the uncapped 15:55:03
+    cross, remainder held; reference only), pnl_with_hacking (conditional), delta_pnl.
+    All PnL columns are WHOLE-POSITION PnL. Fill rule depends on UNCAPPED (module docstring)."""
+    df = legs.copy()
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    df["sh_strike"]  = df["sh_strike"].astype(float)
+    df["lg_strike"]  = df["lg_strike"].astype(float)
+    df = df.merge(imbal_350_df, on="trade_date", how="left")
+    df = df.merge(imbal_355_df, on="trade_date", how="left")
+    df = df.merge(opra_exits_all, on=["trade_date","cp","sh_strike","lg_strike"], how="left")
+    df["hack_triggered"] = (
+        ((df["cp"] == "Put")  & (df["imbal_355"] < -THRESHOLD)) |
+        ((df["cp"] == "Call") & (df["imbal_355"] >  THRESHOLD))
+    )
+    # Hack size: prod unwinds HALF the filled size (floor, so 1-lot legs are skipped);
+    # --full-size unwinds the whole leg. The unhacked remainder rides to settlement.
+    df["hack_size"] = df["size"].astype(float) if FULL_SIZE else np.floor(df["size"].astype(float) / 2)
+    hold_frac = (df["size"] - df["hack_size"]) / df["size"]   # settlement fraction (0 in full-size)
+
+    # 15:55:03 snapshot cross = short_ask - long_bid. NaN long_bid -> 0 (long abandoned).
+    sa = df["short_ask"]
+    lb = df["long_bid"].fillna(0)
+    cross_1555 = np.where(pd.isna(sa), np.nan, sa - lb)
+
+    # Reference: whole-position PnL if we ALWAYS hack hack_size at the uncapped 15:55:03 cross
+    # (remainder held to settlement). NaN when OPRA missing.
+    always_hack_pnl = ((df["credit"] - cross_1555) * df["hack_size"] * MULTIPLIER
+                       + df["original_pnl"] * hold_frac)
+    df["hacked_pnl"] = np.where(pd.isna(cross_1555), np.nan, always_hack_pnl)
+
+    if UNCAPPED:
+        # Legacy: triggered legs always fill at the 15:55:03 cross (no slippage).
+        df["hack_exit_cost"] = cross_1555
+        fill = df["hack_triggered"] & (~pd.isna(df["hack_exit_cost"])) & (df["hack_size"] >= 1)
+        df["hack_exit_time"]   = np.where(fill, EXIT_TIME_TARGET.strftime("%H:%M:%S"), None)
+        df["attempted_hacked"] = fill
+        df["hack_filled"]      = fill
+        df["slippage_cost"]    = np.where(fill, 0.0, np.nan)
+    else:
+        # Capped: first second in [15:55:03, 16:00:00] with slipped cross <= MAX_HACK_COST.
+        costs, times, priced_l, slips = [], [], [], []
+        for _, r in df.iterrows():
+            if (not r["hack_triggered"] or r["hack_size"] < 1
+                    or pd.isna(r["sh_strike"]) or pd.isna(r["lg_strike"])):
+                costs.append(np.nan); times.append(None); priced_l.append(False); slips.append(np.nan)
+                continue
+            c, t_sec, priced, raw_cross = scan_hack_fill(r["trade_date"], r["cp"],
+                                                         float(r["sh_strike"]), float(r["lg_strike"]))
+            costs.append(c)
+            times.append(None if t_sec is None else
+                         f"{t_sec//3600:02d}:{(t_sec%3600)//60:02d}:{t_sec%60:02d}")
+            priced_l.append(priced)
+            # Slippage paid = (fill price - raw displayed cross at fill time) on the hacked size.
+            slips.append(np.nan if pd.isna(c) else (c - raw_cross) * r["hack_size"] * MULTIPLIER)
+        df["hack_exit_cost"]   = costs
+        df["hack_exit_time"]   = times
+        df["attempted_hacked"] = df["hack_triggered"] & pd.Series(priced_l, index=df.index)
+        df["hack_filled"]      = df["attempted_hacked"] & (~pd.isna(df["hack_exit_cost"]))
+        df["slippage_cost"]    = slips
+
+    fill_pnl = ((df["credit"] - df["hack_exit_cost"]) * df["hack_size"] * MULTIPLIER
+                + df["original_pnl"] * hold_frac)
+    df["pnl_with_hacking"] = np.where(df["hack_filled"], fill_pnl, df["original_pnl"])
+
+    # Strategy delta = conditional-hack PnL vs never-hack baseline
+    df["delta_pnl"] = df["pnl_with_hacking"] - df["original_pnl"]
+    return df
+
+
+hacked_by_strat = {n: apply_hack(legs_by_strat[n]) for n in legs_by_strat}
+
+
+#%% Build Summary
+def sharpe(s):
+    """Raw mean/std (per global rule: do NOT annualize)."""
+    s = s[s != 0]
+    return s.mean() / s.std() if len(s) > 1 and s.std() > 0 else 0
+
+
+summary_rows = []
+for n in ALL_NAMES:
+    df = hacked_by_strat[n]
+    summary_rows.append({
+        "Strategy":             SHORT_LABELS[n],
+        "N legs":               len(df),
+        "N flip-eligible":      int(df["hack_triggered"].sum()),
+        "N attempted hacked":   int(df["attempted_hacked"].sum()),
+        "N filled":             int(df["hack_filled"].sum()),
+        "Original total PnL":   df["original_pnl"].sum(),
+        "Hacked total PnL (always hack)": df["hacked_pnl"].sum(),
+        "PnL with hacking total": df["pnl_with_hacking"].sum(),
+        "Delta PnL":            (df["pnl_with_hacking"] - df["original_pnl"]).sum(),
+        "Total slippage cost":  df["slippage_cost"].sum(),
+        "Sharpe orig (per-leg)": sharpe(df["original_pnl"]),
+        "Sharpe hacked (per-leg)": sharpe(df["hacked_pnl"]),
+        "Sharpe w/ hacking (per-leg)": sharpe(df["pnl_with_hacking"]),
+    })
+summary_df = pd.DataFrame(summary_rows)
+print("\n=== Summary ===")
+print(summary_df.to_string(index=False))
+
+# Cross-strategy per-day aggregation for top/bottom-10 hack-day tables
+_all = pd.concat(
+    [hacked_by_strat[n].assign(strategy=SHORT_LABELS[n])
+     for n in ALL_NAMES],
+    ignore_index=True,
+)
+_hacks = _all[_all["hack_filled"]].copy()
+if len(_hacks):
+    day_agg = _hacks.groupby("trade_date").agg(
+        imbal_350            =("imbal_350",        "first"),
+        imbal_355            =("imbal_355",        "first"),
+        n_legs_hacked        =("hack_filled",      "sum"),
+        strategies           =("strategy",         lambda s: ", ".join(sorted(set(s)))),
+        original_pnl_sum     =("original_pnl",     "sum"),
+        pnl_with_hacking_sum =("pnl_with_hacking", "sum"),
+        delta_pnl_sum        =("delta_pnl",        "sum"),
+    ).reset_index()
+    top10 = day_agg.sort_values("delta_pnl_sum", ascending=False).head(10).reset_index(drop=True)
+    bot10 = day_agg.sort_values("delta_pnl_sum", ascending=True ).head(10).reset_index(drop=True)
+else:
+    _empty_cols = ["trade_date","imbal_350","imbal_355","n_legs_hacked","strategies",
+                   "original_pnl_sum","pnl_with_hacking_sum","delta_pnl_sum"]
+    top10 = pd.DataFrame(columns=_empty_cols)
+    bot10 = pd.DataFrame(columns=_empty_cols)
+print(f"\nCross-strategy hack days: {len(_hacks)} legs -> {len(day_agg) if len(_hacks) else 0} distinct dates")
+
+
+#%% Save Excel
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+mode_tag  = "_uncapped" if UNCAPPED else f"_cap{int(round(MAX_HACK_COST * 100))}"
+if not UNCAPPED and (SLIP_FLOOR, SLIP_PCT) != (0.20, 0.10):
+    mode_tag += f"_slip{int(round(SLIP_FLOOR * 100))}x{int(round(SLIP_PCT * 100))}"
+if FULL_SIZE:
+    mode_tag += "_fullsize"
+if LAST_DAYS:
+    mode_tag += f"_last{LAST_DAYS}"
+filepath  = f"{OUTPUT_DIR}hacking_355_backtest{mode_tag}_{timestamp}.xlsx"
+
+strategy_cols = ["trade_date","cp","sh_strike","lg_strike","size","hack_size","credit",
+                 "idx_close","imbal_350","imbal_355","hack_triggered","short_ask","long_bid",
+                 "hack_exit_cost","hack_exit_time","attempted_hacked","hack_filled",
+                 "slippage_cost","original_pnl","hacked_pnl","pnl_with_hacking","delta_pnl"]
+
+detail_sheets = {}
+for n in ALL_NAMES:
+    df = hacked_by_strat[n][[c for c in strategy_cols if c in hacked_by_strat[n].columns]].copy()
+    detail_sheets[SHORT_LABELS[n]] = df.sort_values("trade_date").reset_index(drop=True)
+
+dollar_cols_in_detail  = {"original_pnl","hacked_pnl","pnl_with_hacking","delta_pnl","imbal_350",
+                          "imbal_355","slippage_cost"}
+dollar2_cols_in_detail = {"credit","short_ask","long_bid","hack_exit_cost"}
+dollar_cols_in_summary = {"Original total PnL","Hacked total PnL (always hack)",
+                          "PnL with hacking total","Delta PnL","Total slippage cost"}
+dollar_cols_in_hackday = {"imbal_350","imbal_355","original_pnl_sum",
+                          "pnl_with_hacking_sum","delta_pnl_sum"}
+
+with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+    # --- Summary sheet: three stacked tables ---
+    summary_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
+    n1 = len(summary_df) + 3                          # blank rows after Table 1
+    top10.to_excel(writer, sheet_name="Summary", index=False, startrow=n1 + 1)
+    n2 = n1 + 1 + len(top10) + 3                      # blank rows after Table 2
+    bot10.to_excel(writer, sheet_name="Summary", index=False, startrow=n2 + 1)
+
+    wb = writer.book
+    ws = wb["Summary"]
+
+    # Section labels above each hack-day table (bold)
+    ws.cell(row=n1 + 1,        column=1, value="Top 10 BEST hack days (aggregated across all strategies, by delta_pnl_sum)").font = Font(bold=True)
+    ws.cell(row=n2 + 1,        column=1, value="Top 10 WORST hack days (aggregated across all strategies, by delta_pnl_sum)").font = Font(bold=True)
+
+    # AutoFilter only over the strategy comparison table
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(summary_df.columns))}{len(summary_df)+1}"
+
+    # Column widths for Summary (widen enough for the widest of the three tables)
+    max_cols_summary = max(len(summary_df.columns), len(top10.columns), len(bot10.columns))
+    for i in range(1, max_cols_summary + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 22
+
+    # --- Number formatting on Summary sheet ---
+    def _apply_fmt(sheet, header_row, df_local, dollar_set, dollar2_set=None):
+        """Apply dollar/sharpe/pct formats to data rows below a header row."""
+        for i, col in enumerate(df_local.columns, 1):
+            fmt = None
+            if col in dollar_set:
+                fmt = "_($* #,##0_);[Red]_($* (#,##0)"
+            elif dollar2_set and col in dollar2_set:
+                fmt = "_($* #,##0.00_);[Red]_($* (#,##0.00)"
+            elif isinstance(col, str) and col.startswith("Sharpe"):
+                fmt = "0.00"
+            if fmt:
+                letter = get_column_letter(i)
+                for r in range(header_row + 1, header_row + 1 + len(df_local)):
+                    sheet[f"{letter}{r}"].number_format = fmt
+
+    _apply_fmt(ws, header_row=1,        df_local=summary_df, dollar_set=dollar_cols_in_summary)
+    _apply_fmt(ws, header_row=n1 + 2,   df_local=top10,      dollar_set=dollar_cols_in_hackday)
+    _apply_fmt(ws, header_row=n2 + 2,   df_local=bot10,      dollar_set=dollar_cols_in_hackday)
+
+    # --- Strategy detail sheets ---
+    for sh, df in detail_sheets.items():
+        df.to_excel(writer, sheet_name=sh, index=False)
+        ws2 = wb[sh]
+        ws2.auto_filter.ref = ws2.dimensions
+        ws2.freeze_panes    = "C2"   # freeze trade_date + cp
+        for i, col in enumerate(df.columns, 1):
+            letter = get_column_letter(i)
+            width = max(12, min(28, int(df[col].astype(str).map(len).max()) if len(df) else 12))
+            ws2.column_dimensions[letter].width = width
+            fmt = None
+            if col in dollar_cols_in_detail:
+                fmt = "_($* #,##0_);[Red]_($* (#,##0)"
+            elif col in dollar2_cols_in_detail:
+                fmt = "_($* #,##0.00_);[Red]_($* (#,##0.00)"
+            if fmt:
+                for row in range(2, len(df) + 2):
+                    ws2[f"{letter}{row}"].number_format = fmt
+
+print(f"\nSaved: {filepath}")

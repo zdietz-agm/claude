@@ -1,0 +1,684 @@
+"""BTIC + IMBAL prod script.
+
+Architecture (mirrors 355pm_script with BTIC-specific state tracker):
+  1. Startup
+     - Load configs from configs_btic_options/ (time keyword "BTIC")
+     - Install BTIC edge constants into helpers.* (scale by VIX)
+     - Resolve BTIC ticker (STE{H/M/U/Z}{Y} Index) and verify NAME contains "BTIC"
+     - Fetch pre-3:45 PM HIGH/LOW from blp.bdib
+     - Build krishna sell/buy level ladders; init BTICStateTracker
+  2. Pre-loop wait
+     - Wait until MAIN_LOOP_START_TIME (15:50:07 ET)
+  3. Tick loop (drift-free, wait_until each absolute schedule slot)
+     - Skip the TIME_BLOCK window (15:55:00 to 15:55:30) and stop at MAIN_LOOP_END_TIME (15:59:00)
+     - poll_btic_price + poll_latest_imbal
+     - Update tracker (latches breaches; updates running min/max)
+     - Build merged factor_dict (tracker factors + live_imbal factors)
+     - Refresh SPXW chain, call prep_trades, filter already-fired (name,side) pairs
+     - send_complex_two_waves for any remaining positive-size trades
+
+No apply_size_limits, no manual sizing -- prep_trades handles dollar_target/max_size from the config.
+"""
+import datetime as dt
+import time
+import asyncio
+import sys
+import os
+
+import pandas as pd
+
+sys.path.insert(1, "D:/PycharmProjects/utils")
+from google_chat_webhook import send_message, my_chat
+from calendar_utils import getNowEst, wait_until
+from spdr_rock_functions import run_query
+from xbbg import blp
+
+today = dt.date.today()
+
+# --- SpiderRock v8 migration toggle (per-script) --------------------------------------------
+# USE_V8=True -> DATA reads on v8 (the get_closest_and_slightly_itm_* chain pulls at the early
+# pull and the pre-send refresh). SEND_V8=True -> orders/cancels/fills on v8 too (legacy
+# send_complex_two_waves / send_outright_limit_order paths, SEND_V8-gated in the shared module).
+# use_v8() MUST run BEFORE the spdr_rock_order_functions star-import below: it copies the SQL
+# strings by value, so flipping after it would keep the stale v7 table name.
+# NOTE: IS_TEST in this script exits before any trading -- there is NO test-account send path,
+# so the first v8 send is the first live prod send (EOD34/EOD39, provisioned per Zach 8/24).
+USE_V8  = True
+SEND_V8 = True
+if USE_V8:
+	from spdr_rock_order_functions import use_v8 as _use_v8
+	_use_v8(True, send=SEND_V8)
+
+import helpers
+from helpers import *  # noqa: F401,F403 -- intentional; prep_trades, send_complex_two_waves, pretty_time, etc.
+from spdr_rock_order_functions import *  # noqa: F401,F403 -- get_closest_and_slightly_itm_*_sql
+
+from btic.btic_helpers import (
+    get_btic_ticker, verify_btic_ticker, fetch_pre_345_high_low,
+    build_sell_levels, build_buy_levels,
+    install_btic_edge_constants,
+)
+from btic.tape_monitor import poll_btic_price, poll_latest_imbal
+
+
+# ---------------------------------------------------------------------------
+# Knobs
+# ---------------------------------------------------------------------------
+
+IS_TEST     = False
+SEND_TRADES = True
+
+DATA_REFRESH_INTERVAL = 2           # seconds between ticks
+IMBAL_MAX_AGE_SEC     = 3           # treat imbal as stale (gate closed) if older than this
+
+# Tracker doesn't start until this time so we don't latch off pre-3:45 noise.
+TRACKER_START_TIME    = dt.time(15, 45, 0)
+
+# Main loop window -- outer bounds across ALL configs. Per-config valid times are
+# enforced via each config's tracker.is_valid_time(now_t). Make these wide enough
+# to cover the union of all configs' active windows.
+MAIN_LOOP_START_TIME  = dt.time(15, 50, 7)
+MAIN_LOOP_END_TIME    = dt.time(15, 59, 0)
+
+# Static-day factor poll times. Consumed by SIGN_MATCH's size_multiplier_factors.
+# atmVol: polled before the main loop -> always available at trigger time.
+# 350 imbal: polled inside the main loop at first tick >= IMBAL_350_POLL_TIME ->
+#   triggers in the 15:50:07-15:50:10 window see signed_pos/neg = 0 (no 1.2x/1.8x).
+#   The backtest mirrors this via a fill_t >= 15:50:10 gate in add_factors.
+ATMVOL_POLL_TIME      = dt.time(15, 49, 55)
+IMBAL_350_POLL_TIME   = dt.time(15, 50, 10)
+
+# 3:55pm levered-rebal poll (added 7/15/26). Blocks BAI PUT trades when the
+# projected 3:55pm rebal is strongly negative (-9B chosen instead of the -10B
+# empirical cutoff to leave margin between the 15:49 projection and the actual
+# 3:55 hit). Consumed by BTIC_AND_IMBAL's put_dont_trade_factors AND, since 9/9/26, by the
+# 350PM scripts' IMBAL_GROWS CLOSER/BUMPED adverse-rebal veto via levered_rebal_355_daily.csv
+# (rebal_veto.py, read at 15:49:55) -- do not retime past ~15:49:30 or remove this poll.
+REBAL_355_POLL_TIME   = dt.time(15, 49, 0)
+REBAL_355_THRESHOLD_B = -9
+
+
+# ---------------------------------------------------------------------------
+# Live-imbal factor names (used by configs in configs_btic_options/)
+# ---------------------------------------------------------------------------
+
+def _build_live_imbal_factors(imbal):
+    """Build live-imbal factor dict. If imbal is None (poll failed/stale), all factors = 0
+    so triggers requiring them will not fire.
+    """
+    if imbal is None:
+        return {
+            "factor_live_imbal_lt_100M":     0,
+            "factor_live_imbal_gt_neg_100M": 0,
+            "factor_live_imbal_lt_neg_100M": 0,
+            "factor_live_imbal_gt_100M":     0,
+        }
+    return {
+        "factor_live_imbal_lt_100M":     1 if imbal <  100e6 else 0,
+        "factor_live_imbal_gt_neg_100M": 1 if imbal > -100e6 else 0,
+        "factor_live_imbal_lt_neg_100M": 1 if imbal < -100e6 else 0,
+        "factor_live_imbal_gt_100M":     1 if imbal >  100e6 else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Static-day factor builders. Polled ONCE per day (atmVol pre-loop, 350 imbal
+# on first tick >= IMBAL_350_POLL_TIME). Consumed by SIGN_MATCH's
+# size_multiplier_factors to scale dollar_target + max_size on qualifying days.
+# Failure modes (poll error, None, or NO_IMBAL_VAL) -> factors stay 0 ->
+# no scale-up. Default config behavior is unchanged.
+# ---------------------------------------------------------------------------
+
+def _poll_atmvol_once():
+    """Single-shot pull of SPXW 0DTE ATM put implied vol. Returns float or None.
+    Uses the SR puts query already used inside the tick loop; satm.iloc[0] is the
+    closest-to-spot put's IV (consistent with the backtest's per-day atmVol).
+    """
+    try:
+        puts = run_query(get_closest_and_slightly_itm_puts_sql)
+        if puts is None or puts.empty:
+            return None
+        v = float(puts.satm.iloc[0])
+        if v != v:                                    # NaN guard
+            return None
+        return v
+    except Exception as e:
+        print(f"{pretty_time()} -- atmVol poll error: {e}")
+        return None
+
+
+def _atmvol_factors(atmvol):
+    """Per-day atmVol factor dict. None -> all 0 (no scale-up)."""
+    if atmvol is None:
+        return {"factor_atmVol_lt_15": 0, "factor_atmVol_gt_15": 0}
+    return {
+        "factor_atmVol_lt_15": 1 if atmvol <  0.15 else 0,
+        "factor_atmVol_gt_15": 1 if atmvol >= 0.15 else 0,
+    }
+
+
+def _imbal_350_sign_factors(imbal_350):
+    """Per-day 350 SPX imbal sign factor dict. None / NO_IMBAL_VAL -> all 0."""
+    if imbal_350 is None or imbal_350 == helpers.NO_IMBAL_VAL:
+        return {"factor_350_imbal_signed_pos": 0, "factor_350_imbal_signed_neg": 0}
+    return {
+        "factor_350_imbal_signed_pos": 1 if imbal_350 > 0 else 0,
+        "factor_350_imbal_signed_neg": 1 if imbal_350 < 0 else 0,
+    }
+
+
+def _poll_355_rebal_once():
+    """Single-shot pull of today's projected 3:55pm levered-ETF rebal (in $B).
+    Uses the light get_live_rebal_buckets helper from levered_rebal so we don't
+    pay the historical-model / similar-dates / blurb cost of run_live_estimate.
+    Returns float ($B, signed) or None on failure.
+    """
+    try:
+        # Path-inject the levered_rebal project on first use; import is cheap after.
+        import sys
+        _lib = "D:/agent_projects/levered_rebal"
+        if _lib not in sys.path:
+            sys.path.insert(0, _lib)
+        from estimate_live_rebal import get_live_rebal_buckets
+        buckets = get_live_rebal_buckets()
+        v = float(buckets.get('355pm', 0.0))
+        if v != v:                                    # NaN guard
+            return None
+        # Hand the buckets to the 350PM scripts' IMBAL_GROWS CLOSER/BUMPED adverse-rebal veto
+        # (rebal_veto.py, 9/9/2026) via the shared daily CSV. Prod only: the harness never
+        # launches this script, and a manual IS_TEST run must not overwrite the prod row.
+        # Any failure here is contained by write_rebal_355_row (never raises).
+        if not IS_TEST:
+            import rebal_veto
+            _age_td, _oldest = rebal_veto.constituency_max_age(dt.date.today())
+            rebal_veto.write_rebal_355_row(
+                trade_date=dt.date.today(), buckets=buckets,
+                poll_time_et=getNowEst().strftime("%H:%M:%S"),
+                constituency_max_age_td=_age_td, constituency_oldest_etf=_oldest,
+            )
+        return v / 1e9
+    except Exception as e:
+        print(f"{pretty_time()} -- 355 rebal poll error: {e}")
+        return None
+
+
+def _rebal_355_factors(rebal_355_B):
+    """Per-day 3:55pm rebal factor dict. None -> factor 0 (graceful degrade:
+    PUT trades allowed as if the check never happened, per the design spec).
+    """
+    if rebal_355_B is None:
+        return {"factor_355_rebal_lt_neg_9b": 0}
+    return {"factor_355_rebal_lt_neg_9b": 1 if rebal_355_B < REBAL_355_THRESHOLD_B else 0}
+
+
+def _describe_size_multiplier(factor_dict, size_multiplier_factors):
+    """Walk the rules and return (mult, matched_factor_names) for the first match.
+    No match (or empty rules) -> (1.0, None). Mirrors helpers.resolve_size_multiplier
+    but also returns which factor names lit -- useful for the trade-time log line.
+    """
+    if not size_multiplier_factors:
+        return 1.0, None
+    for factor_tuple, mult in size_multiplier_factors:
+        if all(factor_dict.get(col) == val for col, val in factor_tuple):
+            return float(mult), [col for col, _val in factor_tuple]
+    return 1.0, None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _imbal_is_fresh(capture_time, now_t):
+    """Return True if capture_time is within IMBAL_MAX_AGE_SEC of now_t.
+    capture_time / now_t are dt.time objects (today, ET).
+    """
+    if capture_time is None:
+        return False
+    today_d = dt.date.today()
+    cap_dt = dt.datetime.combine(today_d, capture_time)
+    now_dt = dt.datetime.combine(today_d, now_t)
+    return (now_dt - cap_dt).total_seconds() <= IMBAL_MAX_AGE_SEC
+
+
+def _trade_side(trade):
+    """Return 'put' or 'call' based on the structure field. prep_trades sets
+    structure to f"Put{explanation_name}" or f"Call{explanation_name}".
+    """
+    return "put" if trade["structure"].startswith("Put") else "call"
+
+
+def _build_tick_schedule():
+    """Pre-compute tick times from MAIN_LOOP_START_TIME to MAIN_LOOP_END_TIME at
+    DATA_REFRESH_INTERVAL spacing. Returns list of dt.time (ET, today).
+
+    dt.time values route wait_until to its time-only comparison branch, which
+    avoids the naive-vs-tz-aware mismatch with getNowEst() (which is tz-aware).
+    """
+    today_d = dt.date.today()
+    start = dt.datetime.combine(today_d, MAIN_LOOP_START_TIME)
+    end   = dt.datetime.combine(today_d, MAIN_LOOP_END_TIME)
+    out = []
+    cur = start
+    while cur <= end:
+        out.append(cur.time())
+        cur = cur + dt.timedelta(seconds=DATA_REFRESH_INTERVAL)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight trigger check: reuses helpers.get_size so the local fast-path uses
+# the SAME factor-tuple logic prep_trades would apply (no reimplementation).
+# Returns True if (cfg, side) is unfired AND a trade-factor tuple matches AND
+# no dont-trade-factor tuple matches.
+# ---------------------------------------------------------------------------
+
+def _config_side_can_fire(cfg, side, factor_dict, fired_keys):
+    if (cfg["name"], side) in fired_keys:
+        return False
+    cp_type = "P" if side == "put" else "C"
+    size_mult, _explanation = get_size(
+        factor_dict,
+        cp_type,
+        call_dont_trade_factors=cfg["call_dont_trade_factors"],
+        call_trade_factors=cfg["call_trade_factors"],
+        call_small_trade_factors=cfg["call_small_trade_factors"],
+        put_dont_trade_factors=cfg["put_dont_trade_factors"],
+        put_trade_factors=cfg["put_trade_factors"],
+        put_small_trade_factors=cfg["put_small_trade_factors"],
+        explanation_name=cfg.get("explanation_name", ""),
+    )
+    return size_mult > 0
+
+
+# ---------------------------------------------------------------------------
+# Trade firing (mirrors 355pm pattern)
+# ---------------------------------------------------------------------------
+
+async def _safe_send(coro, trade_name):
+    """Wrap a trade coroutine so one failure does not kill the rest."""
+    try:
+        await coro
+    except Exception as e:
+        print(f"ERROR sending trade '{trade_name}': {e}")
+
+
+def _fire_trades(trade_dict, fired_keys, now_t, trackers, btic_price, fired_details, scale_mult=None):
+    """Send any positive-size trades in trade_dict whose (name, side) has not yet fired.
+
+    Also re-checks each trade's tracker.is_valid_time(now_t) before firing as defense in
+    depth (the main loop already filters, but this guards against any caller that doesn't).
+
+    Appends one dict per fired trade to `fired_details` for use in the end-of-day recap.
+    scale_mult is the resolved size-up multiplier for this config (None when the config
+    has no size_multiplier_factors); stored in fired_details so the recap can show it.
+
+    Returns count of trades fired.
+    """
+    pending = []
+    for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+        if trade.get("size", 0) <= 0:
+            continue
+        key = (trade["name"], _trade_side(trade))
+        if key in fired_keys:
+            continue
+        tracker = trackers.get(trade["name"])
+        if tracker is not None and not tracker.is_valid_time(now_t):
+            continue
+        if trade_type == "complex":
+            order = send_complex_two_waves(
+                trade["symbol"], trade["size"], trade["short_legs"], trade["long_legs"],
+                trade["exp"], trade["account"],
+                edge_target1=trade["edge_target1"], max_edge1=trade["max_edge1"],
+                edge_target2=trade["edge_target2"], max_edge2=trade["max_edge2"],
+                is_sale=trade["is_sale"], userData=trade["name"], orderDuration=30,
+                min_price=trade.get("min_price", 0.2),
+            )
+        else:
+            order = send_outright_limit_order(
+                trade["symbol"], trade["option"], trade["size"], DIRECTION=trade["direction"],
+                ACCOUNT=trade["account"], offset=trade["offset"], userData=trade["name"],
+                orderDuration=30, min_price=trade.get("min_price", 0.2),
+            )
+        pending.append((order, trade["name"], key, trade, trade_type))
+
+    if not pending:
+        return 0
+
+    if SEND_TRADES:
+        async def _run_all():
+            await asyncio.gather(*[_safe_send(coro, name) for coro, name, _key, _t, _tt in pending])
+        asyncio.run(_run_all())
+
+    for (_coro, _name, key, _trade, _trade_type) in pending:
+        fired_keys.add(key)
+
+    # Append per-trade details for the recap. Done after fire so we only record
+    # trades that actually attempted to send.
+    for (_coro, name, key, trade, trade_type) in pending:
+        short_strikes = [round(float(l.okey_xx), 2) for l in trade.get("short_legs", [])]
+        long_strikes  = [round(float(l.okey_xx), 2) for l in trade.get("long_legs", [])]
+        fired_details.append({
+            "name":     name,
+            "side":     key[1],                              # 'put' or 'call'
+            "account":  trade.get("account"),
+            "size":     trade.get("size"),
+            "structure":trade.get("structure"),
+            "direction":trade.get("direction"),
+            "short_strikes": short_strikes,
+            "long_strikes":  long_strikes,
+            "price":    trade.get("price"),                  # net credit (sell) or debit (buy)
+            "trigger_time": now_t.strftime("%H:%M:%S"),
+            "btic_at_trigger": round(float(btic_price), 2) if btic_price is not None else None,
+            "scale_mult":      scale_mult,                   # None when config lacks size_multiplier_factors
+        })
+    return len(pending)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    if is_month_end():
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')} Not running BTIC+IMBAL script because it is month end.", my_chat)
+        sys.exit(0)
+
+    # Calendar staleness warning (SERIALS / FEDS / QUARTERLIES).
+    # QUARTERLIES drives get_btic_ticker -- if it runs out mid-day the script raises.
+    cal_warn = likely_stale_calendars()
+    if cal_warn:
+        print(f"{pretty_time()} -- CALENDAR WARNING: {cal_warn}")
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')} BTIC+IMBAL startup: {cal_warn}", my_chat)
+
+    if not SEND_TRADES and not IS_TEST:
+        raise AssertionError("SEND_TRADES is False but IS_TEST is False. Refusing to run.")
+
+    # ----- Load configs -----
+    configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs_btic_options")
+    configs = load_configs_from_directory(configs_dir, time="BTIC")
+    print("Loaded BTIC configs:")
+    for cfg in configs:
+        print(f"  {cfg['name']}")
+    if not configs:
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')} No BTIC configs loaded; exiting.", my_chat)
+        sys.exit(0)
+
+    # Required: each config must define its tracker class. Fail loud, no silent fallback.
+    for cfg in configs:
+        if "btic_tracker_cls" not in cfg:
+            raise AssertionError(
+                f"BTIC config {cfg['name']!r} is missing 'btic_tracker_cls'. "
+                f"Each config must define a BTICStateTracker subclass."
+            )
+
+    # ----- Install BTIC edge constants (baseline + VIX scaling in one call) -----
+    startup_vix   = get_vix()
+    vix_edge_mult = get_vix_edge_multiplier(startup_vix, floor=1.0)
+    install_btic_edge_constants(vix_mult=vix_edge_mult)
+    print(f"{pretty_time()} -- VIX: {startup_vix:.1f} -> Edge Mult: {vix_edge_mult:.2f}x")
+    print(f"DEBUG edges: ET1={helpers.EDGE_TARGET_2_LEGGED_1} ME1={helpers.MAX_EDGE_2_LEGGED_1} "
+          f"ET2={helpers.EDGE_TARGET_2_LEGGED_2} ME2={helpers.MAX_EDGE_2_LEGGED_2}")
+
+    # ----- Resolve + verify BTIC ticker -----
+    btic_ticker = get_btic_ticker(today=today)
+    print(f"{pretty_time()} -- Resolved BTIC ticker: {btic_ticker}")
+    btic_name = verify_btic_ticker(btic_ticker)
+    print(f"{pretty_time()} -- Ticker verified: NAME = {btic_name}")
+
+    if not IS_TEST:
+        send_message(
+            f"{getNowEst().time().strftime('%I:%M:%S %p')} Starting BTIC+IMBAL algo. "
+            f"BTIC={btic_ticker} | Edge Mult: {vix_edge_mult:.2f}x (VIX: {startup_vix:.1f})",
+            my_chat,
+        )
+
+    # ----- Fetch pre-3:45 HIGH/LOW (block until 3:45:30 so the bar at 15:44 is final) -----
+    # Skipped in test mode: HIGH/LOW / ladder / trackers are only used inside the
+    # main tick loop, which the IS_TEST branch below the 355 rebal poll exits before.
+    if not IS_TEST:
+        wait_until(dt.time(15, 45, 30))
+        print(f"{pretty_time()} -- Fetching pre-3:45 HIGH/LOW for {btic_ticker}")
+        high_pre, low_pre = fetch_pre_345_high_low(btic_ticker, today=today)
+        if high_pre is None or low_pre is None:
+            send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')} BTIC+IMBAL: no pre-3:45 bars; exiting.", my_chat)
+            sys.exit(0)
+        print(f"{pretty_time()} -- Pre-3:45: HIGH={high_pre:.2f}  LOW={low_pre:.2f}")
+
+        # ----- Build ladder + one tracker per config -----
+        # Configs opt into simultaneous-breach semantic via "simultaneous_breach": True.
+        # Default False preserves the legacy latched-breach behavior.
+        sell_levels = build_sell_levels(high_pre, low_pre)
+        buy_levels  = build_buy_levels(high_pre, low_pre)
+        trackers = {
+            cfg["name"]: cfg["btic_tracker_cls"](
+                sell_levels, buy_levels, high_pre, low_pre,
+                simultaneous_breach=cfg.get("simultaneous_breach", False),
+            )
+            for cfg in configs
+        }
+        print(f"{pretty_time()} -- Sell ladder (first 5): {sell_levels[:5]}")
+        print(f"{pretty_time()} -- Buy  ladder (first 5): {buy_levels[:5]}")
+        for name, tr in trackers.items():
+            mode = "SIMULTANEOUS" if tr.simultaneous_breach else "LATCHED"
+            print(f"{pretty_time()} -- Tracker for {name}: {type(tr).__name__} (breach_mode={mode})")
+    else:
+        print(f"{pretty_time()} -- IS_TEST=True: skipping pre-3:45 HIGH/LOW wait, "
+              f"ladder build, and tracker init (unused before early-exit).")
+
+    # ----- Static-day factor scaffolding (atmVol now, 350 imbal in main loop) -----
+    # Init all 4 to 0 so any pre-poll trigger sees no scale-up. SIGN_MATCH is the
+    # only config that consumes these; all other configs ignore them.
+    static_day_factors = {
+        "factor_atmVol_lt_15":            0,
+        "factor_atmVol_gt_15":            0,
+        "factor_350_imbal_signed_pos":    0,
+        "factor_350_imbal_signed_neg":    0,
+        "factor_355_rebal_lt_neg_9b":     0,
+    }
+    imbal_350_polled = False
+
+    # ----- 355 rebal poll @ 15:49:00 (single-shot; consumed by BAI PUT gate) -----
+    # None result -> factor stays 0 -> PUT trades allowed as if the check never
+    # happened (graceful degrade per design spec).
+    # In test mode, skip the wall-clock wait so the poll fires immediately.
+    if not IS_TEST:
+        wait_until(REBAL_355_POLL_TIME)
+    rebal_355_today = _poll_355_rebal_once()
+    static_day_factors.update(_rebal_355_factors(rebal_355_today))
+    rebal_355_str = f"{rebal_355_today:+.2f}B" if rebal_355_today is not None else "NA"
+    print(f"{pretty_time()} -- 355 rebal poll: {rebal_355_str}  "
+          f"factors={_rebal_355_factors(rebal_355_today)}")
+
+    # Test-mode early exit: verify the 355 rebal poll and stop before the atmVol
+    # poll / main tick loop. Skips the 55s wait_until(ATMVOL_POLL_TIME) and the
+    # full trading loop so you can eyeball the poll result quickly. Set
+    # IS_TEST=False (top of file) to run the full flow.
+    if IS_TEST:
+        print(f"{pretty_time()} -- IS_TEST=True: exiting after 355 rebal poll "
+              f"(before atmVol / main loop). Set IS_TEST=False to run full flow.")
+        sys.exit(0)
+
+    # ----- atmVol poll @ 15:49:55 (single-shot; reused all day) -----
+    wait_until(ATMVOL_POLL_TIME)
+    atmvol_today = _poll_atmvol_once()
+    static_day_factors.update(_atmvol_factors(atmvol_today))
+    atmvol_str = f"{atmvol_today:.4f}" if atmvol_today is not None else "NA"
+    print(f"{pretty_time()} -- atmVol poll: {atmvol_str}  factors={_atmvol_factors(atmvol_today)}")
+
+    # ----- Pre-loop wait -----
+    wait_until(MAIN_LOOP_START_TIME)
+
+    # ----- Tick loop -----
+    fired_keys = set()
+    fired_details = []   # one dict per fired trade -- used in end-of-day recap
+    tick_schedule = _build_tick_schedule()
+    print(f"{pretty_time()} -- Entering tick loop: {len(tick_schedule)} ticks scheduled "
+          f"({MAIN_LOOP_START_TIME} -> {MAIN_LOOP_END_TIME} every {DATA_REFRESH_INTERVAL}s)")
+
+    for tick_t in tick_schedule:
+        wait_until(tick_t)
+        now_t = getNowEst().time()
+
+        # Hard stop guard (covers clock drift past the schedule end).
+        if now_t >= MAIN_LOOP_END_TIME:
+            break
+
+        # ---- One-time 350 imbal poll at 15:50:10 (flag-guarded) ----
+        # Runs on first tick where now_t >= IMBAL_350_POLL_TIME. Pre-poll triggers
+        # have signed_pos/neg = 0 -> no 1.2x / no 1.8x. Mirrors backtest's
+        # fill_t >= 15:50:10 gate exactly.
+        if not imbal_350_polled and now_t >= IMBAL_350_POLL_TIME:
+            try:
+                imbal_350 = helpers.get_350_imbal()
+            except Exception as e:
+                print(f"{pretty_time()} -- 350 imbal poll error: {e}")
+                imbal_350 = None
+            static_day_factors.update(_imbal_350_sign_factors(imbal_350))
+            imbal_350_polled = True
+            imbal_350_str = (
+                f"{imbal_350/1e6:+.0f}M"
+                if (imbal_350 is not None and imbal_350 != helpers.NO_IMBAL_VAL)
+                else "NA"
+            )
+            print(f"{pretty_time()} -- 350 imbal poll: {imbal_350_str}  factors={_imbal_350_sign_factors(imbal_350)}")
+
+        # ---- Determine which configs are active right now ----
+        # Per-config tracker.is_valid_time decides. If no config is valid, skip the
+        # tick ENTIRELY -- no BDP, no DB, no tracker update. Prevents cross-config
+        # contamination through latched breaches in dead windows.
+        active_cfgs = [cfg for cfg in configs if trackers[cfg["name"]].is_valid_time(now_t)]
+        if not active_cfgs:
+            continue
+
+        # ---- Poll BTIC + imbal (once, shared across active configs) ----
+        btic_price = poll_btic_price(btic_ticker)
+        if btic_price is None:
+            print(f"{pretty_time()} -- BTIC poll returned None; skipping tick")
+            continue
+        imbal, capture_time = poll_latest_imbal()
+        fresh = _imbal_is_fresh(capture_time, now_t)
+
+        # Per-tick poll log: useful for post-hoc debugging from saved script logs.
+        imbal_str = f"{imbal/1e6:+.0f}M" if imbal is not None else "NA"
+        cap_str   = capture_time.strftime("%H:%M:%S") if capture_time is not None else "NA"
+        print(f"{pretty_time()} -- poll BTIC={btic_price:.2f}  Imbal={imbal_str}  cap={cap_str}  fresh={fresh}")
+
+        # ---- Update only the active trackers (others stay frozen at last valid state) ----
+        for cfg in active_cfgs:
+            trackers[cfg["name"]].update(btic_price, ts=tick_t, gate_open=fresh)
+
+        # ---- Local trigger pre-flight: skip chain refresh + prep_trades entirely
+        #      on ticks where no config has a live trigger. This is the vast majority. ----
+        live_imbal_factors = _build_live_imbal_factors(imbal if fresh else None)
+        configs_to_prep = []
+        for cfg in active_cfgs:
+            factor_dict = trackers[cfg["name"]].factor_dict()
+            factor_dict.update(live_imbal_factors)
+            factor_dict.update(static_day_factors)   # atmVol + 350 imbal sign (SIGN_MATCH scale-up)
+            if (_config_side_can_fire(cfg, "put",  factor_dict, fired_keys) or
+                _config_side_can_fire(cfg, "call", factor_dict, fired_keys)):
+                configs_to_prep.append((cfg, factor_dict))
+
+        if not configs_to_prep:
+            continue  # no triggers live -- skip chain refresh + prep_trades
+
+        # ---- Refresh chain once for this tick (only reached when a trigger is live) ----
+        try:
+            calls = run_query(get_closest_and_slightly_itm_calls_sql)
+            puts  = run_query(get_closest_and_slightly_itm_puts_sql)
+        except Exception as e:
+            print(f"{pretty_time()} -- chain query error: {e}; skipping tick")
+            continue
+        if calls is None or puts is None or calls.empty or puts.empty:
+            print(f"{pretty_time()} -- empty chain; skipping tick")
+            continue
+
+        spx = puts.uprc[0]
+        option_chains = {"SPXW": {
+            "puts":  puts.reset_index(drop=True),
+            "calls": calls.reset_index(drop=True),
+            "underlying": spx,
+        }}
+
+        # ---- prep_trades per ready config ----
+        # Live-reload SIZE_MULT_BTIC_PUTS/CALLS once per tick (only when we're actually
+        # about to fire something -- configs_to_prep is non-empty). Mid-run edits to
+        # algo_globals.py take effect on the next tick.
+        from algo_globals import get_live_size_mults
+        _puts_mult_btic, _calls_mult_btic = get_live_size_mults("BTIC")
+        print(f"{pretty_time()} -- Live size mults (BTIC): puts={_puts_mult_btic}, calls={_calls_mult_btic}")
+        total_fired_this_tick = 0
+        for cfg, factor_dict in configs_to_prep:
+            try:
+                trade_dict, _expl = prep_trades(
+                    configs=[cfg],
+                    factor_dict=factor_dict,
+                    option_chains=option_chains,
+                    today=today,
+                    trigger_all=False,
+                    trigger_all_size=0,
+                    magnets=[],
+                    puts_size_mult=_puts_mult_btic,
+                    calls_size_mult=_calls_mult_btic,
+                )
+            except Exception as e:
+                print(f"{pretty_time()} -- prep_trades error for {cfg['name']}: {e}; skipping config this tick")
+                continue
+
+            # Resolve scale_mult once per (cfg, tick). None for configs without
+            # size_multiplier_factors -> recap suppresses the suffix for them.
+            cfg_scale_mult = None
+            if cfg.get("size_multiplier_factors"):
+                cfg_scale_mult, matched = _describe_size_multiplier(factor_dict, cfg["size_multiplier_factors"])
+                if any(t.get("size", 0) > 0 for t in trade_dict.get("trades", [])):
+                    if matched is not None:
+                        print(f"{pretty_time()} -- {cfg['name']} scale_mult={cfg_scale_mult}x  matched=[{', '.join(matched)}]")
+                    else:
+                        print(f"{pretty_time()} -- {cfg['name']} scale_mult=1.0x  (no rule matched)")
+
+            total_fired_this_tick += _fire_trades(trade_dict, fired_keys, now_t, trackers, btic_price, fired_details, scale_mult=cfg_scale_mult)
+
+        if total_fired_this_tick:
+            print(f"{pretty_time()} -- Fired {total_fired_this_tick} trade(s). BTIC={btic_price:.2f} "
+                  f"Imbal={imbal/1e6 if imbal is not None else 'NA'}M  fresh={fresh}")
+            print(f"{pretty_time()} -- fired_keys now: {fired_keys}")
+
+        # Early exit: every config has fired both sides -- nothing more to do this day.
+        max_possible_keys = 2 * len(configs)  # one per (config, side)
+        if len(fired_keys) >= max_possible_keys:
+            print(f"{pretty_time()} -- All sides fired ({len(fired_keys)}); exiting loop")
+            break
+
+    # ----- Summary -----
+    summary = f"{dt.date.today().strftime('%m/%d/%Y')} BTIC+IMBAL RECAP:\n\n"
+    summary += f"BTIC ticker: {btic_ticker}. Pre-3:45 HIGH={high_pre:.2f} LOW={low_pre:.2f}.\n"
+    for name, tr in trackers.items():
+        summary += (f"{name}: last={tr.last_price}  running max={tr.running_max}  "
+                    f"min={tr.running_min}  updates={tr.n_updates}.\n")
+    summary += f"Edge Mult: {vix_edge_mult:.2f}x (VIX: {startup_vix:.1f}).\n"
+
+    # Per-trade detail block: one line per fired trade, grouped by config name.
+    # Format mirrors 355pm's summary_dict but appends trigger time + BTIC@trigger.
+    if fired_details:
+        per_cfg = {}
+        for d in fired_details:
+            key = f"*{d['name']}* ({d['account']})"
+            per_cfg.setdefault(key, []).append(d)
+        for header, trades in per_cfg.items():
+            summary += f"\n{header}:\n"
+            for d in trades:
+                # Sell credit spread shows SHORT first, then LONG; buy shows LONG first.
+                if d['direction'] == 'Sell':
+                    legs = f"{' '.join(str(k) for k in d['short_strikes'])} {' '.join(str(k) for k in d['long_strikes'])}"
+                else:
+                    legs = f"{' '.join(str(k) for k in d['long_strikes'])} {' '.join(str(k) for k in d['short_strikes'])}"
+                price_str = f"{d['price']}" if d['price'] is not None else "?"
+                btic_str  = f"{d['btic_at_trigger']}" if d['btic_at_trigger'] is not None else "?"
+                scale_suffix = f" (scale: {d['scale_mult']}x)" if d.get('scale_mult') is not None else ""
+                summary += (f"{d['direction']} {d['size']} SPXW {legs} {d['structure']} "
+                            f"for {price_str} @ {d['trigger_time']} (BTIC={btic_str}){scale_suffix}\n")
+    else:
+        summary += "\nNo trades fired today.\n"
+
+    print(summary)
+    send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary, my_chat)

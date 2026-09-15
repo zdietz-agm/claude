@@ -1,0 +1,124 @@
+"""End-to-end escalation test for the hacker W3/W4 redesign (9/11/26).
+
+Drives hacker_trades._fire_one -- the REAL path: send_complex_two_waves (W1+W2), the W3
+NBBO refresh + Seeker/Simple send, the announced 10s sleep, the status-gated fill check,
+and the W4 refreshed-NBBO rest. Early waves are made unmarketable ON PURPOSE so the
+escalation actually runs. Buys back an SPXW 0DTE put spread (1 lot, default 7655/7650).
+
+Scenarios:
+  --scenario w3fill   W1/W2 unmarketable (max_edge -0.15 -> limits ~20c below market);
+                      W3 prices normally off the live NBBO and should fill.
+  --scenario w4fill   Same, PLUS HACK_W3_NBBO_OFFSET patched to -0.20 for this process so
+                      W3 is also unmarketable; W4 (normal +0.15 offset) should fill.
+
+TEST ACCOUNTS ONLY (T.*). W4's rest is capped at 60s here (not the prod 310s) so nothing
+lingers. Prod files are NOT modified -- the w4fill patch is process-local.
+
+Usage (scratch/.venv python):
+  .../python.exe test_hacker_w34_escalation.py --book v7 --scenario w3fill --send
+"""
+import argparse
+import asyncio
+import datetime as dt
+import sys
+
+sys.path.insert(0, "D:/PycharmProjects/scratch/algos/")
+sys.path.insert(0, "D:/PycharmProjects/utils/")
+
+ACCOUNTS = {"v7": "T.AGM", "v8": "T.AGMV8.01"}
+# -0.15 keeps the W1/W2 limits a VALID small debit (~0.10 vs a ~0.30 cross) that just
+# never fills; a bigger negative edge would flip the limit to a credit and risk an
+# InvldParentLimit reject instead of a clean no-fill.
+UNMARKETABLE_EDGE = -0.15
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--book", choices=["v7", "v8"], required=True)
+    ap.add_argument("--scenario", choices=["w3fill", "w4fill"], required=True)
+    ap.add_argument("--send", action="store_true", help="actually send; default dry-run")
+    ap.add_argument("--lots", type=int, default=1,
+                    help="order size; with >1 lots PREMIUM_LIMIT is patched down (this "
+                         "process only) so every wave chunks into 1-lot orders, exercising "
+                         "trade_complex's chunked branch with the new kwargs")
+    ap.add_argument("--buy-strike", type=float, default=7655.0)
+    ap.add_argument("--sell-strike", type=float, default=7650.0)
+    args = ap.parse_args()
+
+    account = ACCOUNTS[args.book]
+    assert account.startswith("T."), f"refusing: {account} is not a T.* test account"
+
+    import spdr_rock_order_functions as srof
+    from spdr_rock_functions import run_query
+    if args.book == "v8":
+        srof.use_v8(True)
+    import hacker_trades as ht
+
+    # Keep the test short-lived: W4 rests 60s max instead of prod's 310s.
+    ht.WAVE_REST_MAX_DURATION_S = 60
+    if args.scenario == "w4fill":
+        ht.HACK_W3_NBBO_OFFSET = -0.20   # process-local: W3 bids ~cross-0.20, unmarketable -> W4
+        print(f"scenario w4fill: HACK_W3_NBBO_OFFSET patched to {ht.HACK_W3_NBBO_OFFSET} "
+              f"(this process only)")
+
+    if args.lots > 1:
+        # Force chunking: cap per-order premium below one lot's worth so trade_complex
+        # splits every wave into 1-lot chunks. Process-local, prod file untouched.
+        srof.PREMIUM_LIMIT = 1
+        print(f"--lots {args.lots}: PREMIUM_LIMIT patched to $1 (this process only) -> "
+              f"every wave chunks into {args.lots} x 1-lot orders")
+    BUY_STRIKE, SELL_STRIKE = args.buy_strike, args.sell_strike
+    today = dt.date.today()
+    table = ht._nbbo_table()
+    # Mirror _fetch_legs's columns: refresh_legs at the W1->W2 transition needs the full
+    # okey_* identity (okey_tk etc.) on every leg -- a slimmer SELECT crashed the 9/11 run.
+    sql = (f"SELECT okey_at, okey_ts, okey_tk, okey_yr, okey_mn, okey_dy, okey_xx, okey_cp, "
+           f"sprc, obid, oask, timestamp FROM {table} "
+           f"WHERE (okey_tk, okey_xx, okey_cp, okey_yr, okey_mn, okey_dy) IN ("
+           f"('SPXW',{BUY_STRIKE},'Put',{today.year},{today.month},{today.day}),"
+           f"('SPXW',{SELL_STRIKE},'Put',{today.year},{today.month},{today.day}))")
+    df = run_query(sql, database="sranalytics", verbose=True, tag="w34_escalation_test")
+    assert df is not None and len(df) == 2, "quote pull failed"
+    rows = {float(r.okey_xx): r for _, r in df.iterrows()}
+    buy_leg, sell_leg = rows[BUY_STRIKE], rows[SELL_STRIKE]
+    cross = float(buy_leg.oask) - float(sell_leg.obid)
+    print(f"[{args.book}/{args.scenario}] {table}")
+    print(f"  buy  {BUY_STRIKE:.0f}P nbbo {float(buy_leg.obid):.2f}/{float(buy_leg.oask):.2f}")
+    print(f"  sell {SELL_STRIKE:.0f}P nbbo {float(sell_leg.obid):.2f}/{float(sell_leg.oask):.2f}")
+    print(f"  buy-back cross {cross:.2f}; W1/W2 limits will sit ~{-UNMARKETABLE_EDGE:.2f} below "
+          f"market (edge {UNMARKETABLE_EDGE}); cap {-ht.HACK_MAX_PRICE}")
+    if cross + max(ht.HACK_W3_NBBO_OFFSET, ht.HACK_W4_NBBO_OFFSET) >= ht.HACK_MAX_PRICE:
+        print(f"  !!! cross + offset >= cap {ht.HACK_MAX_PRICE}: W3/W4 will CLAMP TO THE CAP")
+        print("  !!! and likely NOT fill -- that tests the cap-binding path, not the fill path.")
+        print("  !!! Pick a cheaper spread (--buy-strike/--sell-strike) to test fills.")
+
+    if not args.send:
+        print("DRY RUN -- no orders sent. Re-run with --send.")
+        return
+
+    trade = {
+        "name": f"HACK_W34_ESCALATION_{args.scenario.upper()}_{args.book.upper()}",
+        "symbol": "SPXW", "size": args.lots,
+        "long_legs": [buy_leg], "short_legs": [sell_leg],
+        "exp": today, "account": account, "is_sale": False,
+        "edge_target1": 0.02, "max_edge1": UNMARKETABLE_EDGE,
+        "edge_target2": 0.02, "max_edge2": UNMARKETABLE_EDGE,
+        "min_price": -ht.HACK_MAX_PRICE,
+        "grouping_codes": None,
+    }
+    log_fn = lambda msg: print(f"{dt.datetime.now().time()} -- [test] {msg}")
+    codes = asyncio.run(ht._fire_one(trade, orderDuration=10, log_fn=log_fn))
+    print(f"\nall grouping_codes={codes}")
+    print(f"wave3={trade.get('wave3_grouping_codes')} wave4={trade.get('wave4_grouping_codes')}")
+
+    codes_csv = ",".join(f"'{gc}'" for gc in codes)
+    qty = "cumSquareQty" if args.book == "v8" else "fillQuan1"
+    st = run_query(f"SELECT groupingcode, spdrOrderStatus, spdrCloseReason, spdrRejectReason, "
+                   f"{qty} FROM srtrade.msgsrmlegbrkrstate WHERE groupingcode IN ({codes_csv})",
+                   "srtrade")
+    print(st.to_string(index=False) if st is not None and not st.empty else "no state rows")
+    print("\nNOTE: if wave 4 is resting unfilled it self-expires within 60s; nothing to clean up.")
+
+
+if __name__ == "__main__":
+    main()

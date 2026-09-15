@@ -1,0 +1,328 @@
+#%% Imports
+import datetime as dt
+import numpy as np
+import pandas as pd
+import sys
+from IPython.display import display
+
+from sqlalchemy import create_engine, text
+from xbbg import blp
+
+sys.path.insert(0, 'd:/PycharmProjects/utils/')
+from calendar_utils import SERIALS, x_days_ago
+
+pd.set_option('display.max_columns', 30)
+pd.set_option('display.width', 200)
+
+#%% Reimport helpers
+import importlib
+import calendar_utils
+importlib.reload(calendar_utils)
+from calendar_utils import SERIALS, x_days_ago
+
+#%% Global Variables & Configuration
+# (listed_date, listed_index_value) pairs provided by user
+LISTED = [
+    ("2022-02-18", 14800), ("2022-03-18", 14075), ("2022-04-14", 14225),
+    ("2022-05-20", 14050), ("2022-06-17", 11800), ("2022-07-15", 11150),
+    ("2022-08-19", 11925), ("2022-09-16", 13250), ("2022-10-21", 11750),
+    ("2022-11-18", 11050), ("2022-12-16", 11650), ("2023-01-20", 11275),
+    ("2023-02-17", 11425), ("2023-03-17", 12300), ("2023-04-21", 12525),
+    ("2023-05-19", 12975), ("2023-06-16", 13850), ("2023-07-21", 15200),
+    ("2023-08-18", 15475), ("2023-09-15", 14625), ("2023-10-20", 15250),
+    ("2023-11-17", 14600), ("2023-12-15", 15825), ("2024-01-19", 16650),
+    ("2024-02-16", 17100), ("2024-03-15", 17750), ("2024-04-19", 17900),
+    ("2024-05-17", 17250), ("2024-06-21", 18600), ("2024-07-19", 19750),
+    ("2024-08-16", 19650), ("2024-09-20", 19450), ("2024-10-18", 19725),
+    ("2024-11-15", 20300), ("2024-12-20", 20475), ("2025-01-17", 21275),
+    ("2025-02-21", 21450), ("2025-03-21", 21950), ("2025-04-17", 19600),
+    ("2025-05-16", 18200), ("2025-06-20", 21325), ("2025-07-18", 21625),
+    ("2025-08-15", 23050), ("2025-09-19", 23725), ("2025-10-17", 24525),
+    ("2025-11-21", 24600), ("2025-12-19", 23950), ("2026-01-16", 25250),
+    ("2026-02-20", 25550), ("2026-03-20", 25075), ("2026-04-17", 24100),
+    ("2026-05-15", 26700),
+    ("2026-06-18", 29200),  # THURSDAY expiry (not Friday), day prior is 2026-06-17
+    ("2026-07-17", 30325),
+    ("2026-08-21", 28550),
+]
+
+NDX_THRESHOLD_PCT = 0.02          # 2% higher than listed index value
+IMBAL_CUTOFF = 300_000_000        # $300M
+SNAP_TIME = "15:50:01"            # target snap
+
+# VBAM DB (imbalances + ETF NAV)
+VBAM_HOST = "alpine-vbam-prod.c7wvpkbyvjzb.us-east-1.rds.amazonaws.com"
+VBAM_USER = "VBAM_Read"
+VBAM_PASS = "read-VBAM-^6"
+
+MARKET_RATIO_CSV = "D:/PycharmProjects/scratch/imbal_research/data/spy_daily_moves_50_01.csv"
+
+#%% Clear caches (run this cell to force re-pull of data)
+def clear_caches():
+    """Clear all cached data to force fresh pull on next run."""
+    cache_vars = ['ndx_closes', 'imbal_df', 'twap_df', 'nav_df', 'market_ratio_df']
+    cleared = []
+    for var in cache_vars:
+        if var in globals():
+            del globals()[var]
+            cleared.append(var)
+    if cleared:
+        print(f"Cleared caches: {', '.join(cleared)}")
+    else:
+        print("No caches to clear")
+
+# Uncomment to clear: clear_caches()
+
+#%% Helper Functions
+def get_vbam_engine(db):
+    """Create VBAM DB engine for given schema."""
+    return create_engine(f'mysql+pymysql://{VBAM_USER}:{VBAM_PASS}@{VBAM_HOST}/{db}')
+
+def parse_date(s):
+    """Convert 'YYYY-MM-DD' string to date."""
+    return dt.datetime.strptime(s, "%Y-%m-%d").date()
+
+def classify_market_type(market_ratio):
+    """Up if > 0.5, Down if < -0.5, else Flat."""
+    if pd.isna(market_ratio):
+        return None
+    if market_ratio > 0.5:
+        return "Up"
+    if market_ratio < -0.5:
+        return "Down"
+    return "Flat"
+
+#%% Step 1: Validate all listed dates are in SERIALS
+listed_df = pd.DataFrame(LISTED, columns=["listed_date", "listed_index"])
+listed_df["listed_date"] = listed_df["listed_date"].apply(parse_date)
+
+serials_set = set(SERIALS)
+not_in_serials = [d for d in listed_df["listed_date"] if d not in serials_set]
+if not_in_serials:
+    print(f"WARNING: {len(not_in_serials)} listed dates NOT in SERIALS:")
+    for d in not_in_serials:
+        print(f"  {d}")
+else:
+    print(f"All {len(listed_df)} listed dates are valid SERIALS.")
+
+#%% Step 2: Get prior trading day for each listed date
+listed_df["prior_day"] = listed_df["listed_date"].apply(lambda d: x_days_ago(1, d))
+
+print("Sanity check - prior trading day mapping:")
+display(listed_df.head())
+
+#%% Cache: NDX close prices from Bloomberg
+if 'ndx_closes' not in dir():
+    start = min(listed_df["prior_day"]) - dt.timedelta(days=3)
+    end = max(listed_df["prior_day"]) + dt.timedelta(days=3)
+    ndx_closes = blp.bdh("NDX Index", "PX_LAST", start, end, adjust="-")
+    # Flatten MultiIndex columns
+    ndx_closes.columns = ["ndx_close"]
+    ndx_closes.index = pd.to_datetime(ndx_closes.index).date
+
+print(f"Pulled NDX closes: {len(ndx_closes)} days")
+print("Sanity check - NDX closes sample:")
+display(ndx_closes.tail())
+
+#%% Step 3: Merge NDX close on prior_day, flag > 2% above listed index
+listed_df["ndx_close_prior"] = listed_df["prior_day"].map(ndx_closes["ndx_close"])
+listed_df["pct_above_listed"] = listed_df["ndx_close_prior"] / listed_df["listed_index"] - 1
+listed_df["flag_gt_2pct"] = listed_df["pct_above_listed"] > NDX_THRESHOLD_PCT
+
+print(f"\nFlagged days (NDX prior close > 2% above listed index): {listed_df['flag_gt_2pct'].sum()}")
+print("Sanity check - flagged subset:")
+display(listed_df[listed_df["flag_gt_2pct"]].head())
+
+#%% Cache: imbal + spy_price at 15:50:01 + NAV for flagged prior days
+flagged_prior_days = listed_df.loc[listed_df["flag_gt_2pct"], "prior_day"].tolist()
+
+if 'imbal_df' not in dir() and len(flagged_prior_days) > 0:
+    dates_sql_list = ", ".join(f"'{d.strftime('%Y-%m-%d')}'" for d in flagged_prior_days)
+
+    engine = get_vbam_engine("auctionResearch")
+    query = text(f"""
+        SELECT
+            i.business_date,
+            i.snap_time,
+            i.spy_exchange_net_imbalance,
+            i.spy_price,
+            b.officialNavUSD AS spy_nav
+        FROM auctionResearch.t_report_consolidated_imbalances i
+        LEFT JOIN compositions.t_compositions_ETFDailyBasketHeaders b
+            ON i.business_date = b.navDate AND b.etfTicker = 'SPY'
+        WHERE i.business_date IN ({dates_sql_list})
+          AND i.snap_time = '{SNAP_TIME}'
+    """)
+    with engine.connect() as conn:
+        imbal_df = pd.read_sql(query, conn)
+    engine.dispose()
+
+    imbal_df["business_date"] = pd.to_datetime(imbal_df["business_date"]).dt.date
+    imbal_df["snap_time"] = imbal_df["snap_time"].astype(str).str.replace("0 days ", "", regex=False)
+
+    print(f"Pulled {len(imbal_df)} imbalance rows for {imbal_df['business_date'].nunique()} unique dates")
+    print("Sanity check - imbalance/NAV sample:")
+    display(imbal_df.head())
+
+#%% Cache: SPY 10-minute TWAP price for flagged prior days
+if 'twap_df' not in dir() and len(flagged_prior_days) > 0:
+    dates_sql_list = ", ".join(f"'{d.strftime('%Y-%m-%d')}'" for d in flagged_prior_days)
+
+    engine = get_vbam_engine("auctionResearch")
+    query = text(f"""
+        SELECT
+            business_date,
+            `10m_TWAP` AS spy_twap
+        FROM auctionResearch.t_report_twap_imbalance_analysis
+        WHERE ticker = 'SPY'
+          AND business_date IN ({dates_sql_list})
+    """)
+    with engine.connect() as conn:
+        twap_df = pd.read_sql(query, conn)
+    engine.dispose()
+
+    twap_df["business_date"] = pd.to_datetime(twap_df["business_date"]).dt.date
+
+    print(f"Pulled {len(twap_df)} TWAP rows for {twap_df['business_date'].nunique()} unique dates")
+    print("Sanity check - TWAP sample:")
+    display(twap_df.head())
+
+#%% Cache: market_ratio (market_type) from 50_01 CSV
+if 'market_ratio_df' not in dir():
+    market_ratio_df = pd.read_csv(MARKET_RATIO_CSV)
+    market_ratio_df["date"] = pd.to_datetime(market_ratio_df["date"]).dt.date
+    market_ratio_df = market_ratio_df[["date", "market_ratio"]]
+
+print("Sanity check - market_ratio sample:")
+display(market_ratio_df.tail())
+
+#%% Step 4: Combine into analysis frame
+ana = listed_df[listed_df["flag_gt_2pct"]].merge(
+    imbal_df.rename(columns={"business_date": "prior_day"}),
+    on="prior_day",
+    how="left",
+)
+ana = ana.merge(
+    twap_df.rename(columns={"business_date": "prior_day"}),
+    on="prior_day",
+    how="left",
+)
+ana = ana.merge(
+    market_ratio_df.rename(columns={"date": "prior_day"}),
+    on="prior_day",
+    how="left",
+)
+ana["market_type"] = ana["market_ratio"].apply(classify_market_type)
+
+# Return in bps from 3:50:01 spy_price to NAV
+ana["return_bps"] = (ana["spy_nav"] / ana["spy_price"] - 1) * 10000
+# Return in bps from 10-minute TWAP price to NAV
+ana["return_twap_bps"] = (ana["spy_nav"] - ana["spy_twap"]) / ana["spy_twap"] * 10000
+
+# Imbal bucket
+ana["imbal_bucket"] = np.where(ana["spy_exchange_net_imbalance"] > IMBAL_CUTOFF, ">300M",
+                        np.where(ana["spy_exchange_net_imbalance"] < -IMBAL_CUTOFF, "<-300M", "|imbal|<=300M"))
+
+# Also simpler two-way split per user request: imbal > 300M vs imbal < 300M
+ana["imbal_gt_300m"] = ana["spy_exchange_net_imbalance"] > IMBAL_CUTOFF
+ana["imbal_lt_neg_300m"] = ana["spy_exchange_net_imbalance"] < -IMBAL_CUTOFF
+
+print("\nAnalysis frame (flagged days with imbal/NAV/market_type):")
+display(ana[["listed_date", "prior_day", "listed_index", "ndx_close_prior", "pct_above_listed",
+             "spy_exchange_net_imbalance", "spy_price", "spy_twap", "spy_nav", "market_type",
+             "return_bps", "return_twap_bps"]])
+
+#%% Step 5: Summary table — avg & median return by imbal bucket
+def summary_row(label, df):
+    if len(df) == 0:
+        return dict(bucket=label, n=0, avg_bps=np.nan, median_bps=np.nan,
+                    avg_imbal_m=np.nan, n_up=0, n_down=0, n_flat=0)
+    return dict(
+        bucket=label,
+        n=len(df),
+        avg_bps=df["return_bps"].mean(),
+        median_bps=df["return_bps"].median(),
+        win_rate_buying_pct=(df["return_bps"] > 0).mean() * 100,
+        avg_twap_bps=df["return_twap_bps"].mean(),
+        median_twap_bps=df["return_twap_bps"].median(),
+        win_rate_twap_pct=(df["return_twap_bps"] > 0).mean() * 100,
+        avg_imbal_m=df["spy_exchange_net_imbalance"].mean() / 1e6,
+        n_up=(df["market_type"] == "Up").sum(),
+        n_down=(df["market_type"] == "Down").sum(),
+        n_flat=(df["market_type"] == "Flat").sum(),
+    )
+
+ana_valid = ana.dropna(subset=["return_bps", "spy_exchange_net_imbalance"]).copy()
+
+summary_rows = [
+    summary_row("imbal > +300M", ana_valid[ana_valid["spy_exchange_net_imbalance"] >  IMBAL_CUTOFF]),
+    summary_row("imbal < -300M", ana_valid[ana_valid["spy_exchange_net_imbalance"] < -IMBAL_CUTOFF]),
+    summary_row("|imbal| <= 300M", ana_valid[ana_valid["spy_exchange_net_imbalance"].abs() <= IMBAL_CUTOFF]),
+    summary_row("ALL flagged",  ana_valid),
+]
+summary_df = pd.DataFrame(summary_rows)
+summary_df["avg_bps"] = summary_df["avg_bps"].round(2)
+summary_df["median_bps"] = summary_df["median_bps"].round(2)
+summary_df["win_rate_buying_pct"] = summary_df["win_rate_buying_pct"].round(1)
+summary_df["avg_twap_bps"] = summary_df["avg_twap_bps"].round(2)
+summary_df["median_twap_bps"] = summary_df["median_twap_bps"].round(2)
+summary_df["win_rate_twap_pct"] = summary_df["win_rate_twap_pct"].round(1)
+summary_df["avg_imbal_m"] = summary_df["avg_imbal_m"].round(1)
+
+print("\n==== SUMMARY: SPY 3:50:01 -> NAV return (bps), flagged days only ====")
+display(summary_df)
+
+#%% Step 6: Export raw results to Excel
+from openpyxl.utils import get_column_letter
+
+timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M')
+filepath = f'C:/Users/zdietz/Downloads/qyld_ndx_flag_analysis_{timestamp}.xlsx'
+
+# Build full detail frame (all listed dates with NDX check), plus flagged-only detail
+full_detail = listed_df.copy()
+full_detail["ndx_close_prior"] = full_detail["ndx_close_prior"].round(2)
+full_detail["pct_above_listed"] = (full_detail["pct_above_listed"] * 100).round(3)  # as %
+full_detail = full_detail.rename(columns={"pct_above_listed": "pct_above_listed_%"})
+
+flagged_detail = ana[[
+    "listed_date", "prior_day", "listed_index", "ndx_close_prior", "pct_above_listed",
+    "spy_exchange_net_imbalance", "spy_price", "spy_twap", "spy_nav", "market_ratio",
+    "market_type", "return_bps", "return_twap_bps",
+]].copy()
+flagged_detail["ndx_close_prior"] = flagged_detail["ndx_close_prior"].round(2)
+flagged_detail["pct_above_listed"] = (flagged_detail["pct_above_listed"] * 100).round(3)
+flagged_detail["market_ratio"] = flagged_detail["market_ratio"].round(3)
+flagged_detail["return_bps"] = flagged_detail["return_bps"].round(2)
+flagged_detail["return_twap_bps"] = flagged_detail["return_twap_bps"].round(2)
+flagged_detail = flagged_detail.rename(columns={"pct_above_listed": "pct_above_listed_%"})
+
+dfs_to_write = {
+    "Summary": summary_df,
+    "Flagged Detail": flagged_detail,
+    "All Dates": full_detail,
+}
+
+dollar_cols = {"spy_price", "spy_twap", "spy_nav", "ndx_close_prior", "listed_index",
+               "spy_exchange_net_imbalance", "avg_imbal_m"}
+
+with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+    for sheet_name, df in dfs_to_write.items():
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+        ws = writer.sheets[sheet_name]
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = 'C2'
+
+        for col_idx, col_name in enumerate(df.columns, 1):
+            col_letter = get_column_letter(col_idx)
+            max_len = max(
+                len(str(col_name)),
+                df[col_name].astype(str).str.len().max() if len(df) > 0 else 0,
+            )
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 22)
+
+            if col_name in dollar_cols:
+                for row in range(2, len(df) + 2):
+                    ws[f'{col_letter}{row}'].number_format = '_($* #,##0.00_);[Red]_($* (#,##0.00)'
+
+print(f'\nSaved: {filepath}')
+

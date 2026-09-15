@@ -1,0 +1,182 @@
+"""
+Large index flows -- step 2a: pull 0DTE option quotes (1-sec NBBO bars) for the
+last hour of every effective date in intraday_prices.csv and save them to
+optionsResearch.t_opra_quotes (VBAM dev) so the whole team can reuse them.
+
+Per (symbol, eff_date):
+  * chain  = ThetaData v3 0DTE contracts quoted that day (exp == eff_date; index
+             effective dates are 3rd Fridays so the monthly expires that day)
+  * strikes = |strike - px_1500| <= BAND_PCT (8%) of the 15:00 CloudQuant price,
+              calls AND puts (wide enough for any 15:00-15:50 entry point)
+  * window  = 15:00:00 - 16:00:00, interval 1s, one ThetaData request per contract
+  * rows are appended to t_opra_quotes as each contract lands; a per-pair
+    checkpoint row goes to _pull_meta.csv when the pair is complete
+
+Resumable: pairs in _pull_meta.csv with status ok/no_chain/no_strikes are
+skipped. A pair that died mid-pull (rows in DB, no meta row) is wiped from
+t_opra_quotes (symbol + trade_date + exp) and re-pulled cleanly. --force wipes
+and re-pulls everything.
+
+Run from Git Bash:
+    python /d/agent_projects/large_index_flows/pull_0dte_quotes.py
+    python /d/agent_projects/large_index_flows/pull_0dte_quotes.py --dry-run     # no DB writes
+    python /d/agent_projects/large_index_flows/pull_0dte_quotes.py --force       # wipe + re-pull
+"""
+import argparse
+import datetime as dt
+import os
+import sys
+import time
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import vbam_helpers
+from thetadata_helpers import check_v3_connection, get_bulk_chain_v3, get_option_quotes_v3
+
+PROJ_DIR = 'D:/agent_projects/large_index_flows'
+PRICES_CSV = os.path.join(PROJ_DIR, 'intraday_prices.csv')
+META_CSV = os.path.join(PROJ_DIR, '_pull_meta.csv')
+TABLE = 't_opra_quotes'
+
+BAND_PCT = 0.08                  # strikes within +/- 8% of the 15:00 price
+START_TIME = dt.time(15, 0, 0)
+END_TIME = dt.time(16, 0, 0)
+INTERVAL = '1s'
+SLEEP_BETWEEN_CALLS = 0.2        # ThetaData pacing rule: >= 0.1s between requests
+DONE_STATUSES = {'ok', 'no_chain', 'no_strikes'}
+
+
+def log(msg):
+    """Print with flush so progress shows up live in Git Bash."""
+    print(msg, flush=True)
+
+
+def load_events(min_flow_bn):
+    """Events from intraday_prices.csv with est_flow_bn >= min_flow_bn, newest first."""
+    ev = pd.read_csv(PRICES_CSV, parse_dates=['eff_date'])
+    ev = ev[ev['est_flow_bn'] >= min_flow_bn].copy()
+    ev['eff_date'] = ev['eff_date'].dt.date
+    return ev.sort_values(['eff_date', 'symbol'], ascending=[False, True]).reset_index(drop=True)
+
+
+def load_meta():
+    """Completed (symbol, eff_date) pairs from the checkpoint CSV."""
+    if not os.path.exists(META_CSV):
+        return set()
+    m = pd.read_csv(META_CSV, parse_dates=['eff_date'])
+    m = m[m['status'].isin(DONE_STATUSES)]
+    return {(r.symbol, r.eff_date.date()) for r in m.itertuples()}
+
+
+def append_meta(row):
+    """Append one checkpoint row to _pull_meta.csv."""
+    pd.DataFrame([row]).to_csv(META_CSV, mode='a', index=False, header=not os.path.exists(META_CSV))
+
+
+def rows_in_db(eng, symbol, date):
+    """Count of 0DTE rows already in t_opra_quotes for (symbol, date)."""
+    with eng.connect() as c:
+        return c.execute(text(
+            f"SELECT COUNT(*) FROM {TABLE} WHERE symbol = :s AND trade_date = :d AND exp = :d"),
+            {'s': symbol, 'd': date}).scalar()
+
+
+def wipe_db(eng, symbol, date):
+    """Delete the 0DTE rows for (symbol, date) so a re-pull starts clean."""
+    with eng.connect() as c:
+        n = c.execute(text(
+            f"DELETE FROM {TABLE} WHERE symbol = :s AND trade_date = :d AND exp = :d"),
+            {'s': symbol, 'd': date}).rowcount
+        c.commit()
+    return n
+
+
+def pull_pair(eng, symbol, date, px_1500, dry_run, start_time=None):
+    """Pull the 0DTE chain within the band for one (symbol, date), saving each contract as it
+    lands. Returns the meta row. start_time defaults to START_TIME (15:00); pass an earlier
+    time (e.g. 14:00) to widen the window -- END_TIME (16:00) and the band are unchanged."""
+    start_time = start_time or START_TIME
+    t0 = time.perf_counter()
+    chain = get_bulk_chain_v3(symbol, exp=date, trade_date=date)
+    time.sleep(SLEEP_BETWEEN_CALLS)
+    if chain.empty:
+        log(f"    no 0DTE chain on ThetaData -- skipping")
+        return {'status': 'no_chain', 'n_contracts': 0, 'n_with_data': 0, 'n_rows': 0}
+
+    band = BAND_PCT * px_1500
+    chain = chain[(chain.strike - px_1500).abs() <= band].sort_values(['cp', 'strike']).reset_index(drop=True)
+    if chain.empty:
+        log(f"    chain has no strikes within {BAND_PCT:.0%} of {px_1500:.2f} -- skipping")
+        return {'status': 'no_strikes', 'n_contracts': 0, 'n_with_data': 0, 'n_rows': 0}
+    log(f"    {len(chain)} contracts in band {px_1500 - band:.2f}-{px_1500 + band:.2f} "
+        f"({(chain.cp == 'Call').sum()} calls / {(chain.cp == 'Put').sum()} puts)")
+
+    n_rows, n_with_data, n_err = 0, 0, 0
+    for i, row in chain.iterrows():
+        try:
+            q = get_option_quotes_v3(symbol, row.strike, row.cp, row.exp, trade_date=date,
+                                     start_time=start_time, end_time=END_TIME, interval=INTERVAL)
+        except Exception as e:
+            log(f"    [{i + 1:>2}/{len(chain)}] {row.strike:>8.2f} {row.cp:<4}  ERROR {e}")
+            n_err += 1
+            time.sleep(SLEEP_BETWEEN_CALLS)
+            continue
+        q = q[(q.timestmp >= start_time) & (q.timestmp <= END_TIME)]
+        if len(q):
+            if not dry_run:
+                q.to_sql(TABLE, con=eng, if_exists='append', index=False)
+            n_rows += len(q)
+            n_with_data += 1
+        log(f"    [{i + 1:>2}/{len(chain)}] {row.strike:>8.2f} {row.cp:<4}  {len(q):>5} rows"
+            + ("" if len(q) else "  (no quotes)"))
+        time.sleep(SLEEP_BETWEEN_CALLS)
+
+    log(f"    saved {n_rows:,} rows from {n_with_data}/{len(chain)} contracts, "
+        f"{n_err} errors, {time.perf_counter() - t0:.0f}s" + ("  (DRY RUN)" if dry_run else ""))
+    return {'status': 'ok' if n_err == 0 else 'partial', 'n_contracts': len(chain),
+            'n_with_data': n_with_data, 'n_rows': n_rows}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--min-flow', type=float, default=7.0, help='min est_flow_bn to include (default 7)')
+    p.add_argument('--dry-run', action='store_true', help='pull but do not write to the DB or meta file')
+    p.add_argument('--force', action='store_true', help='wipe and re-pull every pair')
+    args = p.parse_args()
+
+    events = load_events(args.min_flow)
+    done = set() if args.force else load_meta()
+    log(f"{len(events)} events (est flow >= ${args.min_flow:g}B), {len(done)} already complete, "
+        f"window {START_TIME}-{END_TIME} @ {INTERVAL}, band +/-{BAND_PCT:.0%} of 15:00 px")
+    assert check_v3_connection(), "ThetaData v3 auth failed -- check thetadata_creds.json / THETADATA_API_KEY"
+    eng = create_engine(vbam_helpers.dev_connection_string, pool_pre_ping=True)
+
+    t_all = time.perf_counter()
+    n_pulled = n_skipped = 0
+    for i, ev in events.iterrows():
+        sym, date, px = ev.symbol, ev.eff_date, float(ev['15:00'])
+        tag = f"[{i + 1}/{len(events)}] {date} {sym:<5} 15:00 px {px:.2f}"
+        if (sym, date) in done:
+            log(f"{tag}  already complete -- skip")
+            n_skipped += 1
+            continue
+        existing = rows_in_db(eng, sym, date)
+        if existing and not args.dry_run:
+            n = wipe_db(eng, sym, date)
+            log(f"{tag}  wiped {n:,} stale rows (partial/older pull)")
+        else:
+            log(tag)
+        meta = pull_pair(eng, sym, date, px, args.dry_run)
+        if not args.dry_run:
+            append_meta({'symbol': sym, 'eff_date': date, 'px_1500': px, 'band_pct': BAND_PCT,
+                         'start': START_TIME, 'end': END_TIME, 'pulled_at': dt.datetime.now(), **meta})
+        n_pulled += 1
+
+    log(f"\nDone in {(time.perf_counter() - t_all) / 60:.1f} min: pulled {n_pulled}, skipped {n_skipped}. "
+        f"Checkpoints: {META_CSV}")
+
+
+if __name__ == '__main__':
+    main()

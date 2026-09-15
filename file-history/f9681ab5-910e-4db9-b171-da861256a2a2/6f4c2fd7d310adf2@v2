@@ -1,0 +1,106 @@
+notify = [ "C:\\Users\\zdietz\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\6f12e0ef1c6e5061\\bin\\node_modules\\@oai\\sky\\bin\\windows\\codex-computer-use.exe", "turn-ended" ]
+model = "gpt-6-astra"
+model_reasoning_effort = "xhigh"
+
+# --- shared-agent setup (added 2026-09-15) ---
+# Rules: ~/.codex/AGENTS.md is the canonical shared rules file (Claude Code imports it).
+# Skills: ~/.agents/skills is a junction to ~/.claude/skills (shared skill folder).
+sandbox_mode = "workspace-write"
+project_doc_max_bytes = 65536
+
+[sandbox_workspace_write]
+# Downloads is the only extra permanent writable root. D:/PycharmProjects is deliberately
+# excluded so edits there always prompt for approval.
+writable_roots = ['C:\Users\zdietz\Downloads']
+network_access = true
+
+[projects.'D:\agent_projects']
+trust_level = "trusted"
+
+[desktop]
+followUpQueueMode = "steer"
+conversationDetailMode = "STEPS_COMMANDS"
+ambient-suggestions-enabled = false
+
+[marketplaces.openai-bundled]
+source_type = "local"
+source = '\\?\C:\Users\zdietz\.codex\.tmp\bundled-marketplaces\openai-bundled'
+
+[marketplaces.openai-primary-runtime]
+source_type = "local"
+source = '\\?\C:\Users\zdietz\.cache\codex-runtimes\codex-primary-runtime\plugins\openai-primary-runtime'
+
+[plugins."codex-app-tools@openai-bundled"]
+enabled = true
+
+[plugins."browser@openai-bundled"]
+enabled = true
+
+[plugins."unified-computer-use@openai-bundled"]
+enabled = true
+
+[plugins."visualize@openai-bundled"]
+enabled = true
+
+[plugins."documents@openai-primary-runtime"]
+enabled = true
+
+[plugins."pdf@openai-primary-runtime"]
+enabled = true
+
+[plugins."spreadsheets@openai-primary-runtime"]
+enabled = true
+
+[plugins."presentations@openai-primary-runtime"]
+enabled = true
+
+[plugins."template-creator@openai-primary-runtime"]
+enabled = true
+
+[plugins."computer-use@openai-bundled"]
+enabled = true
+
+[mcp_servers.node_repl]
+args = []
+command = 'C:\Users\zdietz\AppData\Local\OpenAI\Codex\runtimes\cua_node\6f12e0ef1c6e5061\bin\node_repl.exe'
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS = "1000"
+NODE_REPL_NODE_MODULE_DIRS = 'C:\Users\zdietz\AppData\Local\OpenAI\Codex\runtimes\cua_node\6f12e0ef1c6e5061\bin\node_modules'
+NODE_REPL_NODE_PATH = 'C:\Users\zdietz\AppData\Local\OpenAI\Codex\runtimes\cua_node\6f12e0ef1c6e5061\bin\node.exe'
+NODE_REPL_TRUSTED_CODE_PATHS = 'C:\Users\zdietz\.codex;C:\Users\zdietz\AppData\Local\OpenAI\Codex\runtimes\cua_node\6f12e0ef1c6e5061\bin\node_modules'
+CODEX_HOME = 'C:\Users\zdietz\.codex'
+BROWSER_USE_AVAILABLE_BACKENDS = "chrome,iab"
+BROWSER_USE_TINYSKY_ENABLED = "1"
+NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER = ""
+NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME = ""
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+BROWSER_USE_CODEX_APP_VERSION = "26.908.70816"
+NODE_REPL_TRUSTED_SERVICES = '{"browser":"C:/Users/zdietz/.codex/plugins/cache/openai-bundled/browser/26.908.70816/scripts/browser-service.mjs","sky":"@oai/sky/service"}'
+SKY_CUA_NATIVE_PIPE = "1"
+SKY_CUA_NATIVE_PIPE_DIRECTORY = '\\.\pipe\codex-computer-use-d4891847-7b1f-4324-8950-2d7be1238590'
+CODEX_CLI_PATH = 'C:\Users\zdietz\AppData\Local\OpenAI\Codex\bin\12219cbfbcbddde7\codex.exe'
+
+[windows]
+sandbox = "unelevated"
+
+[projects.'c:\users\zdietz\documents\codex\2026-09-15\i-m-currently-in-the-codex']
+trust_level = "trusted"
+
+[projects.'c:\users\zdietz\documents\codex\2026-09-15\you-are-being-asked-to-review']
+trust_level = "trusted"
+
+[mcp_servers.jupyter]
+# Same server/kernel bridge Claude Code uses (mirrors ~/.claude.json mcpServers.jupyter).
+command = "uvx"
+args = ["jupyter-mcp-server"]
+startup_timeout_sec = 30
+tool_timeout_sec = 60
+
+[mcp_servers.jupyter.env]
+DOCUMENT_URL = "http://localhost:9500"
+DOCUMENT_TOKEN = "3ef325019fb0fcaea95683019bc892de"
+DOCUMENT_ID = "notebook.ipynb"
+RUNTIME_URL = "http://localhost:9500"
+RUNTIME_TOKEN = "3ef325019fb0fcaea95683019bc892de"

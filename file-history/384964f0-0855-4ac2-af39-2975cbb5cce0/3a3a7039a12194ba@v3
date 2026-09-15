@@ -1,0 +1,127 @@
+"""
+Large index flows -- side-by-side cumulative PnL curves from one entry-time tab of the
+strangle workbook (export_backtest_excel.py output).
+
+Left:  buy the strangle, $10k of premium per event, equal contracts of call and put
+       (n = 10k / (100 x (call_px + put_px))), hold to expiry.
+Right: buy only the wrong-way OTM option, $10k of premium per event, hold to expiry:
+       ADD / UPWGT (index buying) -> the put; DOWNWGT (index selling) -> the call.
+Same first-OTM strikes and fills as the workbook tab. Events on the same eff_date are
+summed for the curve; stats count every trade.
+
+Run from Git Bash:
+    python /d/agent_projects/large_index_flows/cum_pnl_chart.py <workbook.xlsx> [--tab 15_00]
+"""
+import argparse
+import datetime as dt
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import numpy as np
+import pandas as pd
+
+PREMIUM = 10_000
+LABEL_MIN = 20_000   # annotate a trade with its symbol when its pnl is at least this (keeps 12/19 to AVGO + CVNA)
+BG = '#f5f5f5'
+WRONG_WAY = {'ADD': 'put', 'UPWGT': 'put', 'DOWNWGT': 'call'}   # option that pays if the flow reverses
+
+
+def load_tab(path, tab):
+    """One row per event from the workbook tab, with per-leg intrinsic at the close."""
+    df = pd.read_excel(path, tab, parse_dates=['eff_date']).sort_values(['eff_date', 'symbol']).reset_index(drop=True)
+    df['call_intr'] = (df['close'] - df['call_strike']).clip(lower=0)
+    df['put_intr'] = (df['put_strike'] - df['close']).clip(lower=0)
+    return df
+
+
+def strangle_pnl(df, premium=PREMIUM):
+    """$ pnl per event buying `premium` of the strangle with equal call/put contracts."""
+    cost = df['call_px'] + df['put_px']
+    n = premium / (100 * cost)
+    return n * 100 * (df['call_intr'] + df['put_intr'] - cost)
+
+
+def wrong_way_pnl(df, premium=PREMIUM):
+    """$ pnl per event buying `premium` of only the wrong-way OTM option (put for buys, call for sells)."""
+    side = df['event_type'].map(WRONG_WAY)
+    px = np.where(side == 'call', df['call_px'], df['put_px'])
+    intr = np.where(side == 'call', df['call_intr'], df['put_intr'])
+    return pd.Series(premium / (100 * px) * 100 * (intr - px), index=df.index), side
+
+
+def stats(pnl):
+    """Total, Sharpe (raw mean/std per trade), win rate, max drawdown of the cumulative curve, N."""
+    cum = pnl.cumsum()
+    dd = (cum - cum.cummax()).min()
+    return dict(total=pnl.sum(), sharpe=pnl.mean() / pnl.std() if pnl.std() else np.nan,
+                win=(pnl > 0).mean(), maxdd=dd, n=len(pnl))
+
+
+def plot_curve(ax, dates, pnl, title, color, symbols=None, label_min=LABEL_MIN):
+    """Step cumulative-PnL curve by event date with per-event markers, a zero line and a small
+    arrow + symbol on every trade whose pnl is at least label_min (stacked when a date has several)."""
+    daily = pd.Series(pnl.values, index=dates).groupby(level=0).sum()
+    cum = daily.cumsum()
+    ax.step(cum.index, cum.values, where='post', color=color, lw=2)
+    ax.scatter(cum.index, cum.values, color=color, s=22, zorder=5)
+    ax.axhline(0, color='gray', lw=0.8)
+    ax.fill_between(cum.index, 0, cum.values, step='post', color=color, alpha=0.08)
+    if symbols is not None:
+        big = pd.DataFrame({'date': pd.to_datetime(dates).values, 'symbol': symbols.values, 'pnl': pnl.values})
+        big = big[big.pnl >= label_min].sort_values(['date', 'pnl'], ascending=[True, False])
+        for i, (d, grp) in enumerate(big.groupby('date')):
+            for k, r in enumerate(grp.itertuples(index=False)):
+                ax.annotate(r.symbol, xy=(d, cum.loc[d]), xytext=(-28, 18 + 13 * k), textcoords='offset points',
+                            fontsize=8.5, color='#333333', ha='right', va='center',
+                            arrowprops=dict(arrowstyle='->', color='#555555', lw=0.8, shrinkA=0, shrinkB=3))
+    s = stats(pnl)
+    ax.set_title(f"{title}\nTotal: \\${s['total']:,.0f}  |  Sharpe: {s['sharpe']:.2f}  |  Win: {s['win']:.0%}  |  "
+                 f"Max DD: -\\${abs(s['maxdd']):,.0f}  |  N={s['n']}", fontsize=10.5)
+    ax.set_facecolor(BG)
+    ax.grid(alpha=0.3)
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+    ax.yaxis.set_major_formatter(mtick.FuncFormatter(lambda x, _: f'-${abs(x):,.0f}' if x < 0 else f'${x:,.0f}'))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+    ax.set_ylabel('Cumulative PnL ($)')
+    ax.set_xlabel('Effective date')
+
+
+def main(path, tab):
+    df = load_tab(path, tab)
+    entry = tab.replace('_', ':')
+    s_pnl = strangle_pnl(df)
+    w_pnl, side = wrong_way_pnl(df)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6.5), facecolor=BG, sharex=True)
+    plot_curve(axes[0], df['eff_date'], s_pnl,
+               f'Strangle: \\${PREMIUM:,.0f} premium per event, equal call/put contracts, first-OTM strikes', '#1f4e79',
+               symbols=df['symbol'])
+    plot_curve(axes[1], df['eff_date'], w_pnl,
+               f'Wrong-way option only: \\${PREMIUM:,.0f} premium per event (put on buys, call on the AVGO sell)',
+               '#b3541e', symbols=df['symbol'])
+    fig.suptitle(f'Large index flows -- 0DTE options bought at {entry} on the effective date, held to expiry '
+                 f'({len(df)} events, est flow >= \\$7B, fills = bid + 70% of spread)', fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    out = Path.home() / 'Downloads' / f'large_index_flows_cum_pnl_{tab}_{dt.datetime.now():%Y%m%d_%H%M}.png'
+    fig.savefig(out, dpi=150, facecolor=BG)
+    print(f'Saved: {out}')
+
+    detail = df[['eff_date', 'symbol', 'event_type', 'call_strike', 'put_strike', 'call_px', 'put_px', 'close']].copy()
+    detail['strangle_pnl'] = s_pnl.round(0)
+    detail['wrong_way_leg'] = side
+    detail['wrong_way_pnl'] = w_pnl.round(0)
+    print(detail.to_string(index=False))
+    return out
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('workbook', help='path to large_index_flows_strangle_hold_*.xlsx')
+    ap.add_argument('--tab', default='15_00', help='entry-time tab (default 15_00)')
+    a = ap.parse_args()
+    main(a.workbook, a.tab)

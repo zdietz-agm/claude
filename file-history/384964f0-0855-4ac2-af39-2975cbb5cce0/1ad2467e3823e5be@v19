@@ -1,0 +1,137 @@
+# large_index_flows
+
+Do very large single-name index flows on the effective date make 0DTE strangles worth buying at ~3pm?
+
+## Step 1 (done 9/10/26): event list -- `build_flow_list.py` -> `large_flow_events.csv`
+
+- Population: the 18 regular-cycle S&P 500 adds in `sp500_adds/sp500_helpers.py::INDIVIDUAL_ADDS`
+  (Jun 2023 - Sep 2026), plus two manual non-add events sized by Zach (9/10/26): AVGO sell 2025-12-19 ~$16B, AAPL buy 2024-09-20 ~$30B.
+- Announcement date = the `ANNOUNCEMENT_CYCLES` Friday within 21 days before the effective date.
+- Estimated index flow = **12% x CUR_MKT_CAP on the announcement date** (Bloomberg, via `bloomberg_helpers.my_bdh`, cached).
+- Thresholds: `passes_7b` (every regular-cycle add clears it, min PANW $8.0B) and `passes_10b` (Zach's working cut, 9/10/26 -- 13 of 20 events).
+- Caveat for review: CUR_MKT_CAP is full market cap, not float-adjusted. Names with big insider/affiliate holdings
+  (DELL, KKR, BX, APO, PLTR) would have materially less real index demand under S&P's IWF float factor.
+
+Run: `python -c "exec(open('build_flow_list.py').read())"` (my_bdh spawns a child process; do not run `python build_flow_list.py`).
+
+## Step 1b (9/10/26): eff-date intraday price path -- `pull_intraday_prices.py` -> `intraday_prices.csv`
+
+- Events: `passes_10b` rows only (13). Per event: CloudQuant trade price at 14:00..15:50 every 5 min, 15:50:01, 15:55, 15:55:01,
+  15:59:59, plus Bloomberg raw PX_LAST; `move_1550_to_last_bps` = 15:50:00 -> PX_LAST.
+- Sources are the team-cached vbam_utilities wrappers (`cloudquant.get_prices_batch` -> agentData.cloudquant_intraday_prices,
+  `bloomberg.my_bdh` -> agentData.bloomberg_bdh_cache), so reruns are free and teammates share the pulls.
+- Quirk: `get_prices_batch` returns the print NEAREST the requested timestamp (not last-print-as-of), so a :01 snap can
+  in principle pick a print a fraction of a second before publication. ~6s per (date, snap) call on a cold cache.
+
+## Step 2a (9/10/26): 0DTE quote pull -- `pull_0dte_quotes.py` -> `optionsResearch.t_opra_quotes` + `_pull_meta.csv`
+
+- ThetaData v3 via `D:/PycharmProjects/utils/thetadata_helpers.py` (`get_bulk_chain_v3`, `get_option_quotes_v3`).
+- Per event (est flow >= $7B, from intraday_prices.csv): 0DTE chain (exp == eff_date), calls + puts with strikes
+  within +/-8% of the 15:00 CloudQuant price, 15:00:00-16:00:00 at 1s bars, one request per contract (0.2s pacing).
+- Rows append to t_opra_quotes as each contract lands; `_pull_meta.csv` checkpoints completed pairs. Resumable:
+  a pair with DB rows but no meta row is wiped (symbol + trade_date + exp) and re-pulled. `--force` wipes everything.
+- Decision (Zach 9/10/26): pull the full last hour once rather than a 15:00-15:00:30 window -- request count, not
+  window width, drives the cost, and widening later would mean a full delete + re-pull per pair.
+- Zach runs it himself from Git Bash: `python /d/agent_projects/large_index_flows/pull_0dte_quotes.py`.
+
+## Excel deliverable (9/14/26): `export_backtest_excel.py` -> Downloads/large_index_flows_strangle_hold_<ts>.xlsx
+
+Tabs 15_00 / 15_10 / 15_20 / 15_30 / 15_40 (one row per event, sorted by est_flow_bn desc, hold to expiry) + Settings
+(every parameter and formula). Columns per Zach's spec: eff_date, symbol, pnl_bps, payout (= (payoff - total_cost) / total_cost, net;
+-1 = expired worthless), event_type (ADD / UPWGT / DOWNWGT), est_flow_bn, px_trade_time, close, move_bps, strikes, per-leg
+median bid / ask / fill, total_cost(_bps), winner, per-leg max bid + time, entry_time. Leg fills round UP to the next penny
+(9/14/26) -- shaves ~10 bps off each tab's total (15:40: +147 -> +135 bps).
+Flags: `--otm-bps 0` (closest OTM), `--max-pushes 0` (no cost-cap push; filename gets `_nopush`). Trailing columns
+(9/14/26): base1..base4 date/bps, base_mean_bps, richness_baseline, sigma_30d, one_day_move_bps, richness_realized.
+Closest-OTM no-push totals: 15:00 +382 bps (win 58%), 15:10 +52, 15:20 +362, 15:30 +241, 15:40 +234.
+
+## Charts (9/14/26)
+
+- `chart_top4.py [--otm-bps 0]` -> Downloads/large_index_flows_top4_charts_otm<N>_<ts>.png: 2x2 grid of the top-4
+  flows, 15:00-16:00 10-sec price path (vbam.get_intraday_prices; Liberator tick fallback for APP 2025-09-19) as % vs
+  prior close, dashed break-even lines (strike +/- premium paid), close dot at 16:00:10, title = name / eff / flow /
+  cost / payout / pnl. Default = closest OTM strikes at 15:40.
+- `cum_pnl_chart.py <workbook.xlsx> --tab 15_00` -> Downloads/large_index_flows_cum_pnl_<tab>_<ts>.png: side-by-side
+  cumulative $ PnL, $10k premium per event. Left = strangle with equal call/put contracts (pnl = 10k x net payout);
+  right = wrong-way OTM option only (put on ADD/UPWGT, call on DOWNWGT). 15:00 closest-OTM result: strangle +$44.5k,
+  Sharpe 0.22, win 53%, max DD -$26k; wrong-way +$89.8k, Sharpe 0.25, win 42%, max DD -$47k -- the wrong-way leg's edge
+  is Dec 25 (AVGO +$27k, CRH +$16k, CVNA +$44k) plus UBER/AAPL; 8 of 19 puts expire worthless (-$10k each).
+
+## Step 3a (9/14/26): baseline 0DTE quotes -- `pull_baseline_quotes.py` (Zach runs it from Git Bash)
+
+Goal: a "normalized baseline price of OTM options" per name so each event's strangle cost can be expressed as a
+multiple of the name's own normal Friday. For every event, the 5 Fridays strictly before eff_date (rolled to the
+prior trading day on holidays; MRVL's Thursday eff date still maps to Fridays) get the same pull as the event day:
+0DTE chain, strikes within 8% of the 15:00 spot, 15:00-16:00 at 1s -> t_opra_quotes via pull_0dte_quotes.pull_pair.
+Names without weeklies only have a chain on the monthly inside the window; other Fridays log `no_chain`.
+Spot snaps 15:00/15:10/.../15:40 + PX_LAST per baseline day -> `baseline_spots.csv`; checkpoints ->
+`_baseline_pull_meta.csv`. 19 events x 5 = 95 pairs; ~1 min per pair with a chain.
+Pull result (9/14/26): 91 of 95 pairs ok, every name had weekly 0DTE chains; 4 `no_spot` (CRH 11/28/25 and WDAY
+11/29/24 are Black Friday half-days, UBER 12/1 + 12/8/23 no prints).
+
+## Step 3b (9/14/26): richness vs baseline -- `baseline_richness.py [--entry 15:00]` -> `baseline_richness.csv`
+
+Per event: closest-OTM strangle cost in bps of spot at the entry time (same fills, rounded up, NO cost-cap push)
+on the eff date and on each baseline Friday, EXCLUDING the announcement Friday (2nd Friday back; matches
+large_flow_events.annc_date for all 17 adds) -> up to 4 baseline days. baseline = median; richness = event / baseline.
+First pass at 15:00: median richness 3.1x, mean 3.4x. Richest: AAPL 8.1x (4.6 -> 37.6 bps), UBER 8.0x, PANW 6.2x,
+APO 6.0x, MRVL 4.7x (59 -> 280 bps), DASH 4.5x. Near baseline: KKR 0.9x (baseline polluted by a 170 bps 5/31/24 day),
+CRH 1.0x, AVGO 1.2x, DELL / CVNA 1.5x. Caveats for Zach's review: first-OTM moneyness varies day to day with the
+strike grid (noise in cost_bps); baseline Fridays include monthly opex / MSCI / earnings-week days; the eff date is
+always a monthly opex while most baselines are weeklies.
+
+Baseline switched to MEAN (Zach 9/14/26). 15:00: median richness 2.7x (UBER 9.4x .. KKR 0.8x); 15:40: median 4.5x,
+mean 5.5x (baselines collapse to 4-20 bps with 20 min left while event days hold 50-240 bps). Richness vs payout
+correlation 0.21 (15:00) / 0.16 (15:40); top-10-by-richness mean payout 0.05 / 0.04 vs bottom-9 0.44 / 0.21.
+**Conclusion (Zach 9/14/26): with 19 events this cannot tell whether richness predicts trade success** -- the
+correlation is inside its own standard error (~0.24 at N=19), the split flips on 2-3 names (UBER rich and paid,
+CRH/KKR "cheap" only because of one blown-out baseline Friday each), and MRVL is the largest payoff at 4.5-6.3x.
+
+## Step 3c (9/14/26): strangle cost vs one-day realized move -- `realized_vol_richness.py [--entry 15:00 15:40]`
+
+sigma_30d = Bloomberg `VOLATILITY_30D` (annualized realized, %) at the PRIOR trading day's close (cached my_bdh);
+one_day_move_bps = sigma_30d / sqrt(252) x 100; ratio = closest-OTM strangle cost bps / one_day_move_bps (no cost-cap
+push, so MRVL and VRT differ from the workbook rows). Output `realized_vol_richness_<HHMM>.csv`. Results: median ratio
+0.30 at 15:00 (CRH 0.58 .. AVGO 0.12), 0.28 at 15:40 (UBER 0.55 .. CRWD 0.13); corr(ratio, payout) 0.01 / 0.03 --
+no relationship to trade success in this sample either. MRVL's 135% realized vol (850 bps one-day move) makes its
+280 bps strangle look ordinary at 0.33.
+
+## Step 2b (9/10/26): strangle backtest -- `backtest_strangle.py`
+
+- Trade: at 15:00 buy the 0DTE call and put each >= 120 bps OTM vs the 15:00 CloudQuant spot (nearest such strike),
+  fill = bid + 70% x spread, entry = median fill over 15:00:00-15:00:10, hold to expiry (intrinsic at PX_LAST).
+  A zero bid is a real no-bid market (fill = 70% x ask), not a bad quote.
+- Result (19 events, first pass): mean cost 31 bps (median 18), mean payoff 27 bps, mean pnl -4 bps, win rate 26%
+  (5 of 19 finish ITM), Sharpe -0.12, payoff/cost 0.87. >= $10B bucket (13): pnl +0.4 bps/event, payoff/cost 1.01;
+  $7-10B bucket (6): -14 bps/event, payoff/cost 0.35. Winners: CVNA +87, APP +70, MRVL +22, CRH +15, CRWD +8.
+- Caveat: strike spacing makes the average leg ~165 bps OTM (not 120), and 0DTE vol varies hugely by name
+  (MRVL strangle cost 192 bps, AAPL/DELL 6-7 bps) -- a fixed OTM distance is not a fixed budget.
+- Knobs: `OTM_BPS`, `SPREAD_PAID`, `ENTRY_TIME`, `ENTRY_WINDOW_SEC`, `MIN_FLOW_BN`; `run_backtest()` takes them as args
+  so entry-time / OTM sweeps are one loop over the cached quotes.
+
+### Refinement 9/14/26 (Zach): cost cap + limit-order exit
+- If the strangle costs > `MAX_COST_BPS` (120 bps) push both strikes out one strike (`MAX_PUSHES` = 1). Only MRVL
+  triggers (192 -> 142 bps at 330/315, still above the cap after one push).
+- Exit variant: resting sell limit on EACH leg at `LIMIT_MULT` (2x) the total strangle cost; a leg fills if its max
+  bid after entry (cached 1-sec bars, one SQL query per event) reaches the limit, filled at the limit; unfilled legs
+  expire at intrinsic. A single fill therefore returns +cost (100%) plus the other leg's intrinsic.
+- Result (19 events): at least one leg hit 2x in 6 of 19 (AVGO, CVNA, APP, AAPL, CRWD, UBER; 46% of the >= $10B
+  events), both legs only AAPL. Mean pnl -7 bps vs -5.6 hold: the cap costs more on CVNA (+87 -> +16) and APP
+  (+70 -> +42) than it earns on the expire-worthless fills. Sum of max bids averages 2.4x cost (median 1.8x) and the
+  max bids cluster 15:45-16:00, so the option value shows up late. Limit-multiple sweep 1.5x/2x/3x/4x: mean pnl
+  -6.6 / -7.0 / -5.5 / -7.6 bps, any-leg fill 42% / 32% / 21% / 5% -- no multiple turns it positive.
+- **Current default `LIMIT_MULT = 1.0` (Zach 9/14/26):** rest an offer at the TOTAL strangle cost in each leg (pay
+  $1 + $1 -> $2 offers in both). One fill recoups the premium (pnl 0 + other leg's intrinsic); two fills = +cost.
+  Result (19 events): mean +2.0 bps, median 0, win rate 21% (4 events: MRVL +142 both filled, AVGO +8, AAPL +7, CRH
+  +15 unfilled put ITM), 12 of 19 got at least one fill, 3 got both. >= $10B bucket +6.2 bps/event (77% any fill,
+  23% both); $7-10B -6.9 bps. Gives up CVNA (+87 -> 0) and APP (+70 -> 0) hold pnl; MRVL is 142 of the 38 total bps.
+- Entry-time sweep (9/14/26, top-4 flows AAPL/MRVL/APP/AVGO, `sweep_entry_times()`, spot = CloudQuant snap at entry):
+  limit-exit total 15:00 / 15:10 / 15:20 / 15:30 / 15:40 = +158 / +19 / +18 / +17 / +11 bps -- the 15:00 edge is
+  MRVL's double fill (+142); from 15:10 on only its put fills (0). AVGO fills both legs at every entry (+8 to +12),
+  APP only ever fills the call (0), AAPL fills both through 15:30 (+5 to +8) and at 15:40 only the put (0, hold +66).
+  Hold-to-close improves with later entry (mean +12 -> +71 bps; MRVL strangle cost falls 142 -> 86 bps while the
+  close move is fixed) but that is the same 4 names, not a new signal.
+- 15:40 entry, hold to expiry, all 19 (9/14/26): total +147 bps, mean +7.8, median loss, win 32% (6 of 19), Sharpe
+  0.13, payoff/cost 1.30, mean cost 25 bps. >= $10B: +151 total / +11.6 mean / 38% win; $7-10B: -4 total. MRVL is
+  +200 of the +147 (strangle 86 bps vs 555 bps move); ex-MRVL -53. Other winners CRH +88, AAPL +66, APP +30, CVNA +27,
+  UBER +5. Strikes re-picked off the 15:40 spot (AAPL 237.5/230, MRVL 337.5/320 after one push).

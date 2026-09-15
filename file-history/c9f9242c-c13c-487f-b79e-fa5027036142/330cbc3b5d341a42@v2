@@ -1,0 +1,460 @@
+REVIEW CORRECTIONS -- Zach's edits to the automated algo review
+==============================================================
+
+The daily review task reads this file every run and follows it. It overrides REVIEW_GUIDE.txt
+and overrides anything the task prompt implies.
+
+HOW TO USE THIS FILE
+  Zach: after reading a review, add a numbered correction below. One correction per thing.
+  Say what was wrong and what you want instead -- a verbatim WRONG / RIGHT pair is the most
+  useful form, because it pins the style, not just the rule.
+
+  Claude: when Zach corrects a review in chat, append the correction here yourself (keep his
+  wording), so the next run inherits it. Never delete a correction; if one is superseded,
+  mark it SUPERSEDED BY #n and leave it in place.
+
+Format:
+
+  CORRECTION #n  (YYYY-MM-DD)  <one-line topic>
+    What was wrong:
+    What to do instead:
+    WRONG:  <verbatim line from the review>
+    RIGHT:  <the line as it should have read>
+
+------------------------------------------------------------------------------------------
+
+CORRECTION #1  (2026-08-20)  hard-wrap the .txt at 120 characters
+  What was wrong: 08_19_2026.txt had 17 lines over 120 chars, the longest 496. Unreadable
+    without horizontal scrolling.
+  What to do instead: no line in the review .txt may exceed 120 characters. Wrap a long
+    bullet onto continuation lines indented 2 spaces so the "- " bullets stay scannable.
+    This applies ONLY to the .txt file. Do NOT wrap the Google Chat message -- Chat inserts
+    its own line breaks, so send that text unwrapped.
+  WRONG:  - MAINTAINS prod +2,093 vs backtest -36,849. Two structural causes, both verified. (a) The backtest put MAINTAINS on 7705/7710 at 1.25, prod on 7710/7715 at 0.30: backtest idx_at_trade is 7703.83 vs prod SPX 7704.46, so 7705 clears the $1 min-strike-distance gate on the backtest index and fails it on prod's.
+  RIGHT:  - MAINTAINS prod +2,093 vs backtest -36,849. Two structural causes, both verified.
+            (a) Backtest put MAINTAINS on 7705/7710 at 1.25, prod on 7710/7715 at 0.30:
+            backtest idx_at_trade 7703.83 vs prod SPX 7704.46, so 7705 clears the $1
+            min-strike-distance gate on the backtest index and fails it on prod's.
+
+CORRECTION #2  (2026-08-20)  stop explaining why OUTRIGHT has no backtest row
+  What was wrong: the review spent a clause explaining that the OUTRIGHT family has no sheet
+    in the backtest workbook. Zach: "this is correct but you dont need to note it going
+    forward." It is structural (create_backtests.py filters OUTRIGHT unless --outright is
+    passed) and already understood.
+  What to do instead: report the OUTRIGHT trade and its PnL normally, and say nothing about
+    the missing backtest row. Do not flag it as a discrepancy or a gap.
+  WRONG:  - Sold 1 SPXW 7705 put at 1.15 and 1 SPXW 7720 call at 0.80 (both sized down to 1
+            by config max size). Both expired worthless at 7707.98 for +195; prod row is
+            +200. The OUTRIGHT family has no sheet in the backtest workbook, which is why it
+            shows no backtest row.
+  RIGHT:  - Sold 1 SPXW 7705 put at 1.15 and 1 SPXW 7720 call at 0.80, both sized down to 1
+            by config max size. Both expired worthless at 7707.98 for +195; prod row +200.
+
+CORRECTION #3  (2026-08-21)  CUT EVERYTHING THAT IS NOT ABOUT A run_algos.sh SCRIPT
+  Zach, verbatim: "THE POINT OF THIS ALGO REVIEW IS TO SAVE ME TIME. MAKE YOUR MESSAGES
+    CONCISE AND TO THE POINT. INCLUDE NOTHING THAT DOES NOT HAVE TO DO WITH ONE OF THE
+    SCRIPTS RUN IN run_algos.sh"
+  What to do instead: if a line is not about a script in run_algos.sh, delete it. He cut the
+    whole-book PnL line even though it was correct and one line long.
+  WRONG:  Whole-book -40k on 8/20 is all non-algo strategies.
+  RIGHT:  (deleted -- non-algo strategies are not in scope)
+
+CORRECTION #4  (2026-08-21)  ONE FINDING PER BULLET, STOP AT THE POINT
+  What was wrong: bullets that kept going after the finding was made. He cut supporting
+    arithmetic, second-day corroboration, and my own conclusions from four separate bullets.
+  What to do instead: state the finding and stop. No derivation, no "and the same thing
+    happened yesterday", no verdict on whether the outcome was good.
+  Cut examples (all deleted by him):
+    - "Same story 8/19: ICON_REGULAR 2 and ICON_MWF 8, both waves, 0 filled. Two days, 0 of
+      55 lots."  -> prior-day corroboration; keep the day being reviewed
+    - "run_query_cached (4pm_script_v3.py:74) has no TTL, so the 15:39 preview pull was
+      reused at 16:00. refresh_legs at 16:00:19 moved 7635P sprc 13.355 -> 16.612 and 7690C
+      6.810 -> 6.014: net stale sprc 4.948 vs refreshed 5.251."  -> root-cause derivation
+    - The entire wave-1-vs-cross bullet ("Wave 1 at 4.85 sat 0.05 above the 4.80 net cross
+      ... Not filling was the good outcome.")  -> my analysis, not a finding
+
+CORRECTION #5  (2026-08-21)  FLAG IT, DO NOT ADJUDICATE IT
+  What was wrong: I closed findings with my own judgment. He replaced those with a flag and
+    left the call to himself.
+  WRONG:  ... against the 16:00:15 Bloomberg SPX of 7641.82. run_query_cached ... [derivation]
+  RIGHT:  ... against the 16:00:15 Bloomberg SPX of 7641.82. THIS SHOULD BE REVIEWED.
+  WRONG:  The 10.0s pause at 15:50:06 ... Nothing was pending, so it cost nothing.
+  RIGHT:  May need attention. Unusual delay of 10.0s at 15:50:06 when sending recap Google
+            Chat post; ... v7 posted the same recap in 1.0s. I will flag if I see this
+            behavior again.
+  Use his severity words: "Needs attention." / "May need attention." / "THIS SHOULD BE
+    REVIEWED." Do not write "cost nothing", "was the good outcome", or "correctly".
+
+CORRECTION #6  (2026-08-21)  SAY WHY IT DID NOT TRADE, NOT THAT IT "CORRECTLY" DID NOT
+  WRONG:  BUMPED correctly no-trade at vol 0.102 and CLOSER applied no overrides.
+  RIGHT:  BUMPED and CLOSER do not trade since neither parent triggerred.
+  Note: my version was also factually wrong. Bumped requires atmVol < 0.14
+    (configs_bumped_spreads/bumped_spread_config.py:31), so 0.102 PASSES that gate. Both
+    layers sat out because no parent fired. Check the actual gate before naming a reason.
+
+CORRECTION #7  (2026-08-21)  RECONCILIATION IS ONE FLAT LINE
+  WRONG:  Reconciles at zero: every sheet in EOD_OPTION_ALGOS_20260821_0813.xlsx shows
+            total_pnl 0 on 8/20.
+  RIGHT:  Backtests in EOD_OPTION_ALGOS_20260821_0813.xlsx shows total_pnl 0 on 8/20.
+  Drop "Reconciles at zero:", "every sheet", "all sheets". Name the workbook and the number.
+  For 340pm he compressed the whole block to two lines: "No notable slow data issues." and
+  "No trades, matches backtest." -- and dropped the factor that blocked it.
+
+  AMENDED 2026-08-21 (Zach): the one-flat-line form is ONLY for a day where everything
+  reconciles. When an algo disagrees, name which one and how. Materiality bar for calling it
+  a disagreement:
+    - PnL differs by >= 10%, measured as abs(prod - bt) / max(abs(prod), abs(bt)); or
+    - a different strike was selected on either leg; or
+    - one side traded and the other did not; or
+    - the side traded differs (put vs call), or the direction differs.
+  Anything under those bars is agreement -- do not spend a line on it. The digest now
+  computes this in its RECONCILIATION VERDICT section, so read the verdict rather than
+  eyeballing the two numbers.
+
+CORRECTION #8  (2026-08-21)  NEAR-MISSES: SUB-BULLETS, AND SAY IF IT WOULD HAVE PAID
+  What to do instead: put near-misses under an "Almost fired:" bullet with one indented
+    sub-bullet per strategy, and when the counterfactual trade is knowable, say what it would
+    have selected and whether it would have made money. That is the part he added himself.
+  RIGHT:  - Almost fired:
+            - IMBAL_GROWS calls, short by $362M. Its call leg needs the 350 imbal above -400M
+              and prod read -762M; the 355 leg (-2.25B vs the -1B gate) cleared.
+            - SPREAD_BUYS was blocked outright by factor_spy_chg_1550_1555_lt_neg2bps, SPY
+              -4.2 bps from 15:50 to 15:55. It would have selected 7645 7640 put spread which
+              would have made money.
+
+CORRECTION #9  (2026-08-21)  NEVER PUT A SIDE-LEVEL DENOMINATOR ON ONE ALGO
+  What was wrong: the 8/21 review said "IMBAL_GROWS 7680/7685 calls filled 83/1068 on W1".
+    Zach: "this is WRONG. we only tried to trade 320 +62 +146 of the 7680 7685 cs".
+  Where 1068 came from: the prod log's own line "[orchestrator] WAVE1 UNDERFILL [Call]:
+    83/1068 filled". That number is a SIDE-LEVEL total across every Call order that session
+    (IMBAL_GROWS 320 + IMBAL_GROWS_CLOSER 748 = 1068), not IMBAL_GROWS's size. It is also,
+    coincidentally, IMBAL_GROWS's PRE-RESIZE banner size -- the resize moved exactly 748 to
+    the CLOSER, so 1068 - 748 = 320. Two different 1068s. Do not be fooled by either.
+  What to do instead: per-algo fill numbers come ONLY from FILLS BY WAVE
+    (size_attempted / wave1_filled_qty / wave2_filled_qty, sourced from algo_trade_log).
+    Never from the ALGO TRADED banner size (pre-resize) and never from the UNDERFILL ratio
+    (side-level).
+  WRONG:  IMBAL_GROWS 7680/7685 calls filled 83/1068 on W1 at 0.30
+  RIGHT:  IMBAL_GROWS 7680/7685 calls filled 83/320 on W1, 237 on W2.
+  If the side-level figure is worth a line at all, label it as such and decompose it:
+    "Call side filled 83/1068 on W1 (GROWS 320 + GROWS_CLOSER 748)."
+  Zach's 320 + 62 + 146 = 528 is the total attempted on the 7680/7685 call spread across all
+  three books: 355PM GROWS 320, 355PM_V8 GROWS 62, 355PM_V8 GROWS_CLOSER 146. When several
+  scripts trade the same spread, sum them by strike before saying what "we" traded.
+  Digest now prints, next to every UNDERFILL block, the side total decomposed per algo, and
+  labels the banner size "size(pre-resize)" with the SENT size beside it.
+
+CORRECTION #10  (2026-08-24)  SAY WHEN THE WAVE-1 UNDERFILL MECHANISM TRIGGERED
+  Zach: "CLEARLY STATE THAT UNDERFILL TRIGGERRED HERE IF ITS THE CASE"
+  What was wrong: the fills bullet gave W1/W2 sizes and limits but never said the underfill
+    handler fired, which is the thing that changed the W2 edges.
+  What to do instead: when the log carries a "WAVE1 UNDERFILL [side]" line, say so in the
+    fills bullet, with the side-level ratio and the add-on that resulted. It is still a
+    side-level number -- label it (correction #9), do not pin it on one algo.
+  WRONG:  - IMBAL_GROWS 7680/7685 calls sent 320: 83 filled on W1 at a 0.30 limit, 237 on W2.
+            CLOSER 7675/7680 sent 748: 0 on W1 at a 1.36 limit, all 748 on W2 at a 0.98
+            limit, avg fill 1.25.
+  RIGHT:  - IMBAL_GROWS 7680/7685 calls sent 320: 83 filled on W1 at a 0.30 limit, 237 on W2.
+            CLOSER 7675/7680 sent 748: 0 on W1 at a 1.36 limit, all 748 on W2 at 0.98, avg
+            fill 1.25. Wave-1 underfill triggered on the Call side, 83/1068 filled (7.8%),
+            bumping W2 edges +0.014 for IMBAL_GROWS and +0.057 for the CLOSER.
+
+CORRECTION #11  (2026-08-24)  NO ROUTINE STREAK BULLET
+  Zach: "THIS IS AN UNNECESSARY BULLET. KEEP IT CONCISE. STICK TO TO THE TASK AND DONT TELL
+    ME THINGS I DIDNT ASK FOR"
+  WRONG:  - IMBAL_GROWS_CLOSER is 4 up days in a row, +314,176. IMBAL_GROWS is 3 up days,
+            +26,829.
+  RIGHT:  (deleted)
+  What to do instead: do not report streaks as a standalone statistic. The digest still
+    computes them, but a streak earns a line ONLY when it changes a sizing decision, and then
+    it belongs inside that strategy's bullet with the action, not as a stats readout.
+    Supersedes the routine reading of finding-order item 4 in REVIEW_GUIDE section 3.
+
+CORRECTION #12  (2026-08-24)  v7-vs-v8 DIFFERENCES GET COMPARED TO THE BACKTEST
+  Zach, on a bullet describing v8's CLOSER landing on the same strikes as its own parent:
+    "Instead of stating a line like this, you should be stating how this compares to the
+    backtest."
+  What to do instead: when v7 and v8 diverge, the reference point is the BACKTEST, not an
+    internal v8-vs-its-own-parent observation. Say which strikes the backtest selected, which
+    book matched it, and the PnL consequence.
+  WRONG:  - Needs attention. v8's CLOSER landed on 7680/7685, identical to its own parent
+            IMBAL_GROWS, so it added size at the same spread instead of one strike closer.
+            v7's CLOSER sat a strike inside its parent.
+  RIGHT:  - Backtest CLOSER sold 7675/7680 at 1.20 on 748 lots for +89,760 off an idx_at_trade
+            of 7675.74, matching v7's 7675/7680. v8's 7680/7685 is the outlier.
+
+CORRECTION #13  (2026-08-25)  FILL QUALITY COMES FROM FILL-TIME RECORDS, NOT QUOTE SNAPSHOTS
+  What was wrong: the 8/24 review judged fill quality off a quote-table snapshot taken ~2s
+    BEFORE the trade (msgoptionimpliedquote nbbo=1.50/2.20 at 14:55:01.222) and concluded
+    "1220 lots filled instantly off a surface the book was not showing." Zach: that NBBO "is
+    completely wrong... SPXW zero-day option prices move very volatile, especially around the
+    last ten minutes of the day. It's not a surprise that the NBBO would flip from these
+    higher values to the lower values when we executed." SpiderRock's own fill records show
+    fillBid 0.80-0.85 at execution; every print was inside its bid/ask.
+  THE RULE, in order:
+    1. Data source, v7: srtrade_agm_<YYYY_MM_DD>.msgsrparentexecution (198.102.4.55:3307).
+       Data source, v8: srtrade_<YYYY_MM_DD>.msgsrparentexecution (192.81.231.66:3700).
+       NOTE THE NAMING: v8 DROPS the _agm_ infix -- srtrade_2026_08_25, not
+       srtrade_agm_2026_08_25, which does not exist on v8 at all. Same table name either side.
+       Confirmed with SpiderRock (Will) 2026-08-26. v8 accounts (e.g. EOD61_C42, the
+       355 SPREAD_BUYS book) do NOT appear in the v7 table, so both hosts must be queried to
+       see the whole day's fills.
+       RETRY RULE: the v8 endpoint is load-balanced and some backends lack the grant, so a
+       query can come back "ERROR 1142 SELECT command denied" on one connection and succeed on
+       the next. Measured 2026-08-26: 8 of 12 fresh connections succeeded. On an error or a
+       denial, WAIT 5 SECONDS AND RETRY on a new connection -- do not treat the first failure
+       as the table being unavailable. A backend with the grant lists 47 databases; one
+       without lists 5, which is a quick way to tell them apart.
+       Only report the table as inaccessible (and loudly, per Zach's standing ask) if it still
+       fails after several spaced retries.
+       Query it EVERY review cycle for every option algo that filled. fillBid / fillAsk are
+       the quote AT the fill -- the only valid evidence for fill quality. A pre-trade quote
+       snapshot from the script log is context for why a limit was set, never evidence of
+       fill quality.
+    2. What to flag: a fill is POTENTIALLY TOO AGGRESSIVE when BOTH hold --
+       (a) fillPrice sits at/near the disadvantageous side (near fillBid on a sell, near
+           fillAsk on a buy), AND
+       (b) the fillBid/fillAsk spread is extremely wide.
+       Zach's calibration: sold at 0.82 on fillBid 0.80 / fillAsk 0.95 = NOT a bad fill.
+       Sold at 0.82 on fillBid 0.80 / fillAsk 1.20 = flag it.
+    3. When in doubt, ALERT -- err toward flagging a potentially too-aggressive fill.
+    4. Citation: name the exact table, e.g. srtrade_agm_2026_08_24.msgsrparentexecution.
+    5. ACCESS FAILURE IS ITSELF A FINDING (Zach, 2026-08-25). If this table cannot be
+       reached on any review -- connect error, database or table missing for the trade
+       date, or empty rows on a day the logs show option fills (e.g. trading has moved
+       fully to v8 and the v7 srtrade_agm_<date> mirror stops populating) -- flag it
+       LOUDLY at the top of the review: say the fill-quality check could not run, name
+       the exact host/table that failed, and state that access needs to be updated so
+       Zach can talk to SpiderRock. Do not silently skip the check or infer fill quality
+       from anything else.
+    NOTE (2026-08-25): the digest now computes all of this in its FILL QUALITY section --
+    per-fill fillPrice vs fillBid/fillAsk, the flag, and the loud access-failure warning.
+    Read that section rather than re-querying, but the rule above still governs how to
+    interpret and report it.
+  WRONG:  THIS SHOULD BE REVIEWED. ... 7655C sprc printed 0.932 against its own NBBO of
+            1.50/2.20 (0.568 below the bid, row_ts 14:55:01.222 CT), and wave limits are
+            surface-anchored, so 1220 lots filled instantly off a surface the book was not
+            showing.
+  RIGHT:  Sold 1220x 7655C at 0.82-1.00 against fillBid 0.80-0.95 / fillAsk 0.95-1.05 at
+            execution (srtrade_agm_2026_08_24.msgsrparentexecution). No print outside the
+            quote; spreads 0.10-0.20 wide. Fill quality fine.
+
+CORRECTION #14  (2026-08-25)  RECONCILIATION LEADS WITH AGGREGATES, FLAGS INDIVIDUALS ONLY ON GAPS
+  What was wrong: the 8/24 review's 355pm_script block listed three per-algo backtest PnLs
+    ("Backtest sold the same 7655/7660 at 0.70 on 356 / 1068 / 748 for 24,920 / 74,760 /
+    52,360") with no prod side and no totals. Zach: "just showing a list of three PNL numbers
+    from the backtest doesn't clearly state to me whether there was a big discrepancy between
+    prod and backtest PNL."
+  What to do instead: the reconciliation line states AGGREGATE prod PnL vs AGGREGATE backtest
+    PnL for the script, side by side, so a large discrepancy is visible at a glance. Only
+    after that, and only when an individual algo has a large prod-vs-backtest gap (the
+    correction #7 materiality bar), name that algo's pair. Never print a bare list of
+    backtest PnLs without the prod numbers next to them.
+  WRONG:  Backtest sold the same 7655/7660 at 0.70 on 356 / 1068 / 748 for 24,920 / 74,760 /
+            52,360 (EOD_355_OPTION_ALGOS_20260825_0816.xlsx, idx_at_trade 7652.69).
+  RIGHT:  Prod 148k vs backtest 152k in aggregate across the three algos (EOD_355_OPTION_
+            ALGOS_20260825_0816.xlsx). No individual algo differs by more than the 10% bar.
+          (and on a day one algo DOES differ:)
+          Prod 148k vs backtest 190k in aggregate. GROWS_CLOSER drives it: prod 52k vs
+            backtest 95k, strikes differ 7655/7660 vs 7650/7655.
+
+CORRECTION #15  (2026-08-25)  DECOMPOSE THE PROD-VS-BACKTEST GAP: CLOSER PRECEDENCE AND LOSS CAP
+  Zach: in future reviews, break out how much of the PnL difference between backtest and prod
+    comes from (a) the CLOSER precedence resize and (b) the script loss-cap pro-rata --
+    i.e. state the dollar figures for each, like the -$52,360 and -$14,280 on 8/24.
+  How to compute (the 8/24 worked example):
+    (a) CLOSER PRECEDENCE: prod moves size from the parent to the CLOSER (Resize line in the
+        script log, e.g. "GROWS 1068 -> 320, offset by CLOSER size 748"); the backtest keeps
+        the parent at full size AND counts the CLOSER, double-counting the offset lots.
+        Dollar figure = offset lots x backtest per-lot PnL. 8/24: 748 x $70 = -$52,360.
+    (b) LOSS-CAP PRO-RATA: the [LossCap] PRO-RATA line gives pre -> post sizes per trade
+        (e.g. 356/320/748 -> 305/274/641, ~0.857x); the backtest does not model it.
+        Dollar figure = lots removed x backtest per-lot PnL. 8/24: 204 x $70 = -$14,280.
+    (c) The residual after (a) and (b) is fill-price difference -- state it only if it is
+        large enough to matter under the correction #7 bar.
+    Per-lot PnL comes from the backtest sheet (total_pnl / size); when put and call per-lot
+    differ, decompose per side. Sources: the script log's Resize and [LossCap] lines (both
+    already in the digest's per-script section) plus the backtest workbook.
+  This slots into the correction #14 shape: aggregate prod vs aggregate backtest first, then
+    the (a)/(b) dollar breakouts as the explanation of the gap, then any per-algo flag.
+  RIGHT (8/24 form):
+    355PM aggregate: prod 82,382 vs backtest 152,040. Of the -69,658 gap, -52,360 is CLOSER
+      precedence (backtest keeps GROWS at 1068 while prod resized to 320) and -14,280 is the
+      loss-cap pro-rata (0.857x); residual -3,018 is fill prices.
+
+CORRECTION #16  (2026-08-26)  "DON'T TRADE BECAUSE X" DOES NOT MEAN THE ALGO ALMOST FIRED
+  What was wrong: the 8/25 review wrote "Almost fired: GROWS, GROWS_CLOSER and GROWS_SML all
+    blocked by factor_spy_chg_1550_1555_gt_12bps". Zach: "dont GROWS and GROWS_CLOSER also
+    not qualify bc of 350pm imbal??" He is right -- none of the three met its imbal trigger
+    that day (GROWS puts need 350 imbal < +400M, read +765M; calls need 355 < -1B, read
+    +2.45B; SML needs 355-350 > 2.5B, read 1.69B).
+  Why the log misleads: helpers.py checks dont_trade_factors FIRST and returns immediately
+    (helpers.py:1250), so the recap prints "*Don't trade X* because <veto>" whether or not
+    any trade trigger would have matched. The veto line is about evaluation order, not
+    near-ness to firing.
+  What to do instead: before writing "Almost fired" or "blocked by", verify the algo's TRADE
+    trigger would have matched using the day's raw values from the digest (350pm/355pm imbal,
+    bps, market type). If the trigger fails on its own, either omit the algo or say the veto
+    printed but was moot, with the failing trigger value.
+  WRONG:  Almost fired: GROWS, GROWS_CLOSER and GROWS_SML all blocked by
+            factor_spy_chg_1550_1555_gt_12bps at exactly 12.0 bps.
+  RIGHT:  The gt_12bps veto printed on GROWS, GROWS_CLOSER and GROWS_SML at exactly 12.0 bps,
+            but it was moot: none met its imbal trigger (GROWS puts need 350 imbal < +400M,
+            read +765M; calls need 355 < -1B, read +2.45B; SML needs 355-350 > 2.5B, read
+            1.69B).
+
+  AMENDED 2026-08-26 (Zach): "raw imbal/bps values from the digest --- yes this is the correct
+  way to do it. and you may need to check things like how close we were to up / flat / down
+  market, atmvol levels, etc (not just imbal)."
+    Imbal is not the only trade-side gate, and usually not the closest one. The trade triggers
+    in configs/ gate on: market type (factor_market_type / _350 / _340 -- 6 of the 355 trade
+    triggers and 12 of the 350 ones), factor_realized_change (47 uses), factor_vol /
+    factor_vol_high_enough / factor_ndx_atm_vol_lt_17, factor_vix, factor_first_tick*, the
+    imbal ladder, and the (355 - 350) delta.
+    The digest now has a MARKET STATE AND TRADE-GATE DISTANCES section that prints every one
+    of these with its distance to the boundary, including -- for market type -- the SPY price
+    and bps move that would have flipped UP/FLAT/DOWN. Read it before writing near-miss words.
+    Worked example (8/25, the day this correction came from): the 355 market_ratio was +0.430
+    against the +0.5 UP boundary -- 0.070 away, SPY needed 766.58 vs the 766.14 it printed,
+    +5.7 bps. THAT was the day's real near-miss, and the review never mentioned it while
+    calling three algos "almost fired" on a veto they were nowhere near needing.
+    Rule: "almost fired" requires (a) the algo's full trade-trigger tuple checked against
+    these values, and (b) the binding gate named with its distance. If the closest gate is a
+    market-type boundary or a vol bin edge rather than imbal, say that instead.
+    The other half of the discipline, from the same day: a CLOSE gate is NOT by itself a
+    near-miss. 8/25's 355 market_ratio sat 0.070 from UP, but every market-type-UP trigger in
+    the 355 suite (the VS_MKT family) ALSO requires factor_market_type350 = 1 (ratio was
+    +0.315, 0.185 away) and factor_355_imbal_less_than_500M (imbal was +2.45B). So nothing was
+    actually near firing on 8/25, and the review should say nothing about it. Flag a near-miss
+    only when the WHOLE tuple was close; otherwise the CLOSE marker is just context.
+
+CORRECTION #17  (2026-08-26)  NEAR-MISS REPORTING BARS ARE TIGHT, AND SILENCE IS THE DEFAULT
+  Zach, verbatim: "Better not include this or stuff like this in any future automated algo
+    reviews unless we genuinely were very close to missing a trigger (i.e., less than 5 bps
+    away), less than a vol point away (i.e. .05 vs .06) or imbal less than 100m away from a
+    trigger. The point of this automated review is to save me time. Including general long
+    recap messages like this does not save me any time because I need to read all of it.
+    Stick to the task."
+  The bars, and they are the ONLY reasons to write a near-miss line:
+    - a price/bps gate under 5 bps from its boundary
+    - a vol gate under one vol point (0.01) from its boundary, e.g. 0.05 vs 0.06
+    - an imbal gate under $100M from its threshold
+  What was wrong: I put a market-type distance in the digest at 5.7 bps / 0.070 ratio units
+    and called it CLOSE. Outside the bars -- it should never have been written down.
+  Also: a gate inside the bars is still not automatically a review line. The whole trigger
+    tuple has to be close (see the 8/25 counter-example under #16). And do NOT report these
+    values as day context or a regime recap -- the digest's "Day context" line exists to
+    inform other findings, not to be restated.
+  The digest now enforces this: TRADE-GATE DISTANCES prints only gates inside the bars, and
+    prints "Write NO near-miss line today" when nothing qualifies.
+  WRONG:  355PM ratio +0.430 -> FLAT, SPY 766.14 vs yest close 763.47, 90d std 0.8142%; to UP
+            (ratio +0.5) needed SPY 766.58, +0.44 away (+5.7 bps), ratio gap 0.070 CLOSE
+  RIGHT:  (omitted entirely -- 5.7 bps is outside the 5 bps bar)
+
+CORRECTION #18  (2026-08-26)  WHEN PROD AND BACKTEST AGREE, SAY SO IN FOUR WORDS
+  Zach, verbatim: "When the backtest and prod agree so closely, you don't need to flag it with
+    details. Just say 'backtest and prod agree.' And leave it at that. Remember, the point of
+    this is to make something concise for the user to read rather than digging into the logs
+    themselves."
+  What to do instead: if a strategy clears the materiality bar in #7 (under 10% PnL, same
+    strikes, same side, both traded), write "Backtest and prod agree." -- no PnL pair, no lot
+    counts, no idx_at_trade-vs-SPX comparison, no arithmetic reconciling the residual. Save
+    the detail for the strategies that actually DISAGREE.
+  This composes with #14: lead with the aggregate. If the aggregate reconciles and no
+    individual algo breaches the bar, the whole reconciliation is one line.
+  WRONG:  - Prod -998 vs backtest -1,000, same 7685/7690 call at 25 lots and 0.40,
+            idx_at_trade 7679.61 vs prod SPX 7679.75 (EOD_355_OPTION_ALGOS_20260826_0816.xlsx).
+            Prod's 29 lots, v7 25 at 0.35 plus v8 4 at 0.30, are consistent with the -2
+            difference.
+  RIGHT:  - Backtest and prod agree.
+
+CORRECTION #19  (2026-08-26)  DO NOT FLAG v8 SIZES THAT ARE WHAT THE RATIO IMPLIES
+  Zach, verbatim: "I don't need crap like this in the algo review. If the prod fills roughly
+    match the size of the backtest fills, or what we would expect given the backtest fills and
+    the v8 size ratio, don't flag it."
+  What was wrong: the digest reported a V8 size-ratio MISMATCH at 0.16x and the review then
+    spent three lines explaining that the flag was false. Two bugs behind it, both now fixed
+    in build_review_pack.py:
+      (a) it compared v8's size against V7's traded size, but V8_SIZE_RATIO applies to v8's
+          OWN pre-ratio size, which the v8 log prints as "ALGO_...: 23 --> 4". v7 and v8 reach
+          different pre-ratio sizes (loss-cap pro-rata, CLOSER resize).
+      (b) it ignored the floor: prod does max(1, int(size * ratio)), so a 23-lot parent lands
+          at 4, which is 0.17x, not 0.20x. Floor rounding is never a finding.
+    v8_check now compares against max(1, int(pre_ratio_size * ratio)) and prints NOTHING when
+    the sizes match.
+  What to do instead: say nothing about size when prod fills match the backtest or match what
+    the v8 ratio implies. Never write a line whose content is "the digest flag was wrong" --
+    if a digest flag is false, the fix goes in build_review_pack.py and the review stays quiet.
+  WRONG:  Filled 4/4 on W1 at a -0.35 limit, avg -0.30. The digest's V8 size-ratio MISMATCH at
+            0.16x is a false flag: the log shows "23 --> 4" at V8_SIZE_RATIO 0.20, so the ratio
+            applied to v8's own 23, not v7's 25. build_review_pack.py should compare against
+            the pre-ratio size in the v8 log.
+  RIGHT:  Filled 4/4 on W1 at a -0.35 limit, avg -0.30.
+
+CORRECTION #20  (2026-08-26)  4pm_script_v3 GETS A BLOCK ONLY ON ERRORS OR A WATCH ITEM
+  Zach, verbatim: "When the 4pm_script_v3 is this mundane, we don't need to include it. We
+    really only need to flag this script if there are execution errors or if there is some
+    watch item that I have flagged to you that I want you looking at in this script."
+  What to do instead: 4pm_script_v3 earns a block ONLY for (a) an execution error, or (b) an
+    open watch item in REVIEW_GUIDE.txt section 8 naming this script. Otherwise it goes on the
+    "Didn't trade/does not need human review" line -- even when it traded, even when orders
+    were resent and filled late, even when expiries settled with real PnL. Normal condor
+    fills, normal resends, normal settlement are not findings.
+  Note this is a HIGHER bar than other scripts: a resend that eventually fills is a finding
+    worth a line for the 350/355 books, but is routine here.
+  WRONG:  - ICON_MEAN_REVERSION bought 8 and ICON_REGULAR sold 2 of the 08/26
+            7650/7660/7695/7705 condor. Both read 0 filled at 16:00:19 and were resent at
+            -5.19 and 4.96; both filled in full at 16:02:03 ... every leg inside its quote.
+          - Settled the 8/25 expiries at SPX 7,677.20: MEAN_REVERSION -3,920, REGULAR +610.
+  RIGHT:  (both deleted; 4pm_script_v3 moves to the didn't-need-review line)
+
+CORRECTION #21  (2026-08-27)  DO NOT ECHO ZACH'S OWN PNL LOG NOTES BACK AT HIM
+  Zach, verbatim: "We do not need this line. I wrote the note in the PNL log, so you don't
+    need to re-remind me of it in the algo review."
+  What was wrong: the 8/26 review repeated the note Zach had already written in
+    PNL LOG NEW.xlsx (NVDA earnings as a possible don't-trade factor) and flagged it back
+    to him with THIS SHOULD BE REVIEWED.
+  What to do instead: a prod note in the PNL log is something Zach wrote himself and
+    already knows. Never restate it, summarize it, or flag it as a review item. The digest
+    prints it as context only.
+  WRONG:  - Outsized down day against +6k, +6k, +5k on its last three fire days. Your PNL
+            LOG note flags NVDA earnings as a possible don't-trade factor. THIS SHOULD BE
+            REVIEWED.
+  RIGHT:  (deleted)
+
+CORRECTION #22  (2026-09-08)  do not flag stale uPrc/sprc rows on nickel-wide, near-zero legs
+  Zach, verbatim: "for options that are a nickel wide and worth a tiny value (i.e., 0.05 at
+    0.10), we don't need to flag stale uprc because the smrk will still be accurate."
+  Context: on the v8 msgliveimpliedquote table (helpers_v8 F4) a row only republishes when that
+    option's NBBO changes or the 2-3 minute loop recomputes it. A far-OTM leg quoted 0.05/0.10
+    that has not ticked shows a row_ts minutes old and a uPrc/sprc computed off an old
+    underlier, but its NBBO -- and therefore its smrk, which is bounded inside the NBBO -- is
+    still current. The 9/4 350_v8 wave-2 refresh of 7695P (row_ts 14:48:19, sent 14:50:15) is
+    the example; it was harmless.
+  What to do instead: when a leg's NBBO is one nickel wide AND both sides are at or below
+    0.10 (e.g. 0.05/0.10, 0.00/0.05), do not flag its stale row_ts / stale uPrc / stale sprc
+    as a finding. The smrk anchor is accurate for that leg. Stale rows on legs that are worth
+    real money or quoted wider than a nickel remain reportable.
+  WRONG:  - 7695P leg priced off a 2-minute-old row (row_ts 14:48:19 vs send 14:50:15);
+            uPrc/sprc stale.
+  RIGHT:  (deleted -- nickel-wide 0.05/0.10 leg, smrk still accurate)
+
+CORRECTION #23  (2026-09-11)  IMBAL GROWS EXTRA PUTS IS BOOKED INSIDE IMBAL GROWS -- ENCODE IT
+  Zach, verbatim: "it is indeed the case that IMBAL GROWS EXTRA PUTS gets folded into
+    IMBAL_GROWS. Make sure that this is noted somewhere in our algo review pipeline so that
+    there's no confusion over this again."
+  Context: the 9/10 review spent a bullet re-deriving that EXTRA PUTS filled 14 lots in prod
+    but has no PNL LOG NEW row, and showing that its dollars fit inside IMBAL GROWS' 2,280.
+    True, but it is a standing fact, not a daily finding.
+  What to do instead: treat it as structural. It is now encoded in three places --
+    (a) build_review_pack.py PNL_LOG_FOLDS, which moves the child out of the Cat 1 list into
+        a "BOOKED INSIDE ANOTHER PNL LOG ROW" sub-section and folds its backtest PnL into
+        the parent's reconciliation verdict with a "note:" line;
+    (b) REVIEW_GUIDE.txt section 7 known-good patterns;
+    (c) this correction.
+    Use the digest's folded parent number (IMBAL GROWS backtest reads 12,740 on 9/10, not
+    10,920) and write nothing about the fold itself. A new child booked the same way gets
+    added to PNL_LOG_FOLDS, not written up in a review.
+  WRONG:  - IMBAL GROWS EXTRA PUTS filled 14 lots in prod but has no PNL LOG NEW row, on this
+            or any date. Its dollars are consistent with sitting inside IMBAL GROWS' 2,280.
+  RIGHT:  (deleted -- structural, handled by PNL_LOG_FOLDS)

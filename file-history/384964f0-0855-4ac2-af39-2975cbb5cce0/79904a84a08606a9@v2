@@ -1,0 +1,128 @@
+"""
+Scrub stale post-close rows from optionsResearch.t_opra_quotes on NYSE half days.
+
+On early-close days the 0DTE market ends at 13:00 (equity / ETF options) or 13:15 (index
+options: SPXW, SPX, NDXP, NDX, XSP, RUT, VIX). ThetaData keeps publishing 1-sec bars after
+that, so any pull whose window ran later wrote dead-book rows (0.00 / 0.01 OTM quotes, ITM at
+intrinsic). This deletes rows with timestmp > cutoff, one (trade_date, symbol) pair per
+transaction, bounded by the indexed trade_date, and logs every rowcount.
+
+Modes:
+    --audit               per (date, symbol) counts of rows past the cutoff (read-only)
+    --dry-run             same counts using the exact delete predicate, no deletes
+    (default)             delete, logging to scrub_half_days_log.csv
+    --symbols UBER APO    restrict to these symbols (default: every symbol with stale rows)
+    --exclude-index       skip the index roots (do equities first)
+    --index-only          only the index roots
+
+Run standalone from Git Bash (never from the shared kernel -- a long DELETE pins it):
+    python /d/agent_projects/large_index_flows/scrub_half_days.py --dry-run --symbols UBER APO CVNA AVGO
+    python /d/agent_projects/large_index_flows/scrub_half_days.py --symbols UBER APO CVNA AVGO
+"""
+import argparse
+import datetime as dt
+import os
+import sys
+import time
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import vbam_helpers
+from calendar_utils import HALF_DAYS
+
+TABLE = 't_opra_quotes'
+INDEX_ROOTS = {'SPXW', 'SPX', 'NDXP', 'NDX', 'XSP', 'RUT', 'VIX'}
+CUTOFF_INDEX = dt.time(13, 15, 0)
+CUTOFF_EQUITY = dt.time(13, 0, 0)
+FIRST_DATE = dt.date(2019, 1, 1)
+LOG_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scrub_half_days_log.csv')
+
+
+def cutoff_for(symbol):
+    """13:15 for index roots, 13:00 for everything else."""
+    return CUTOFF_INDEX if symbol in INDEX_ROOTS else CUTOFF_EQUITY
+
+
+def half_days():
+    """NYSE early-close dates from FIRST_DATE through today."""
+    return [d for d in HALF_DAYS if FIRST_DATE <= d <= dt.date.today()]
+
+
+def audit(eng, dates, symbols=None):
+    """Per (trade_date, symbol): rows past that symbol's cutoff and total rows. Read-only."""
+    rows = []
+    for d in dates:
+        df = pd.read_sql(text(f"""
+            SELECT symbol,
+                   SUM(timestmp > '{CUTOFF_EQUITY}') AS n_post_1300,
+                   SUM(timestmp > '{CUTOFF_INDEX}')  AS n_post_1315,
+                   COUNT(*) AS n_all
+            FROM {TABLE} WHERE trade_date = :d GROUP BY symbol"""), eng, params={'d': d})
+        for r in df.itertuples(index=False):
+            if symbols and r.symbol not in symbols:
+                continue
+            n_stale = int(r.n_post_1315 if r.symbol in INDEX_ROOTS else r.n_post_1300)
+            rows.append({'trade_date': d, 'symbol': r.symbol, 'cutoff': str(cutoff_for(r.symbol)),
+                         'n_stale': n_stale, 'n_all': int(r.n_all), 'n_keep': int(r.n_all) - n_stale})
+    return pd.DataFrame(rows)
+
+
+def delete_pair(eng, d, symbol, dry_run):
+    """Delete rows past the cutoff for one (trade_date, symbol) in one transaction; returns rowcount."""
+    cutoff = cutoff_for(symbol)
+    params = {'d': d, 's': symbol, 't': cutoff}
+    with eng.begin() as c:
+        n_before = c.execute(text(
+            f"SELECT COUNT(*) FROM {TABLE} WHERE trade_date = :d AND symbol = :s AND timestmp > :t"), params).scalar()
+        if dry_run or n_before == 0:
+            return n_before, n_before
+        n_deleted = c.execute(text(
+            f"DELETE FROM {TABLE} WHERE trade_date = :d AND symbol = :s AND timestmp > :t"), params).rowcount
+    return n_before, n_deleted
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--audit', action='store_true', help='read-only per-(date, symbol) counts and exit')
+    ap.add_argument('--dry-run', action='store_true', help='count with the delete predicate, delete nothing')
+    ap.add_argument('--symbols', nargs='*', default=None)
+    ap.add_argument('--exclude-index', action='store_true')
+    ap.add_argument('--index-only', action='store_true')
+    a = ap.parse_args()
+    eng = create_engine(vbam_helpers.dev_connection_string, pool_pre_ping=True)
+    dates = half_days()
+    print(f"{len(dates)} half days {dates[0]}..{dates[-1]}", flush=True)
+
+    aud = audit(eng, dates, set(a.symbols) if a.symbols else None)
+    if a.exclude_index:
+        aud = aud[~aud.symbol.isin(INDEX_ROOTS)]
+    if a.index_only:
+        aud = aud[aud.symbol.isin(INDEX_ROOTS)]
+    work = aud[aud.n_stale > 0].sort_values(['n_stale', 'trade_date']).reset_index(drop=True)
+    print(f"{len(work)} (date, symbol) pairs with stale rows, {work.n_stale.sum():,} rows to remove, "
+          f"{work.n_keep.sum():,} rows kept on those pairs", flush=True)
+    print(work.to_string(index=False), flush=True)
+    if a.audit:
+        return
+
+    tag = 'DRY RUN' if a.dry_run else 'DELETE'
+    t0 = time.perf_counter()
+    for i, r in enumerate(work.itertuples(index=False), 1):
+        t1 = time.perf_counter()
+        n_before, n_deleted = delete_pair(eng, r.trade_date, r.symbol, a.dry_run)
+        ok = n_before == r.n_stale
+        print(f"[{i}/{len(work)}] {tag} {r.trade_date} {r.symbol:<5} cutoff {r.cutoff}  predicate={n_before:>9,}  "
+              f"audit={r.n_stale:>9,}  {'match' if ok else 'MISMATCH'}  deleted={n_deleted:>9,}  "
+              f"{time.perf_counter() - t1:.1f}s", flush=True)
+        if not a.dry_run:
+            pd.DataFrame([{'run_at': dt.datetime.now(), 'trade_date': r.trade_date, 'symbol': r.symbol,
+                           'cutoff': r.cutoff, 'audit_n_stale': r.n_stale, 'predicate_n': n_before,
+                           'n_deleted': n_deleted, 'n_keep': r.n_keep}]).to_csv(
+                LOG_CSV, mode='a', index=False, header=not os.path.exists(LOG_CSV))
+    print(f"\n{tag} done in {(time.perf_counter() - t0) / 60:.1f} min" + ('' if a.dry_run else f"; log: {LOG_CSV}"))
+
+
+if __name__ == '__main__':
+    main()

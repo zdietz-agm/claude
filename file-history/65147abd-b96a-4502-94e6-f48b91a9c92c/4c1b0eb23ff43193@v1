@@ -1,0 +1,106 @@
+import pandas as pd
+import datetime as dt
+import time
+from xbbg import blp
+import os
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
+from calendar_utils import getNowEst
+from algo_globals import LAST_HOUR
+
+IS_TEST = False
+
+def getSPY():
+    # SPY consolidated last trade, not the SPX calculated index: the index recomputes
+    # ~once per second from constituent last sales and lags the tape, so at the 1-second
+    # first-tick horizon it reads the PRE-imbalance level (observed 8/31/26: SPX flat at
+    # 15:50:01 while SPY had already moved +2.2 bps). Switched SPX -> SPY 9/1/26.
+    request_ts = dt.datetime.now()
+    spy = blp.bdp("SPY US Equity", "PX_LAST").iloc[0, 0]
+    return_ts = dt.datetime.now()
+    return pd.DataFrame({"SPY": [spy], "request_ts": [request_ts], "return_ts": [return_ts]})
+
+# --- Schedule: (fire_time, label) ---
+# Pre-imbalance samples fire 300ms early; post-imbalance samples fire 50ms early,
+# EXCEPT the label-15:50:01 sample, which fires 150ms LATE (9/1/26): it is the end
+# anchor of the 1-second first tick and firing it at :00.95 read the tape before the
+# post-imbalance move had fully printed. Its label is unchanged, so getFirstTick's
+# label-based anchor selection needs no change.
+# Label is the logical second-boundary the sample is meant to represent.
+SCHEDULE = [
+    (dt.time(LAST_HOUR, 49, 57, 700_000), dt.time(LAST_HOUR, 49, 58)),
+    (dt.time(LAST_HOUR, 49, 58, 700_000), dt.time(LAST_HOUR, 49, 59)),
+    (dt.time(LAST_HOUR, 49, 59, 700_000), dt.time(LAST_HOUR, 50, 0)),
+    (dt.time(LAST_HOUR, 50, 1, 150_000),  dt.time(LAST_HOUR, 50, 1)),
+    (dt.time(LAST_HOUR, 50, 1, 950_000),  dt.time(LAST_HOUR, 50, 2)),
+    (dt.time(LAST_HOUR, 50, 2, 950_000),  dt.time(LAST_HOUR, 50, 3)),
+    (dt.time(LAST_HOUR, 50, 3, 950_000),  dt.time(LAST_HOUR, 50, 4)),
+    (dt.time(LAST_HOUR, 50, 4, 950_000),  dt.time(LAST_HOUR, 50, 5)),
+]
+
+PRE_START_TIME = dt.time(LAST_HOUR, 48, 58)
+CSV_FILE = "spy_data.csv"
+
+
+def _atomic_replace_windows_safe(src, dst, max_attempts=5, sleep_s=0.05):
+    """Retry os.replace on transient Windows file-lock errors (WinError 5/32 when
+    the destination is held open by a reader). Refs: bugs.python.org/issue46003."""
+    for attempt in range(max_attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as e:
+            if attempt == max_attempts - 1:
+                raise
+            print(f"  CSV replace attempt {attempt + 1}/{max_attempts} hit lock ({e}), retrying in {sleep_s*1000:.0f}ms")
+            time.sleep(sleep_s)
+
+if __name__ == "__main__":
+    all_data = []
+
+    if os.path.exists(CSV_FILE):
+        os.remove(CSV_FILE)
+
+    if IS_TEST:
+        # Test mode: shift the schedule into the current clock window. Cadence
+        # between fires is preserved (matches prod gaps).
+        current_sec = dt.datetime.now().second
+        while dt.datetime.now().second == current_sec:
+            time.sleep(.05)
+        target_start = dt.datetime.combine(dt.date.today(), SCHEDULE[0][0])
+        time_offset = target_start - getNowEst().replace(tzinfo=None)
+        print(f"TEST MODE: running with prod cadence, offset={time_offset}")
+    else:
+        time_offset = dt.timedelta(0)
+        print("Waiting for the start time...")
+        while getNowEst().time() < PRE_START_TIME:
+            time.sleep(30)
+
+    today = dt.date.today()
+
+    for fire_time, label_time in SCHEDULE:
+        # Wait until fire_time, shifted by time_offset (prod: offset=0;
+        # test: offset shifts fire into current clock window).
+        target_wall = pd.Timestamp.combine(today, fire_time) - time_offset
+        while getNowEst().replace(tzinfo=None) < target_wall:
+            time.sleep(.01)
+
+        try:
+            df = getSPY()
+            df["label"] = pd.Timestamp.combine(today, label_time)
+            df["request_ts"] = df["request_ts"] + time_offset
+            df["return_ts"] = df["return_ts"] + time_offset
+            df = df[["SPY", "label", "request_ts", "return_ts"]]
+            all_data.append(df)
+            latency_ms = (df["return_ts"].iloc[0] - df["request_ts"].iloc[0]).total_seconds() * 1000
+            print(f"Queried SPY label={df['label'].iloc[0]}: {df['SPY'].iloc[0]:.2f} (took {latency_ms:.0f}ms)")
+
+            full_df = pd.concat(all_data, ignore_index=True)
+            tmp = CSV_FILE + ".tmp"
+            full_df.to_csv(tmp, index=False)
+            _atomic_replace_windows_safe(tmp, CSV_FILE)
+        except Exception as e:
+            print(f"Error querying SPY: {e}")
+
+    print(f"Saved {len(all_data)} rows to {CSV_FILE}")

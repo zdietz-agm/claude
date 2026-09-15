@@ -1,0 +1,132 @@
+"""Does the SPY pre-open exchange imbalance predict the open -> 9:40 SPY move?
+
+Imbalance: auctionResearch.t_exchange_snaps (SPY universe) at 09:28:02 and
+09:29:31 (one second after the Nasdaq MOO / LOO cutoffs).
+Open:      Bloomberg 'Open' on SPY US Equity, adjust='-' (raw as-traded).
+9:40 px:   median of t_trade_price_snaps SPY prints 09:39:38 .. 09:40:02.
+Return:    (px_940 / open - 1) * 1e4 bps.
+
+Run:  python D:/agent_projects/sod_option_algos/adhoc/open_imbal_vs_open_to_940.py
+"""
+import sys
+
+sys.path.insert(0, "D:/vbam-data-oracle/src")
+sys.path.insert(0, "D:/PycharmProjects/utils")
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+import bloomberg_helpers as bbg
+import calendar_utils as cu
+from vbam_utilities import vbam_db
+
+pd.set_option("display.width", 250)
+pd.set_option("display.max_columns", 40)
+
+START = "2021-01-04"
+IMBAL_SNAPS = ["09:28:02", "09:29:31"]
+PX_WINDOW = ("09:39:38", "09:40:02")
+
+
+def load_imbal(eng):
+    """SPY exchange net imbalance ($) at each IMBAL_SNAPS time, one row per day."""
+    snaps = ",".join(f"'{s}'" for s in IMBAL_SNAPS)
+    df = pd.read_sql(
+        f"""SELECT business_date, snap_time, exchange_net_imbalance
+            FROM auctionResearch.t_exchange_snaps
+            WHERE universe='SPY' AND business_date >= '{START}' AND snap_time IN ({snaps})""",
+        eng,
+    )
+    df["snap_time"] = df["snap_time"].astype(str).str[-8:]
+    w = df.pivot(index="business_date", columns="snap_time", values="exchange_net_imbalance")
+    w.columns = ["imbal_" + c.replace(":", "")[:4] + c[-2:] for c in w.columns]  # imbal_092802
+    return w
+
+
+def load_px_940(eng):
+    """Median SPY trade print over PX_WINDOW per day (robust to a single bad tick)."""
+    df = pd.read_sql(
+        f"""SELECT business_date, trade_price
+            FROM auctionResearch.t_trade_price_snaps
+            WHERE ticker='SPY' AND business_date >= '{START}'
+              AND snap_time BETWEEN '{PX_WINDOW[0]}' AND '{PX_WINDOW[1]}'
+              AND trade_price > 0""",
+        eng,
+    )
+    g = df.groupby("business_date")["trade_price"]
+    return pd.DataFrame({"px_940": g.median(), "n_px": g.size()})
+
+
+def load_bbg_open(start, end):
+    """Bloomberg raw 'Open' for SPY US Equity."""
+    df = bbg.my_bdh("SPY US Equity", "Open", start, end, adjust="-", timeout=90, verbose=True)
+    s = df.iloc[:, 0]
+    s.index = pd.to_datetime(s.index).date
+    return s.rename("bbg_open")
+
+
+def day_type(d):
+    if cu.is_month_end(d):
+        return "Month End"
+    if d in FEDS:
+        return "Fed Day"
+    if d in SERIALS:
+        return "Serial"
+    return "Regular"
+
+
+def summarize(df, col, label):
+    """Pearson/Spearman + quintile means of ret_bps against one imbalance column."""
+    x, y = df[col] / 1e6, df["ret_bps"]
+    pr, pp = stats.pearsonr(x, y)
+    sr, sp = stats.spearmanr(x, y)
+    slope = np.polyfit(x, y, 1)[0] * 100  # bps per $100mm
+    print(f"\n=== {label}  (N={len(df)}) ===")
+    print(f"Pearson r = {pr:.3f} (p={pp:.3f})   Spearman r = {sr:.3f} (p={sp:.3f})   "
+          f"slope = {slope:+.2f} bps per $100mm")
+    q = pd.qcut(x, 5, labels=["Q1 (most sell)", "Q2", "Q3", "Q4", "Q5 (most buy)"])
+    tbl = df.groupby(q, observed=True).agg(
+        n=("ret_bps", "size"),
+        imbal_mm_mean=(col, lambda s: s.mean() / 1e6),
+        ret_mean=("ret_bps", "mean"),
+        ret_median=("ret_bps", "median"),
+        hit_rate=("ret_bps", lambda s: (s > 0).mean()),
+    ).round(2)
+    print(tbl.to_string())
+    sign = df.groupby(np.sign(df[col]).map({1: "buy imbal", -1: "sell imbal", 0: "zero"})).agg(
+        n=("ret_bps", "size"), ret_mean=("ret_bps", "mean"), ret_median=("ret_bps", "median"),
+        hit_rate=("ret_bps", lambda s: (s > 0).mean())).round(2)
+    print(sign.to_string())
+
+
+if __name__ == "__main__":
+    SERIALS = set(pd.to_datetime(list(cu.SERIALS)).date)
+    FEDS = set(pd.to_datetime(list(cu.FEDS)).date)
+
+    eng = vbam_db.get_prod_engine()
+    imbal = load_imbal(eng)
+    px = load_px_940(eng)
+    data = imbal.join(px, how="inner")
+    data.index = pd.to_datetime(data.index).date
+
+    bbg_open = load_bbg_open(str(min(data.index)), str(max(data.index)))
+    data = data.join(bbg_open, how="inner")
+    data = data[(data["bbg_open"] > 0) & (data["imbal_092802"] != 0) & (data["imbal_092931"] != 0)]
+    data["ret_bps"] = (data["px_940"] / data["bbg_open"] - 1) * 1e4
+    data["day_type"] = [day_type(d) for d in data.index]
+
+    print(f"Days: {len(data)}   {min(data.index)} -> {max(data.index)}")
+    print(f"ret_bps: mean {data.ret_bps.mean():+.2f}  median {data.ret_bps.median():+.2f}  "
+          f"std {data.ret_bps.std():.2f}   |  n_px per day min {data.n_px.min()}")
+    print(data.tail(5).round(2).to_string())
+
+    for col, label in [("imbal_092802", "09:28:02 imbalance vs open->9:40"),
+                       ("imbal_092931", "09:29:31 imbalance vs open->9:40")]:
+        summarize(data, col, label + " -- ALL days")
+        reg = data[data.day_type == "Regular"]
+        summarize(reg, col, label + " -- Regular days only (ex ME / Fed / Serial)")
+
+    print("\n=== 09:28:02 vs 09:29:31 imbalance ===")
+    print(f"corr = {data.imbal_092802.corr(data.imbal_092931):.3f}   "
+          f"same sign = {(np.sign(data.imbal_092802) == np.sign(data.imbal_092931)).mean():.1%}")

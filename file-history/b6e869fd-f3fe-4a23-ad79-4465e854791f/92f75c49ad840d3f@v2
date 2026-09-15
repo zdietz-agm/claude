@@ -1,0 +1,611 @@
+# SP500 Adds Backtesting
+
+Backtesting options strategies around S&P 500 index addition events. Four scripts cover different trade setups: announcement-day 0DTE calls, candidate vol buying with SPY hedges (ATM-call and -1-sns-put versions), and Monday morning option selling on individually added names. Two standalone scripts round it out: an Excel report of underlying-stock returns around off-cycle add announcements, and a rolling top-10-market-cap candidate equity basket backtest vs SPY/QQQ (`candidate_basket_over_time.py`).
+
+All scripts run interactively via `#%%` cells in PyCharm and can share a single Jupyter kernel session. Options data is persisted to an on-disk per-symbol **Parquet store** (`opt_store/`) and loaded in narrow slices at backtest time, so peak memory stays low and reruns never re-pull. This replaced the old in-memory `OPT_DATA_CACHE` (which exhausted the kernel's RAM once all cycles/symbols were resident). `EARNINGS_CACHE` still persists in-memory across the session. See **Options Data Store** below.
+
+## Scripts
+
+| File | Purpose |
+|------|---------|
+| `sp500_helpers.py` | Shared module: liberator setup, dates/candidates data, caches, common functions |
+| `announcement_day_trade.py` | 0DTE call buys on announcement Friday + short 1-week calls |
+| `candidates_buying_vol.py` | Long ~66-day calls on candidates, SPY vega-neutral hedge |
+| `candidates_buying_vol_puts.py` | Put twin of `candidates_buying_vol.py`: long -1 sns puts on candidates, short SPY -1 sns puts |
+| `monday_morning_trades.py` | Sell puts/calls/spreads on individually added names, 10 strategy variants |
+| `off_cycle_adds_returns.py` | Generates an Excel report of underlying-stock returns around off-cycle add announcements (Bloomberg BDH formulas) |
+| `candidate_basket_over_time.py` | Rolling equity basket backtest: top-10 mkt cap names from the NEXT announcement's candidate list, $100k/name, rolled at the close after each announcement, vs $1M rolled SPY/QQQ |
+| `fed_day_chart.py` | Intraday chart of an added name vs SPY on every FED meeting that fell inside its add period. Normalized to prior close = 100. Supports per-name and 5x2 grid output. |
+| `add_relative_returns.py` | Regular-cycle adds only: cumulative return vs SPY (adjusted `PX_LAST`) from the annc close for each day t+1 .. effective date, median row at the bottom. Bloomberg only. Run via `python -c "exec(open(...).read())"`. |
+| `short_candidates_t1.py` | Short the top-10 mkt-cap candidates at the announcement close (SPY long hedge, same gross), exit T+1 open / close. EW ($100k/name) vs mkt-cap weight. Bloomberg only. |
+
+### `sp500_helpers.py`
+
+Shared infrastructure module imported by all scripts. Handles:
+- **Liberator credential setup** — loads `liberator.json`, sets env vars, configures `liberator.pfx` (must happen before importing `helpers_improved`)
+- **Path setup** — adds `D:/PycharmProjects/utils/` and `D:/PycharmProjects/spdr_liberator/` to `sys.path`
+- **Shared data** — `ANNOUNCEMENT_CYCLES` (13 quarterly rebalancing cycles, 2023-03 to 2026-06), `INDIVIDUAL_ADDS` (individual stock additions, 2023-06 to 2026-03, incl. VRT eff 2026-03-20), and `TOP_SYMBOLS_BY_CYCLE`
+- **Options data store** — `shrink_options_df()`, `write_symbol_date()`, `stored_dates()`, `load_symbol_dates()`, `load_leg_frame()` (see "Options Data Store" below)
+- **Common functions** — `had_earnings_between()`, `getOpen()`, `getAfterHoursHigh()`, `build_date_windows()`
+- **Constants** — `OPT_STORE_DIR`, `ILLIQUID_SYMBOLS` (VRT removed 2026-03), `EARNINGS_CACHE`
+
+### `announcement_day_trade.py`
+
+Buys 0DTE calls on SP500 rebalancing announcement Friday (top 4 by volume with tiered premium: $100k/$75k/$50k/$25k), then sells 50% of contracts as short +10% one-week calls.
+
+**Output:** `sp500_announcement_day_trade[_strikeN]_{YYYYMMDD}.xlsx`
+
+| Sheet | Description |
+|-------|-------------|
+| Hold Short Calls to Exp w DH | Short calls held to expiry, first delta hedge Monday close |
+| Close Short Calls Monday AM | Short calls closed at 10am Monday, no delta hedge |
+| All Data | Both variants stacked (`Type` column) |
+| Notes | Strategy descriptions |
+| Summary | Native Excel pivot (PnL by Type / date / symbol) |
+
+**Key config:** `DAYS_BEFORE=0`, `DAYS_AFTER=1`, `STRIKE_IDX=1` (2nd OTM call), `AMOUNT_OF_SHORT_TO_SELL=0.5`
+
+**Refactored into shared functions** (one code path for the normal run and the strike sweep): `build_zero_dte_call_df(strike_idx)`, `add_0dte_pnl(zdf, exit_cache)`, `build_one_week_hold(zdf)`, `build_one_week_monday(zdf)`, `scale_short(...)`, `merge_variant(...)`, `run_hold_to_exp(strike_idx)`, and `export_announcement_excel(combined, combined_close_monday_am, suffix="")`. The data source is the on-disk store (`load_symbol_dates`), loaded one symbol at a time. A backup of the pre-refactor script is kept at `announcement_day_trade_old.py`. See **Strike-Index Sweep** below.
+
+### `candidates_buying_vol.py`
+
+Buys ATM calls on SP500 candidates, hedges with short SPY calls (vega-neutral). Seven strategy variants testing different entry timings and option tenors. Tags stocks with earnings in the trade window via `had_earnings` column (filter in Excel).
+
+**Output:** `buy_sp500_candidate_vol_{YYYYMMDD}.xlsx`
+
+| Sheet | Description |
+|-------|-------------|
+| Long Vol | Eff date 9:35am → 3:30pm same day, ~66-day options |
+| Long Vol T-1 Initiation | T-1 3:30pm → eff 3:30pm, ~66-day options |
+| Long Vol T-3 Initiation | T-3 3:30pm → eff 3:30pm, ~66-day options |
+| Long Vol T-5 Initiation | T-5 3:30pm → eff 3:30pm, ~66-day options |
+| Long Vol Hold Thru Monday | Eff 9:35am → next trading day 10:00am, ~66-day options |
+| Long Vol T-1 Init Closer Dated | T-1 3:30pm → eff 3:30pm, ~5-day options |
+
+**Key config:** `MAX_LOOKBACK=5`, `DAYS_AFTER=1`, `hedge_symbol="SPY"`, `SNS_BAND=2.0` (ATM band loaded per leg), trade_vega=5000 per candidate
+
+**Data:** store-backed. Each leg loads via the two-phase, drift-safe `load_leg_frame()` — entry-date ATM band (`|sns| <= SNS_BAND`) to resolve the strike, then that exact strike on the exit date — one leg at a time, so peak memory is a single leg. The full surface stays on disk, so widening `SNS_BAND` is a re-read, not a re-pull.
+
+**Configuration flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `USE_TOP_FROM_LAST_CYCLE` | `False` | Only trades the ~5 top symbols from the prior cycle (defined in `TOP_SYMBOLS_BY_CYCLE` in `sp500_helpers.py`). Bypasses illiquid filter. Output file gets `_top_from_last` suffix. |
+| `VEGA_FLAT` | `True` | SPY hedge sized by raw vega sum instead of vol-weighted vega. Removes the ATM vol weighting that gives higher-vol names more hedge weight. Output file gets `_vega_flat` suffix. |
+
+### `candidates_buying_vol_puts.py`
+
+Put twin of `candidates_buying_vol.py`, kept as a separate script so the calls version stays untouched. Buys **-1 sns puts** on candidates (`TARGET_SNS = -1.0`) and hedges with **short SPY -1 sns puts** (vega-neutral, same `VEGA_FLAT` logic). Same 6 timing variants, same $5k vega/name, same flags (`USE_TOP_FROM_LAST_CYCLE`, `VEGA_FLAT`).
+
+**Output:** `buy_sp500_candidate_put_vol[_top_from_last][_vega_flat]_{YYYYMMDD}.xlsx` — tabs named "Put Vol", "Put Vol T-1 Initiation", etc., same All Data / Descriptions / Summary pivot layout.
+
+**Data:** cp-specific store files `opt_store/{SYMBOL}/{date}__Put.parquet` (the shared calls-only `{date}.parquet` files are never touched). Fill is incremental/resumable like the calls script. Note: for dates the DB doesn't already hold, liberator returns both cps unfiltered, so some `__Put` files contain call rows — harmless, `leg` filters by cp at selection time.
+
+**Kernel-collision-safe naming** (both scripts can live in one kernel): result vars are `combined_put*`; helpers that differ are renamed (`_run_candidate_put_backtest`, `_run_spy_put_hedge`, `PUT_STRATEGIES`, `clear_put_caches`). The calls script and `announcement_day_trade.py` share a `combined` variable name — whichever ran last wins, so re-run the relevant strategy cells before any export.
+
+**Finding (8/31/26, Zach):** the ATM call version (`candidates_buying_vol.py`) performs better than the -1 sns put version — the At The Money vol trade looks like the better trade.
+
+### `monday_morning_trades.py`
+
+Sells options on individually added S&P 500 names at 11:00am on Monday, 2 Mondays prior to effective date. 10 strategy variants (A-J) across ATM/OTM puts, put spreads, and OTM calls with 1-week or effective-date expiry. All delta-hedged daily.
+
+**Output:** `sp500_announcement_monday_morning_trades_{YYYYMMDD}[_HHMM].xlsx`
+
+| Strategy | Description |
+|----------|-------------|
+| A) 0 Put 1W | Sell 0 SNS put, 1 week expiry |
+| B) -1 Put 1W | Sell -1 SNS put, 1 week expiry |
+| C) 0,-1 Put Spread 1W | Sell 0/-1 SNS put spread, 1 week expiry |
+| D) -1,-2 Put Spread 1W | Sell -1/-2 SNS put spread, 1 week expiry |
+| E) +1 Call 1W | Sell +1 SNS call, 1 week expiry |
+| F) 0 Put Eff | Sell 0 SNS put, effective date expiry |
+| G) -1 Put Eff | Sell -1 SNS put, effective date expiry |
+| H) 0,-1 Put Spread Eff | Sell 0/-1 SNS put spread, effective date expiry |
+| I) -1,-2 Put Spread Eff | Sell -1/-2 SNS put spread, effective date expiry |
+| J) +1 Call Eff | Sell +1 SNS call, effective date expiry |
+
+Plus "All Strategies" consolidation sheet and "Notes" sheet.
+
+**Key config:** `PREMIUM=10000` (target per trade), `TRADE_INITIATION_TIME`, `MONDAY_SNS_BAND=4.0`
+
+**Data:** store-backed and **cp-aware** — fill writes `{date}__Put.parquet` / `{date}__Call.parquet`; backtests load via `load_monday_frame()` (entry-date ATM band + **full** expiry-date cross-section), so the held strike is present even as its `sns` drifts hard toward expiry.
+
+### `off_cycle_adds_returns.py`
+
+Standalone (does **not** share infrastructure with the three options-backtest scripts above — no `sp500_helpers`, no liberator, no options data). Generates an Excel workbook summarizing underlying-stock price action around off-cycle SP500 add announcements. All prices come from Bloomberg via live `BDH(...)` formulas written into the workbook; trading-date helpers come from `calendar_utils`.
+
+**Output:** `sp500_off_cycle_adds_{YYYYMMDD}_{HHMM}.xlsx` in `C:/Users/zdietz/Downloads/`. Open in Excel **with the Bloomberg add-in loaded** so BDH evaluates.
+
+**Returns computed (per event):**
+
+| Column | Definition |
+|--------|------------|
+| `pct_return_annc_to_next_morning` | annc close → next trading day open |
+| `pct_return_annc_to_next_close` | annc close → next trading day close |
+| `pct_return_annc_to_eff_morning` | annc close → eff-day open |
+| `pct_return_annc_to_eff_close` | annc close → eff-day close |
+| `pct_return_annc_to_low` | annc close → MIN PX_LOW over day_after_annc..eff_date |
+| `pct_return_annc_to_high` | annc close → MAX PX_HIGH over day_after_annc..eff_date |
+| `pct_return_day_after_eff` | eff close → +1 trading day close |
+| `pct_return_two_days_after_eff` | eff close → +2 trading day close |
+| `pct_return_three_days_after_eff` | eff close → +3 trading day close |
+| `pct_return_five_days_after_eff` | eff close → +5 trading day close |
+
+**Adding new events:** edit the `ROWS` list (top of script) with `('YYYY-MM-DD', 'TICKER', 'YYYY-MM-DD')` tuples and rerun. Helper columns and per-day path cells auto-extend.
+
+**Layout note:** the yellow-shaded helper region (cols N..AR) is intentionally exposed — every return cell traces back to visible BBG price helpers and date helpers via simple Excel arithmetic, so results are auditable in-place.
+
+### `candidate_basket_over_time.py`
+
+Standalone (no `sp500_helpers`, no liberator -- Bloomberg xbbg only). Rolling **equity** basket backtest of SP500 add candidates, benchmarked against SPY/QQQ.
+
+**Construction:**
+- `ANNOUNCEMENTS` = all 21 announcement dates (14 on-cycle + 7 off-cycle) with candidate lists, chronological, inlined in the script.
+- After each announcement `i`, buy at `next_trade_day(annc_i)`'s close the top-10 `CUR_MKT_CAP` names **from announcement `i+1`'s candidate list** (the names in play for the *upcoming* rebalance -- this is the key rule; using annc `i`'s own list scores ~$250k worse). The final open period reuses the latest list.
+- $100k notional per name (`NOTIONAL_PER_NAME`), hold until the trade date after the next announcement, sell at that close and roll. No transaction costs. Prices `PX_LAST adjust='all'`.
+- Benchmarks: $1M of SPY and QQQ bought/rolled at the same closes (`BENCH_NOTIONAL`).
+- A buy date beyond price history (announcement just made) is a "pending" basket: ranked on latest caps, no PnL until prices exist.
+
+**Candidate list sourcing / edits:**
+- On-cycle lists = `sp500_helpers.ANNOUNCEMENT_CYCLES`; off-cycle lists recovered from `D:/PycharmProjects/scratch/index_adds/current_adds_*.ipynb` notebooks dated within ~3 days before each off-cycle announcement.
+- Edits: ZIM dropped (2025-03-07 typo/immaterial), SQ -> XYZ (bbg carries SQ history through the 1/21/25 rename), COIN off-cycle 5/12/25 list = 3/7/25 list minus DASH with FLTR -> FLUT, off-cycle 7/31/26 added (6/5/26 list minus MRVL).
+
+**Variants / knobs:** `run_basket(top_n=...)` (top-5 tested: ~half the gross, roughly comparable per-dollar), `run_basket(tilted=True)` (rank-weighted 1.1x steps, #1 ~= $148k .. #10 ~= $63k, same gross; gated behind `INCLUDE_TILTED = False`).
+
+**Excel export:** `export_backtest_excel()` writes `sp500_candidate_basket_backtest_<ts>.xlsx` to Downloads -- Daily MTM (daily/cum pnl, portfolio mkt value, SPY/QQQ), Daily Holdings (per-name per-day marks), Positions (per-basket trades).
+
+**Findings (as of 2026-07-31):**
+- Full history (Mar 2023 on): basket ~$1.19M vs QQQ ~$0.91M vs SPY ~$0.68M. Rank-tilt adds ~$100k. Since Mar 2024: basket ~$682k vs QQQ ~$482k vs SPY ~$420k.
+- Daily-PnL corr/beta since Mar 2024 (matched $1M notionals): SPY 0.78 / 1.59, QQQ 0.79 / 1.21.
+- Best symbol-periods: COIN Sep-Dec 24 (+$100k), MRVL Mar-May 26 and May-Jun 26 (+$78k/+$75k as rank 1). Worst: TTD/XYZ/COIN in the Dec 24 basket (post-election unwind), MSTR Sep-Dec 25 (-$44k).
+- Nov 2024 run-up (+$216k) = post-election crypto/PE rally (COIN +$75k, APO, XYZ, DDOG); Mar 2025 drawdown (-$108k) = broad momentum unwind, 11 of 12 names down.
+- **Caveat:** construction assumes the next cycle's candidate list was knowable during the holding period; lists were compiled at each announcement, so early cycles carry look-ahead.
+
+### `fed_day_chart.py`
+
+Standalone visualization tool. For any name that was added to the S&P 500, finds every FED meeting that fell inside its add period and plots an intraday symbol-vs-SPY chart, both normalized so the prior trading day's close = 100. Reproduces the layout of a Bloomberg comparison chart (two lines, red/green fill between them) but in the global "data scientist" style (light bg, hidden top/right spines).
+
+**Add period definition:** within `ADD_PERIOD_LOOKBACK_TRADING_DAYS = 9` trading days before the effective add date. So for a regular quarterly add, eff Friday minus 9 trading days covers the announce Friday + the 1-2 weeks of post-announcement trading.
+
+**Data sources:**
+- Intraday 5-min prices: liberator dataset `ice_xnys_bqt_1388_t` on CloudQuant (one query per `(symbol, date)`, reindexed onto a 09:30-16:00 5-min grid with ffill).
+- Prior-day close + same-day close: xbbg `PX_LAST adjust='-'` (raw, as-traded -- so it matches liberator's tick basis even when Bloomberg has applied a later split adjustment).
+- Final 16:00 point: the same-day xbbg `PX_LAST` is appended to the intraday series so the chart ends on the official close print.
+
+**Population:** combines `INDIVIDUAL_ADDS` (from `sp500_helpers.py`) + an inlined copy of the off-cycle `ROWS` from `off_cycle_adds_returns.py`. Lookup is by symbol; one chart per (FED day, eff date) pair.
+
+**Entry points:**
+
+| Call | What it does |
+|------|--------------|
+| `make_fed_day_charts("CVNA")` | One chart per FED day in CVNA's add period(s). |
+| `make_recent_adds_grid(n=10, ncols=2)` | 5x2 grid of the N most-recent **INDIVIDUAL_ADDS** (no off-cycle) that have a FED day in window. Caches SPY pulls per FED date. |
+| `latest_individual_adds_with_fed(n=10)` | Returns the `(symbol, fed_date, eff_date)` list backing the grid. Use this if you want to drive your own analysis off the same population. |
+| `python fed_day_chart.py CVNA` | Headless CLI -- forces `matplotlib.use('Agg')` and saves PNG to `Downloads/`. |
+| `python fed_day_chart.py grid` | Headless CLI for the 5x2 grid PNG. |
+
+**Output:** `C:/Users/zdietz/Downloads/{symbol}_fed_day_{YYYYMMDD}_{YYYYMMDD_HHMM}.png` or `last{N}_sp500_adds_fed_day_grid_{YYYYMMDD_HHMM}.png`.
+
+**Gotcha worth remembering:** `sp500_helpers` (via `helpers_improved`) silently mutates `liberator.url` from CloudQuant (`https://api.cloudquant.ai`) to SpiderRock (`https://getdata.spiderrock.net`). The ICE/NYSE trade-tick dataset only lives on CloudQuant. `fed_day_chart.py` resets `liberator.url` (and `liberator.pfx`) back to the CloudQuant pair immediately after importing `sp500_helpers`. Any future script that wants both options data (SpiderRock) AND intraday equity ticks (CloudQuant) needs to flip the URL/pfx between query types.
+
+### Findings: 2pm -> PX_LAST excess return on FED day during add window
+
+Quick analysis we ran on the 10-name `make_recent_adds_grid(n=10)` population (most-recent individual adds with a FED day in their 9-trading-day window): for each name, compute the return from 14:00 to the same-day PX_LAST and subtract SPY's matching return.
+
+| Symbol | FED date | Sym 2-4pm (bps) | SPY 2-4pm (bps) | Excess (bps) |
+|--------|----------|-----------------:|-----------------:|--------------:|
+| VRT    | 2026-03-18 | -189.7 | -79.3  | -110.4 |
+| CVNA   | 2025-12-10 | +163.0 | +68.8  | +94.2  |
+| CRH    | 2025-12-10 | +121.3 | +68.8  | +52.5  |
+| APP    | 2025-09-17 | +164.8 | -7.2   | +171.9 |
+| HOOD   | 2025-09-17 | +86.7  | -7.2   | +93.9  |
+| DASH   | 2025-03-19 | +114.6 | +70.1  | +44.5  |
+| APO    | 2024-12-18 | -519.5 | -318.1 | -201.4 |
+| WDAY   | 2024-12-18 | -366.5 | -318.1 | -48.4  |
+| PLTR   | 2024-09-18 | +2.7   | -31.1  | +33.8  |
+| DELL   | 2024-09-18 | -93.9  | -31.1  | -62.9  |
+| **MEDIAN** |        | **+44.7** | **-19.2** | **+39.1** |
+| **MEAN**   |        | **-51.7** | **-58.5** | **+6.8**  |
+
+Takeaways (small-N caveat: 10 obs, 6 distinct FED days):
+- Median excess +39 bps, but mean only +7 bps -- dragged down by APO (-201) and VRT (-110).
+- 7 of 10 added names outperformed SPY 2pm -> close on their FED day.
+- Dec 2024 FOMC (hawkish cut) was the only meeting where BOTH same-cycle adds underperformed (APO, WDAY).
+- The 14:00 anchor isn't tied to the FOMC decision time (2pm ET decision was historical; current 2026 schedule is 2:00pm decision + 2:30pm presser, so 2pm captures decision-instant onward). If you want to isolate post-presser drift, repeat with a 14:30 anchor.
+
+### `short_candidates_t1.py`
+
+Standalone (Bloomberg only via `bloomberg_helpers.my_bdh`, raw `adjust='-'`, cached; no liberator). Reads `ANNOUNCEMENT_CYCLES` / `INDIVIDUAL_ADDS` out of `sp500_helpers.py` via AST so it does not trigger the liberator import chain. Requested by Matt Courter 9/8/26.
+
+**Trade:** on each quarterly announcement Friday, short the top-10 `CUR_MKT_CAP` names from that cycle's candidate list at the close, long SPY for the same gross notional. Because S&P publishes after the close, the eventual add is unknown and stays in the basket (variant A, tradeable). Variant C enters at the T+1 open ex the selected add(s) and exits at the T+1 close.
+
+- Ranking (`RANK_BY`): `'mkt_cap'` = top-N by `CUR_MKT_CAP` on the annc date; `'atm_vol'` (current default) = top-N by announcement-Friday 0DTE `atmVol` (earliest expiry, first snap after 15:30, pool of 10 by atmVol -- same as `announcement_day_trade.build_zero_dte_call_df`) with a **different volume filter** (Zach, 9/8/26): total 0DTE call volume across ALL strikes (last cumulative `prtVolume` per strike, summed) must be >= 2,000 contracts. SpiderRock's `-99` in `prtVolume` is a NaN sentinel and is ignored; the announcement-day trade's legacy metric (mean `prtVolume` over OTM strikes after 15:40, `> 100`) leaves the -99s in, which biases against names with many untraded strikes -- it is kept in the CSV as `legacy_mean_otm_vol`. The ranking is computed ONCE in the shared kernel by `sp500_helpers.build_atm_vol_ranking()` (reads the `opt_store/` Friday files, no liberator/Snowflake) and saved to `atm_vol_ranking.csv`; the backtest script reads the CSV. Regenerate the CSV after filling a new cycle. With the legacy filter the top 4 per cycle matched the kernel's `zero_dte_call_df` on all 15 cycles; the 2k filter changes the top-5 basket in 9 of 15 cycles (mostly APO / CRH / ALAB / LNG entering, low-volume thin names leaving), the 9/4/26 basket is unchanged.
+- Weightings (all four computed every run, `WEIGHTINGS`): `EW` = $100k short per name; `MW` = same gross ($100k x n) pro-rata by market cap; `RUNUP` (Zach 9/8/26) = only names whose close-to-close run-up over the `RUNUP_LOOKBACK` trading days into the annc close exceeds 2% (`RUNUP_MIN_PCT`), sized $100k x multiplier, linear from 1x at 2% to 5x at 10%+ (`RUNUP_MAX_PCT`, `RUNUP_MAX_MULT`); `RUNUP_EW` = same gate, flat $100k per name. SPY hedge = resulting gross. `RUNUP_LOOKBACK` was 2 (T-2 -> annc) for the first pass and is now 1 (annc day only, T-1 close -> annc close) -- the one-day gate trades fewer names (31 vs 37 at 2%), catches the eventual add less often (2 vs 3), and scores better (RUNUP_EW +$48k / Sharpe 0.40 / win 73% vs +$42k / 0.38 / 64%). Cycles with no name up > 2% have no RUNUP row.
+- Cutoff sweep (9/8/26, top-10 mkt cap, flat $100k, one-day gate): short names up > 2/4/6% on annc day -> +$48k / +$28k / +$4k, 31 / 13 / 8 names; long non-adds down > 2/4/6% on T+1 (variant D) -> +$26k / +$12k / +$9k, but every long row's best cycle is Mar 25 (+$41-43k) and all three are negative ex that cycle. Raising the cutoff shrinks the sample without improving it.
+- Variant D (Zach 9/8/26): the reversal trade -- LONG every non-added top-N name at the T+1 close, short $100k SPY per name, exit at the close of the last trading day of that week (T+5 close). `EW` = all non-adds; `DOWN2` = only names down more than 2% (`LONG_DOWN_MIN_PCT`) from the annc close to the T+1 close. Legs carry `side` (+1/-1) and entry/exit date+field so the SPY hedge is timed off the legs; `leg_pnl` is the signed pnl (`short_pnl` kept as alias). Cycles whose T+5 is in the future (9/4/26 until 9/11) are skipped.
+- Finding (9/8/26, top-10 mkt cap, 14 cycles): no bounce. D `EW` -$24k (mean -$1.7k, win 43%, Sharpe -0.09); D `DOWN2` +$26k over 11 cycles (win 55%, Sharpe 0.15) but $43k of it is Mar 25 (APP +23%, HOOD +10% off the post-announcement lows); ex that cycle DOWN2 is -$17k. Dec 25 (-$45k EW) and Mar 26 (-$15k) show non-adds kept sliding all week.
+- Finding (9/8/26, top-10 mkt cap): RUNUP is the only annc-close weighting that scores well -- variant A T+1 close +$89k over 14 cycles (mean +1.5% of gross, win 64%, Sharpe 0.27), T+1 open +$62k (win 71%, Sharpe 0.39) -- but $70k of it is one cycle (Dec 24: APP +7.4% run-up sized 3.7x) and it is short only 1-5 names per cycle. The 9/4/26 cycle is its worst (-$35k): BE ran +16% into the announcement, got the 5x size, and was the add.
+- Horizons: annc close -> T+1 open, annc close -> T+1 close. (Annc -> effective-date close deliberately excluded for now.)
+- Cycles with fewer than 10 candidates (all of 2023 + Mar 2024) are flagged `n_lt_top_n` / `*`.
+- Today's row is pulled uncached so a partial-day print never lands in the bdh cache.
+- **Run standalone as** `python -c "exec(open('short_candidates_t1.py').read())"` -- `my_bdh` spawns a child process, and `python short_candidates_t1.py` makes the spawn re-execute the module (multiprocessing `__main__` guard). In a kernel just run the cells.
+
+**Finding (9/8/26, 15 cycles, 9/4/26 cycle marked at 11am 9/8):**
+- `TOP_N=10` (first pass): variant A to T+1 close is roughly a coin flip -- EW total +$65k (Sharpe 0.21, hit 47%), MW total +$3k (Sharpe 0.01). The selected add ripping T+1 is the drag (MRVL +9.6% Jun 26, BE +8.6% Sep 26). Variant C (T+1 open ex-add -> close) is the best tradeable version: EW +$73k / MW +$70k, Sharpe ~0.40, hit 53%. Exiting at the T+1 open is worse than the close for both weightings.
+- `TOP_N=5` by mkt cap: worse. Variant A to T+1 close EW +$5k (Sharpe 0.02), MW -$26k (Sharpe -0.09); T+1 open exit negative for both. The add is rank 1-3 in 17 of 18 cases, so a 5-name basket is 20-40% short the winner. Variant C holds up: EW +$41k / MW +$40k, Sharpe ~0.40, hit 53-60%, on only $300-500k gross.
+- `TOP_N=5` by 0DTE atmVol, legacy volume filter (mean OTM > 100): variant A a coin flip -- EW +$19k (Sharpe 0.07, hit 47%), MW -$23k (Sharpe -0.07); T+1 open exit negative for both. The eventual add is #1 by 0DTE vol in 9 of 15 cycles and top-2 in 16 of 18 adds, so the vol ranking finds the winner even better than mkt cap does. Variant C (T+1 open ex-add -> close): EW +$67k / MW +$64k, Sharpe 0.49 / 0.53, hit 67%.
+- `TOP_N=5` by 0DTE atmVol, total 0DTE call vol >= 2k (current default): variant A worse -- EW -$3k (Sharpe -0.01), MW -$38k (Sharpe -0.12, hit 47%); T+1 open exit EW -$29k / MW -$57k. Variant C: EW +$46k / MW +$48k, Sharpe 0.34 / 0.42, hit 60%. The 2k filter lets liquid-but-lower-vol names (APO, CRH, ALAB, LNG) into the basket in place of thin names, and they faded less. Only Mar 23 has fewer than 5 survivors (2 names).
+
+## Shorting Failed Candidates (9/8/26 study, `short_candidates_t1.py`)
+
+Matt Courter's question after the 9/4/26 announcement (BE added; LNG / RPRX / ZM / ALAB all down 4-6% on Monday): is there a trade in shorting the S&P add candidates that did NOT get picked? Everything below is on the 15 quarterly cycles Mar 2023 - Sep 2026, Bloomberg raw closes/opens, $100k a name, SPY hedge equal to gross. Sharpe = raw mean/std of per-cycle net PnL, not annualized.
+
+**Verdict (Zach, 9/8/26): none of these look tradable or attractive enough to initiate.** The edge that exists is small, concentrated in two cycles (Dec 24, Mar 25), and the fills would be in thin names at the Monday open.
+
+Variants tested (all in the script, switch with `RANK_BY`, `TOP_N`, `WEIGHTINGS`):
+
+| Trade | Best-looking version | Total / mean per cycle | Win | Sharpe | Why it does not work |
+|---|---|---|---|---|---|
+| A. Short top-N at annc close, cover T+1 | top-10 mkt cap, EW, T+1 close | +$67k / +$4.5k | 47% | 0.21 | Announcement prints after the close, so the eventual add stays in the basket and rips 8-10% Monday (MRVL, BE, VRT...). Mkt-cap weight or top-5 makes it worse because the add is almost always the #1-2 name. |
+| A. ranked by 0DTE ATM vol instead of mkt cap | top-10, EW | +$29k / +$1.9k | 47% | 0.08 | Vol ranking finds the add even better (rank 1 in 9 of 15 cycles), so it concentrates the short in the winner. |
+| A. RUNUP: only names up >2% T-2 -> annc, sized 1x@2% to 5x@10% | top-10 mkt cap | +$90k / +$6.4k | 64% | 0.27 | 1-5 names a cycle; $108k of PnL from Jun 23 + Dec 24; the run-up gate also selects the add (BE +16% -> 5x -> -$58k on 9/4). Flat-$100k gate version: +$40k, Sharpe 0.35, max DD -$13k, but tiny gross. |
+| A. RUNUP_EW, one-day gate: names up >2% on annc day, flat $100k | top-10 mkt cap | +$48k / +$4.3k | 73% | 0.40 | Best-behaved short version (max DD -$7k, 31 names over 11 cycles) but $32k of it is Dec 24 and total gross over 3.5 years is $3.1M. Still shorts the add twice (CRWD Jun 24, BE Sep 26). |
+| C. Short non-adds at T+1 OPEN, cover T+1 close | top-10 mkt cap, EW | +$76k / +$5.1k | 60% | 0.41 | The only version that is actually tradeable after the news is known. Still 2 cycles = most of the PnL, and it needs opens in thin names. Per dollar ~+0.7% of gross per cycle. |
+| D. LONG non-adds at T+1 close, exit Friday close, short SPY | top-10 mkt cap, EW | -$24k / -$1.7k | 43% | -0.09 | No bounce: the Monday drop does not mean-revert within the week (Dec 25 -$45k, Mar 26 -$15k). Down->2%-only filter is +$26k but -$17k ex Mar 25. |
+
+Main takeaways:
+- **The Monday fade of non-selected names is real but one-day.** Shorting into the announcement does not capture it (the add offsets it); shorting at Monday's open does, and holding the losers for a bounce afterwards loses.
+- **Whatever you rank on -- mkt cap, 0DTE vol, pre-announcement run-up -- the #1 name is usually the add.** Concentration (top-5, MW, RUNUP sizing) therefore hurts every annc-close variant.
+- **PnL is fat-tailed and mostly from Dec 24 (post-election unwind) and Mar 25 (tariff selloff).** Ex those two cycles the EW annc-close trade is roughly flat; sample is 15 obs.
+- **Data notes learned along the way:** SpiderRock `prtVolume` uses `-99` as a NaN sentinel (the announcement-day trade's mean-OTM volume filter still leaves it in and is biased against thin names); Snowflake V8 0DTE `atmVol` runs lower than the stored Liberator-era V7 fit (MRVL 3.08 vs 4.69 at 15:30 on 6/5/26), so 0DTE vol levels are not comparable across the source switch.
+- Excel trade blotters (one row per leg + SPY hedge) and per-cycle PnL charts for each variant were produced to Downloads on 9/8/26; regenerate via `export_excel()` in the script or the `#%%` cells.
+
+## Recommended Run Order
+
+In a single kernel session:
+
+1. **`candidates_buying_vol.py`** — run first; its fill covers the widest date range (T-5 .. Monday-after) per candidate.
+2. **`announcement_day_trade.py`** — reuses the candidate **call** files already on disk (Friday/Monday); only pulls 2nd-expiries and illiquid names candidates skipped.
+3. **`monday_morning_trades.py`** — independent dates (from `INDIVIDUAL_ADDS`) and its own cp-specific put/call files; run any time.
+
+For each script: run the **Reimport helpers** cell first (loads the store functions + picks up `sp500_helpers` edits), then Run All. Fill cells are incremental — they skip any `(symbol, date[, cp])` already on disk — and resumable: if a run dies mid-fill, just rerun.
+
+## Options Data Store (Parquet) — memory architecture
+
+Options data lives on disk in a per-symbol Parquet store, **not** in RAM. This replaced the in-memory `OPT_DATA_CACHE`, which exhausted the kernel's memory once all cycles/symbols were resident at once.
+
+**Layout:** `opt_store/{SYMBOL}/{YYYY-MM-DD}[__{cp}].parquet`
+- `{date}.parquet` — calls-only (default); **shared** by `candidates_buying_vol.py` and `announcement_day_trade.py`.
+- `{date}__Put.parquet` / `{date}__Call.parquet` — cp-specific; used by `monday_morning_trades.py` (needs puts + calls; the `__{cp}` suffix avoids colliding with the calls-only files on shared dates).
+
+**Fill = pull → persist → release.** Each pull is dtype-shrunk (`shrink_options_df`, lossless object→numeric + symbol/cp→category) and written to its own file, then dropped from RAM. `stored_dates(symbol, cp)` makes fills incremental and resumable.
+
+**Backtest loads narrow slices, one leg at a time:**
+- `load_symbol_dates(symbol, dates, sns_band=None, cp=None)` — read specific dates, optionally filtered to an `|sns| <= sns_band` ATM band.
+- `load_leg_frame(symbol, st, et, target_tte, sns_band, ...)` — **two-phase, sns-drift-safe**: load the entry date at the ATM band, run `leg`'s own selection to resolve the exact `(strike, expiry)`, then load that exact strike on the exit date (no `sns` window, so a strike whose `sns` drifts out of band by expiry is never dropped). Used by `candidates_buying_vol.py`.
+- `load_monday_frame(...)` (defined in `monday_morning_trades.py`) — entry-date ATM band + **full** expiry-date cross-section; drift-safe for hold-to-expiry puts/spreads.
+
+**Why narrow loads are safe:** the daily delta-hedge PnL is fetched separately from the DB (`get_gamma_hedging_df`, by exact strike), so the in-memory frame only needs entry/exit snapshots. Peak RAM is bounded by a single leg, regardless of how many cycles exist.
+
+**Forcing a fresh pull:** delete the relevant parquet files (or the whole `opt_store/` dir); the fill re-pulls only what's missing. `EARNINGS_CACHE` still persists in-memory and is preserved across `sp500_helpers` hot-reloads via the **Reimport helpers** cell:
+
+```python
+import importlib, sp500_helpers
+_saved_earnings = getattr(sp500_helpers, 'EARNINGS_CACHE', {})
+importlib.reload(sp500_helpers)
+sp500_helpers.EARNINGS_CACHE = _saved_earnings
+from sp500_helpers import *
+```
+
+## External Dependencies
+
+### Data Sources
+- **SpiderRock via Snowflake** — historical options data via `get_options_data()` from `helpers_improved.py` (VBAM DB first, else `snowflake_helpers.pull_from_snowflake`, autosaved to the DB). Liberator was decommissioned 9/2026; the `pull_from_liberator` kwarg in the fill cells is kept for compatibility and now means "pull from Snowflake if missing". Parity check 9/8/26 (MRVL 2026-06-05): identical rows in the shared time windows, NBBO/srPrc/greeks match, atmVol within ~0.5 vol pt for all expiries EXCEPT the 0DTE (Snowflake V8 fit 3.08 vs stored Liberator 4.69 at 15:30) -- relevant because the announcement-day ranking sorts on 0DTE `atmVol`. Snowflake snap labels also run ~40s earlier (15:30:01 vs 15:30:43) and it keeps an extra 10:33-13:55 / 13:55-14:55 window.
+- **SpiderRock earnings** — `getEarnings()` from `spdr_rock_functions.py`
+- **Bloomberg** — open prices, after-hours highs via `xbbg`
+
+### Helper Libraries
+- **`pyarrow`** — Parquet engine for the on-disk options store (`opt_store/`)
+- `D:/PycharmProjects/spdr_liberator/helpers_improved.py` — `get_options_data()`, `leg` class, `get_gamma_hedging_df()` (daily delta-hedge PnL, pulled from DB)
+- `D:/PycharmProjects/spdr_liberator/liberator.json` / `liberator.pfx` — API credentials
+- `D:/PycharmProjects/utils/calendar_utils.py` — trading dates, NYSE calendar
+- `D:/PycharmProjects/utils/spdr_rock_functions.py` — earnings data
+
+## Key Design Patterns
+
+1. **Liberator credential-first setup** — credentials/env vars set before any liberator imports (same pattern as `wheel/wheel_engine.py`).
+2. **On-disk per-symbol Parquet store** — full-fidelity pulls persisted to `opt_store/`; fill writes-then-releases, backtest loads narrow slices. Bounds peak memory to a single leg.
+3. **cp-aware store files** — calls default to `{date}.parquet`; monday uses `{date}__{cp}.parquet` to keep puts+calls without colliding with the shared calls files.
+4. **Two-phase, sns-drift-safe leg loading** — resolve the strike from the entry-date ATM band, then load that exact strike on the exit date.
+5. **Single source of truth** — `announcement_day_trade.py` factors selection / PnL / export into functions so the normal run and the strike sweep share one code path.
+6. **Reimport with cache preservation** — `sp500_helpers` hot-reloads without losing `EARNINGS_CACHE`.
+7. **Interactive notebook execution** — `#%%` cell markers throughout.
+
+## Strike-Index Sweep (announcement_day_trade.py)
+
+`STRIKE_IDX` controls which OTM 0DTE call is traded (0 = 1st OTM, 1 = 2nd OTM, ...) and, via `0DTE_strike * 1.1`, the short 1-week call too. The top-4 symbol set is invariant to `STRIKE_IDX` (ranked by atmVol + `call_volume > 100`), so it's a clean knob. `run_hold_to_exp(strike_idx, exit_cache, verbose)` returns the combined "Hold Short Calls to Exp w DH" per-trade frame for any index, reusing the same functions as the normal run.
+
+**Compare strikes (in-kernel snippet).** Run all of `announcement_day_trade.py` first (defines the functions + `EXIT_CACHE`), then:
+
+```python
+#%% Sweep STRIKE_IDX for "Hold Short Calls to Exp w DH" (1st..4th OTM)
+import pandas as pd
+# EXIT_CACHE was filled by the normal run -> Bloomberg exits reused, no re-pull.
+# If you skipped the normal-run cell this session, uncomment: EXIT_CACHE = {}
+_ranks = {0: "1st OTM", 1: "2nd OTM", 2: "3rd OTM", 3: "4th OTM"}
+sweep_rows, percycle = [], {}
+for idx in [0, 1, 2, 3]:
+    cmb = run_hold_to_exp(idx, exit_cache=EXIT_CACHE, verbose=False)
+    cyc = cmb.groupby("cycle")["Pnl"].sum()
+    percycle[idx] = cyc
+    sweep_rows.append({
+        "strike_idx": idx, "otm_rank": _ranks[idx],
+        "total_pnl": cmb["Pnl"].sum(),
+        "sharpe_per_cycle": cyc.mean() / cyc.std() if cyc.std() else float("nan"),  # raw mean/std
+        "n_trades": len(cmb),
+        "mean_0dte_sns": cmb["0DTE Sns"].mean(),     # confound check: does it keep rising?
+        "mean_0dte_size": cmb["0DTE Size"].mean(),   # confound check: cheaper -> bigger size
+        "gross_0dte_prem": cmb["0DTE Prem"].sum(),
+    })
+summary = pd.DataFrame(sweep_rows).set_index("strike_idx")
+print("STRIKE_IDX sweep -- Hold Short Calls to Exp w DH"); display(summary)
+percycle_df = pd.DataFrame(percycle); percycle_df.columns = [f"idx_{c}" for c in percycle_df.columns]
+display(percycle_df)
+```
+
+**Generate per-strike workbooks (driver).** The normal Run All writes the regular workbook (`STRIKE_IDX=1`). To also write deeper strikes (suffix number == `STRIKE_IDX`; edit the list for a different mapping):
+
+```python
+#%% Generate workbooks for STRIKE_IDX 1 (regular), 2, 3, 4
+# suffix number == STRIKE_IDX value. Edit this list if you meant a different mapping.
+variants = [(1, ""), (2, "_strike2"), (3, "_strike3"), (4, "_strike4")]
+for idx, suffix in variants:
+    print(f"\n===== STRIKE_IDX={idx}  ->  suffix='{suffix or '(regular)'}' =====")
+    zdf     = add_0dte_pnl(build_zero_dte_call_df(idx, verbose=False), EXIT_CACHE)
+    owc     = scale_short(build_one_week_hold(zdf, verbose=False), zdf)
+    owc_mon = scale_short(build_one_week_monday(zdf, verbose=False), zdf)
+    cmb     = merge_variant(zdf, owc,     monday=False)
+    cmb_mon = merge_variant(zdf, owc_mon, monday=True)
+    export_announcement_excel(cmb, cmb_mon, suffix=suffix)
+```
+
+Files land in `C:/Users/zdietz/Downloads/` as `sp500_announcement_day_trade[_strikeN]_YYYYMMDD.xlsx`, each with both variant sheets + All Data + Notes + Summary pivot. **Caveat:** deeper indices (`_strike3`/`_strike4` = 4th/5th OTM) hit the `IndexError` fallback (revert to 1st OTM) for thin names lacking that many OTM strikes — `mean_0dte_sns` in the sweep shows how often that bites.
+
+## Recurring Timing Sweeps
+
+The two sweeps below are **reusable analysis templates**, not one-off scripts. Expect to re-run (and adapt) them whenever you revisit the timing of these trades:
+
+- **Exit timing for the candidate vol trade** -- when to take the position off (the "Monday Exit-Time Sweep"). Vary `end_time_fn`; reuse for other exit days/times or other candidate strategies by swapping the `start_time_fn`/`end_time_fn`/`target_tte`.
+- **Entry timing for the monday-morning trades** -- when to initiate (the "Monday-Morning Entry-Time Sweep"). Vary `TRADE_INITIATION_TIME`; add/remove strategies via the `STRATS` list.
+
+Both lean on the same pattern: reuse the already-loaded backtest functions + the on-disk `opt_store/` (no re-pull), sweep one timing parameter, and summarize total PnL + per-cycle Sharpe. Keep the snippets in sync with the scripts if the underlying functions change. New times are free as long as the relevant dates are already in `opt_store/`; a genuinely new date/cycle just triggers an incremental pull.
+
+## Monday Exit-Time Sweep (candidates_buying_vol.py -- Long Vol Hold Thru Monday)
+
+Sweeps the Monday exit time for "Long Vol Hold Thru Monday" (entry eff 9:35am, ~66d, SPY vega hedge); everything else is held fixed, only the Monday close time varies. `long_vol_pnl` is the same-day "Long Vol" (strategy #1, exit eff 3:30pm) total, net of its hedge, included as a constant benchmark.
+
+**Finding (2026-06):** Holding through Monday appears to increase PnL, with the optimal exit at **9:35** (could be an artifact of bad opening vol marks). Holding until **2pm** is the highest *total* PnL but a lower Sharpe -- i.e. some cycles pay well to hold to 2pm, but on average the PnL is lower.
+
+Run after a completed `candidates_buying_vol.py` run (reuses the loaded functions + `opt_store/`). It runs 8 full backtests (benchmark + 7 exit times), which exceeds the MCP 60s cap -- run it directly in the kernel:
+
+```python
+#%% Sweep Monday exit time for "Long Vol Hold Thru Monday"
+import pandas as pd, datetime as dt
+
+# Benchmark: same-day "Long Vol" (strategy #1) -- entry eff 9:35am -> eff 3:30pm, force_gamma=False
+_lv_lc  = _run_candidate_backtest(
+    start_time_fn=lambda e: dt.datetime.combine(e, dt.time(9, 35)),
+    end_time_fn=lambda e: dt.datetime.combine(e, dt.time(15, 30)),
+)
+_lv_cmb = _combine_and_tag(_lv_lc, _run_spy_hedge(_lv_lc))
+long_vol_pnl = _lv_cmb["pnl"].sum()   # net (candidate + SPY hedge), constant across exit times
+
+EXIT_TIMES = [(9, 35), (9, 45), (10, 0), (10, 30), (11, 0), (14, 0), (15, 30)]
+
+rows, percycle = [], {}
+for h, m in EXIT_TIMES:
+    label = f"{h:02d}:{m:02d}"
+    lc = _run_candidate_backtest(                                    # entry: eff 9:35am, ~66d
+        start_time_fn=lambda e: dt.datetime.combine(e, dt.time(9, 35)),
+        end_time_fn=lambda e, h=h, m=m: dt.datetime.combine(next_trade_day(e), dt.time(h, m)),
+        force_gamma=True,
+    )
+    hc  = _run_spy_hedge(lc, force_gamma=True)                       # SPY hedge follows lc's close
+    cmb = _combine_and_tag(lc, hc)
+    cyc = cmb.groupby("eff")["pnl"].sum()                           # net (candidate + hedge) / cycle
+    percycle[label] = cyc
+    rows.append({
+        "monday_exit": label,
+        "total_pnl": cmb["pnl"].sum(),
+        "long_vol_pnl": long_vol_pnl,                               # same-day benchmark (constant)
+        "sharpe_per_cycle": cyc.mean() / cyc.std() if cyc.std() else float("nan"),  # raw mean/std
+        "mean_cycle_pnl": cyc.mean(),
+        "n_cycles": cyc.shape[0],
+    })
+
+monday_exit_summary  = pd.DataFrame(rows).set_index("monday_exit")
+monday_exit_percycle = pd.DataFrame(percycle)
+print("Long Vol Hold Thru Monday -- Monday exit-time sweep (entry eff 9:35am, ~66d, SPY vega hedge)")
+display(monday_exit_summary)
+print("\nPer-cycle net PnL by Monday exit time:")
+display(monday_exit_percycle)
+```
+
+## Monday-Morning Entry-Time Sweep (monday_morning_trades.py)
+
+Sweeps the **entry** time (`TRADE_INITIATION_TIME`, which drives both entry and the strike-selection snap) for a subset of strategies, holding everything else fixed (exit stays held-to-expiry at 15:30). Reports a total-PnL grid and a per-cycle Sharpe grid (entry x strategy). The reported PnL field is per strategy: **J = total `pnl`** (opt + gamma hedge); **H / I / D = `opt_pnl`** (option mark-to-market only). Sharpe is raw `mean/std` over per-`effective_date` sums.
+
+**Finding (2026-06):**
+- **+1 SNS Call, Exp=Effective (J)** -- optimal entry early in the morning (~9:30-9:45).
+- **-1/-2 SNS Put Spread sales, no delta hedge (Eff `I`, 1W `D`)** -- highest Sharpe either post-11am (price has stabilized) or right at 9:35am.
+- **0/-1 SNS Put Spread sales, no delta hedge (H)** -- 2pm or 3:30pm is most ideal.
+
+Run after a completed `monday_morning_trades.py` run (reuses `trade_info`, `load_monday_frame`, and the backtest helpers). ~420 backtests with DB gamma pulls -- exceeds the MCP 60s cap, so run it directly in the kernel:
+
+```python
+#%% Sweep ENTRY time for monday-morning strategies J, H, I, D -- PnL grid + Sharpe grid
+import pandas as pd, datetime as dt
+
+ENTRY_TIMES = [(9, 35), (9, 45), (10, 0), (10, 30), (11, 0), (14, 0), (15, 30)]
+
+def _single(sns):       # +N call
+    return lambda s, td, exp, df: backtest_single_leg(s, td, exp, df, is_call=True, target_sns=sns)
+def _spread(sell, buy): # put spread
+    return lambda s, td, exp, df: backtest_spread(s, td, exp, df, is_call=False, sns_sell=sell, sns_buy=buy)
+
+# (column label, expiry field, is_call, runner, result field to use)
+STRATS = [
+    ("J) +1 Call Eff PNL",            "long_expiry",  True,  _single(1),      "pnl"),      # opt + gamma
+    ("H) 0,-1 Put Spread Eff Opt PNL","long_expiry",  False, _spread(0, -1),  "opt_pnl"),  # opt only
+    ("I) -1,-2 Put Spread Eff Opt PNL","long_expiry", False, _spread(-1, -2), "opt_pnl"),  # opt only
+    ("D) -1,-2 Put Spread 1W Opt PNL","short_expiry", False, _spread(-1, -2), "opt_pnl"),  # opt only
+]
+_order = [s[0] for s in STRATS]
+
+_orig_init = TRADE_INITIATION_TIME   # restore afterward
+recs = []
+try:
+    for h, m in ENTRY_TIMES:
+        TRADE_INITIATION_TIME = dt.time(h, m)        # drives entry + strike-selection snap
+        entry = f"{h:02d}:{m:02d}"
+        for label, exp_field, is_call, run, metric in STRATS:
+            for info in trade_info:
+                sym, td, exp = info["symbol"], info["trade_date"], info[exp_field]
+                r = run(sym, td, exp, load_monday_frame(sym, td, exp, is_call))
+                if r:
+                    recs.append({"entry": entry, "strategy": label,
+                                 "effective_date": info["effective_date"], "val": r[metric]})
+finally:
+    TRADE_INITIATION_TIME = _orig_init               # leave the session's global unchanged
+
+tidy = pd.DataFrame(recs)
+
+# Total PnL grid (J = pnl, H/I/D = opt_pnl), summed over all trades
+pnl_grid = tidy.groupby(["entry", "strategy"])["val"].sum().unstack().reindex(columns=_order)
+
+# Sharpe grid: per-cycle (effective_date) sums, then raw mean/std across cycles
+cyc = tidy.groupby(["entry", "strategy", "effective_date"])["val"].sum().reset_index()
+def _sharpe(x):
+    return x.mean() / x.std() if x.std() else float("nan")
+sharpe_grid = (cyc.groupby(["entry", "strategy"])["val"].apply(_sharpe).unstack().reindex(columns=_order))
+
+print("Monday-morning ENTRY-time sweep -- TOTAL  (J=PNL, H/I/D=Opt PNL):")
+display(pnl_grid)
+print("\nMonday-morning ENTRY-time sweep -- SHARPE per cycle (raw mean/std over effective_date sums):")
+display(sharpe_grid)
+```
+
+## Original Sources
+
+- `D:/PycharmProjects/spdr_liberator/sp500_announcement_day_trade.py`
+- `D:/PycharmProjects/spdr_liberator/sp500_candidates_buying_vol.py`
+- `D:/PycharmProjects/spdr_liberator/sp500_announcement_monday_morning_trades.py`
+
+## Takeaways
+
+### Questions asked:
+
+**When should I start the trade?**
+3 to 5 days out backtests better than morning of or day before
+
+**Is the trade profitable if I fully cross spreads?**
+No. If you set backtest to cross spread one time, pnl becomes flat to negative
+
+**Should I hedge with SPY vega flat or vega pct flat?**
+For the trades several days ahead, vega pct flat backtests better (but has risks of being short vol, so that is possibly just luck).
+For the trade on day of, vega flat tests better (or no vega hedge is even better)
+
+**Should I hold until Monday?**
+Holding through Monday morning seems to be marginally better
+
+**Should I trade closer dated?**
+Trading 1 week options (with initiation the day before) tests as higher pnl but seems high variance / and a lot of the PNL is driven by SPY hedge (when trading only 'top candidates') -- should try this in small size perhaps
+
+**Should I only trade the 'top candidates' from last time?**
+Trading only the top candidates also backtests as positive PNL and the backtest is more trustworthy IMO
+
+### Do I need the short SPY vega hedge at all?
+
+Likely no for the day trade (or it doesn't seem that worth it). The Sharpe of the day-trade version is higher with the hedge, but not by a ton. The T-1 Initiation becomes worse with the hedge.
+
+**With SPY hedge:**
+
+| Strategy | Sharpe (per cycle) |
+|---|---|
+| Long Vol | 0.08 |
+| Long Vol T-1 Initiation | 0.60 |
+
+Long Vol per-cycle PnL:
+
+| Cycle | PnL |
+|---|---|
+| 2023-03-03 | -$20,219 |
+| 2023-06-02 | $433 |
+| 2023-09-01 | $6,391 |
+| 2023-12-01 | -$10,398 |
+| 2024-03-01 | -$53,859 |
+| 2024-06-07 | -$15,656 |
+| 2024-09-06 | -$101,379 |
+| 2024-12-06 | $28,287 |
+| 2025-03-07 | $108,002 |
+| 2025-06-06 | $12,727 |
+| 2025-09-05 | $47,445 |
+| 2025-12-05 | $48,264 |
+
+Long Vol T-1 Initiation per-cycle PnL:
+
+| Cycle | PnL |
+|---|---|
+| 2023-03-03 | -$18,011 |
+| 2023-06-02 | $12,323 |
+| 2023-09-01 | -$3,613 |
+| 2023-12-01 | -$55,071 |
+| 2024-03-01 | $90,625 |
+| 2024-06-07 | $26,517 |
+| 2024-09-06 | -$11,729 |
+| 2024-12-06 | $86,398 |
+| 2025-03-07 | $160,731 |
+| 2025-06-06 | $23,479 |
+| 2025-09-05 | $88,053 |
+| 2025-12-05 | $34,646 |
+
+**Excluding SPY hedge:**
+
+| Strategy | Sharpe (per cycle) |
+|---|---|
+| Long Vol | 0.43 |
+| Long Vol T-1 Initiation | 0.38 |
+
+Long Vol per-cycle PnL (no SPY):
+
+| Cycle | PnL |
+|---|---|
+| 2023-03-03 | -$13,596 |
+| 2023-06-02 | $94 |
+| 2023-09-01 | -$3,762 |
+| 2023-12-01 | $12,871 |
+| 2024-03-01 | $1,266 |
+| 2024-06-07 | -$35,168 |
+| 2024-09-06 | $144,748 |
+| 2024-12-06 | $51,571 |
+| 2025-03-07 | $51,547 |
+| 2025-06-06 | -$16,711 |
+| 2025-09-05 | $29,635 |
+| 2025-12-05 | $19,858 |
+
+Long Vol T-1 Initiation per-cycle PnL (no SPY):
+
+| Cycle | PnL |
+|---|---|
+| 2023-03-03 | -$12,444 |
+| 2023-06-02 | $23,028 |
+| 2023-09-01 | -$16,530 |
+| 2023-12-01 | -$32,184 |
+| 2024-03-01 | $144,671 |
+| 2024-06-07 | -$21,243 |
+| 2024-09-06 | $101,795 |
+| 2024-12-06 | $50,141 |
+| 2025-03-07 | $7,432 |
+| 2025-06-06 | -$7,472 |
+| 2025-09-05 | $21,867 |
+| 2025-12-05 | -$11,054 |

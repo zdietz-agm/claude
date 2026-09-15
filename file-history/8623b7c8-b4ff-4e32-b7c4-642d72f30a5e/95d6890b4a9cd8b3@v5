@@ -1,0 +1,96 @@
+# 9/11/2026 -- hacker waves 3/4: NBBO-priced plain-limit orders replace the surface-quoting rest
+
+## What changed
+- hacker_trades.py: the wave-3 Seeker rest (surface-quoting, limit forced to -HACK_MAX_PRICE
+  via WAVE3_FORCE_CLAMP_EDGE=99) is replaced by two NBBO-priced waves:
+    WAVE 3: remainder sent Seeker with Simple take/make limit classes (works the plain
+      orderPrcLimit; see Gateway test below) at limit = -(live cross + HACK_W3_NBBO_OFFSET
+      0.07), floored at -HACK_MAX_PRICE (1.70). Works HACK_W3_WORK_S = 10s, then the
+      status-gated batched_fill_check_and_cancel settles it.
+    WAVE 4: any W3 remainder re-priced off a REFRESHED NBBO at -(cross + HACK_W4_NBBO_OFFSET
+      0.15), same floor, resting orderDuration = seconds to 16:00:00 (self-expires; capped by
+      WAVE_REST_MAX_DURATION_S = 310 for test-harness runs).
+  NBBO source (_nbbo_table): v7 sranalytics.msgoptionimpliedquote; v8
+  sranalytics.msgliveimpliedquote (the F4 table, NOT the adj proxy). Refresh retries 3x, 1s
+  apart, on failure/missing leg/ask<=0/row older than 5s; after that it SENDS ANYWAY on the
+  freshest quote held (fire-time leg rows as last resort) -- per Zach: never a silent
+  no-order, and never a bare -1.70 limit (LmtCollar reject risk; cap can only bind when the
+  cross is already near it).
+- spdr_rock_order_functions.py: trade_complex/_send_single_complex_order gained
+  limit_class="Surface", parent_handling="Seeker", explicit_limit=None kwargs -- defaults
+  byte-identical for every existing caller; the hacker passes Simple limit classes + the
+  NBBO-derived explicit limit. WAVE3_FORCE_CLAMP_EDGE deleted.
+- Exception isolation preserved: W3/W4 sit in the existing never-lose-wave-1/2-codes guard,
+  W4 nested so its failure cannot lose W3's code. Announced sleep ("sleeping 10s for WAVE-3
+  to work") keeps the daily review's gap classifier clean.
+
+## Why
+The old wave 3 was believed to be a plain working limit at 1.70 (chat "Hacker script max
+spread price", and the hacker backtest models fill-at-cross up to the cap), but as coded it
+was a Seeker quoting at surface+ET2 with 1.70 only as an outer bound -- more passive than the
+validated model exactly on fast-market days. 9/9 evidence: wave-3 fills at 1.00-1.10 vs
+quotes it could have crossed; the model/prod gap surfaced as "attempted but never filled,
+delta_pnl 0" lines.
+
+## Verified
+- Both files compile; ASCII/tabs clean; HACK_MAX_PRICE line untouched (run_backtest_hacker's
+  regex still resolves); no remaining WAVE3_FORCE_CLAMP_EDGE references.
+- Offline mock tests: fresh-quote path (cross 1.15 -> W3 limit -1.22), all-retries-fail path
+  (fire-time fallback, sends), cap-binding path (cross 1.90 -> clamp -1.70), stale-quote-used
+  path. Review pack: both announced sleeps parse; POSSIBLE WAVE-3 MALFUNCTION flag is
+  algo_trade_log-driven, unaffected.
+
+## Gateway test (9/11, Zach sent both; 1 lot SPXW 0DTE 7670/7665 put spread sale)
+- Activetaker was REJECTED on the mleg gateway: spdrRejectReason=BadOrdType (v7, gc 5524,
+  zero fills). Every accepted mleg parent in the live table is Seeker; the ss script's
+  Activetaker precedent is outright-only.
+- FIX: waves 3/4 now send Seeker + Simple take/make limit classes + explicit_limit. With
+  Simple classes the Seeker works at the plain orderPrcLimit (no surface anchoring), which
+  is the intended behavior.
+- Retest PASSED both books: v7 gc 642 Closed/Filled at net 1.50 (limit 1.45, filled AT the
+  cross, sub-second); v8 gc 0000-0000-0000-1edd Closed/Filled at net 1.45 (limit 1.40, at
+  the cross). Surf-offset columns present with Simple classes are accepted and ignored.
+
+## Escalation test (9/11, Zach sent all four; adhoc/test_hacker_w34_escalation.py drives
+## _fire_one end-to-end with deliberately unmarketable early waves, T.* accounts, 1 lot)
+- v7 w3fill: W1 -0.01 / W2 -0.02 unfilled (UserCxl), W3 filled at net 0.30 vs limit -0.32
+  (at the cross: 7655P at the 1.05 ask, 7650P at the 0.75 bid). Wave-4 correctly skipped.
+- v7 w4fill: W1/W2 unfilled, W3 (offset patched -0.20) sat its full 10s and cancelled clean,
+  W4 re-priced off a REFRESHED cross (0.40 -> 0.45 mid-test) and filled at net 0.45 vs
+  limit -0.60.
+- v8 w3fill / w4fill: identical behavior on the v8 gateway (hex gcs, marketSession/RegMkt,
+  progressRule None, cumSquareQty fills; refresh from msgliveimpliedquote). Fills net 0.50
+  vs -0.57 (W3) and 0.40 vs -0.55 (W4) -- all four fills AT the cross, never at the limit.
+- Also verified live: the announced "sleeping 3s"/"sleeping 10s" lines, the status-gated
+  cancels (every non-filled wave Closed/UserCxl, no 1105s), and the NBBO refresh returning
+  fresh quotes on attempt 1 every time.
+- NOT covered by the standalone test: the v8 script's F3-patched wave-1/2 environment around
+  W3/W4 -- first live session covers that.
+
+## Chunking test (9/11, --lots 2 with PREMIUM_LIMIT patched to force 2x1-lot chunks)
+- PASSED both books: the chunked trade_complex branch threads the new kwargs (both W3 chunk
+  SQLs show Simple/Seeker), multi-code fill checks and cancels clean, W3 chunks filled 2/2.
+  v8 bonus coverage: an expired W1 chunk took the "terminal -- no cancel needed" branch.
+- WATCH: v8's W1->W2 transition took ~35s vs v7's ~3s in this test (time inside the legacy
+  per-order status/cancel loop; possibly an artifact of the 10s test durations). Check the
+  harness log's v8 hacker transition time; if tens of seconds there too, fix before a live
+  v8 hack day.
+
+## Harness caught: v8 drift guard (9/11, first harness run)
+- 350pm_script_v8 refused to start: helpers_v8.install_send_patches asserts trade_complex's
+  signature matches its v8 replacement trade_complex_v8, and the three new kwargs had not
+  been ported. The guard worked exactly as designed -- the standalone tests never called
+  install_send_patches, so the v8 REPLACEMENT path was the one untested surface.
+- FIX: trade_complex_v8 gained the same kwargs with the same defaults. Default path is
+  argument-for-argument identical for every existing v8 caller (Surface/Seeker were already
+  hardcoded in _send_single_complex_order). explicit_limit skips the F3 anchor limit (used
+  verbatim, diagnostics print "EXPLICIT limit ... F3 anchor skipped"); limit_class/
+  parent_handling thread through to the send. Hacker-only consequence: v8 W3/W4 chunks by
+  F1 fixed-qty (max 400/order) instead of the shared premium rule, and lands in V8_SEND_LOG.
+- Verified: signatures match, install_send_patches(qty_chunking=True, smrk_anchor=True) runs
+  clean, helpers_v8 compiles, ASCII-clean.
+
+## Still pending
+- Re-run the test harness (the v8 script now starts); watch the v8 hacker's W1->W2 transition
+  time and the W3/W4 lines through the F3-patched sender.
+- First live session watch: W3/W4 lines in the daily review, fills vs the backtest model.

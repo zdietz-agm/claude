@@ -1,0 +1,970 @@
+# ============================== 350PM V8 PARALLEL-RUN SCRIPT =================================
+# Duplicate of 350PM_script.py that trades on SpiderRock v8 while the v7 original runs
+# simultaneously. TEMPORARY until v7 is retired. Deliberate differences from the v7 script:
+#   1. USE_V8/SEND_V8: all SR data reads + order/cancel/fill traffic on v8.
+#   2. Accounts remapped to the v8-only range EOD41_C42..EOD99_C42 (see _v8_remap_accounts).
+#   3. V8_SIZE_RATIO: whole pipeline runs at exact v7 sizing; ONE delimited "V8 RESIZING SECTION"
+#      immediately before the send scales every trade (delete that section at v7 decommission).
+#   4. Data-read gates shifted +0.1s so the two processes never hit shared resources same-tick.
+#   5. script_name "350PM_V8" for position log + algo_trade_log (PK includes script_name --
+#      reusing "350PM" would overwrite the v7 prod rows).
+#   6. EXPLORATORY FEATURES via helpers_v8.py (2026-09-04), each switchable by a flag in the
+#      "V8 EXPLORATORY FEATURES" block below: F1 400-lot chunking, F2 live-spot strike selection,
+#      F3 sMark price anchor (+ extra-spread fair), F4 msgliveimpliedquote quote table.
+#      Code blocks are delimited "V8 F<n>"; notes in migration_to_v8.txt (2026-09-04 section).
+# Keep ALL other logic byte-identical to 350PM_script.py; port v7 changes here until retired.
+# ==============================================================================================
+import datetime as dt
+import time
+import asyncio
+import pandas as pd
+import numpy as np
+
+import os
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+from google_chat_webhook import send_message, my_chat, aa
+from calendar_utils import getNowEst, SERIALS
+from spdr_rock_functions import run_query
+today = dt.date.today()
+
+# --- SpiderRock v8 toggles (must run BEFORE the spdr_rock_order_functions star-import: the
+# get_closest_* SQL strings are copied by value, so flipping after the import keeps stale v7
+# table names). use_v8() flips the quote table, rebuilds the SQL, and routes run_query. ---
+USE_V8  = True
+SEND_V8 = True
+if USE_V8:
+	from spdr_rock_order_functions import use_v8 as _use_v8
+	_use_v8(True, send=SEND_V8)
+
+import helpers
+from helpers import *
+from spdr_rock_order_functions import *
+from spdr_rock_functions import ConnPool
+seed = int(dt.datetime.now().strftime("%f")) % 10000
+counter = create_counter(seed)
+
+# Knobs are defined below the test-mode CLI block (search "Test-mode CLI") so the CLI
+# overrides sit on the same lines as their prod defaults.
+
+# Pre-warmed connection pools for srtrade (all order INSERTs + fill-check + cancel) and
+# sranalytics (batched refresh_legs SELECT). Both are pooled ONLY for 350PM; 340/355 stay
+# on fresh conns. Size rationale:
+#   SRTRADE_POOL_SIZE = 16   -- peak concurrent wave-1 fires ~8-10; 1.6x headroom.
+#                               Overflow-to-fresh handles bursts > 16 gracefully.
+#   SRANALYTICS_POOL_SIZE = 4 -- only 1 concurrent SELECT today; small headroom for future use.
+SRTRADE_POOL_SIZE     = 16 # test this with less than then number of algos firing
+SRANALYTICS_POOL_SIZE = 4
+
+# --- V8 parallel-run sizing ratio -------------------------------------------------------------
+# Scales the sizing inputs relative to the v7 script running simultaneously: each config's
+# dollar_target / max_size / size_target (floor 1 contract where numeric) and the per-script
+# loss cap (MAX_LOSS_CAP_350). The GLOBAL loss cap is NOT scaled (see the loss-cap note below).
+# All process-local, the v7 script is untouched. 1.0 = same size as v7.
+V8_SIZE_RATIO = .20
+
+# --- V8 gate delay -----------------------------------------------------------------------------
+# EVERY wait-gate in this script fires this many seconds AFTER the corresponding v7 gate, so the
+# two simultaneous processes never hit shared resources on the same tick. 0.0 -> identical timing
+# to 350PM_script.py. TEMPORARY for the parallel-run period.
+V8_GATE_DELAY_S = 0.0
+
+def _v8_gate(h, m, s, us=0):
+	"""The v7 gate time (pass v7's exact h/m/s/us) shifted by V8_GATE_DELAY_S."""
+	base = dt.datetime.combine(dt.date.today(), dt.time(h, m, s, us))
+	return (base + dt.timedelta(seconds=V8_GATE_DELAY_S)).time()
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~ V8 EXPLORATORY FEATURES (helpers_v8) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Each flag is the single disable switch for its feature; all False -> this script behaves like
+# the pre-2026-09-04 v8 parallel run. Tuning knobs live in helpers_v8.py. The code sits in three
+# delimited blocks: "V8 F1/F3/F4 SEND-PATH PATCHES" (startup), "V8 F2/F4 LIVE-SPOT STRIKE
+# SELECTION" (3:50 chain refresh) and "V8 FEATURES RECAP" (log only, not chat).
+V8_QTY_CHUNKING = True   # F1: 400-lot orders (helpers_v8.V8_MAX_QTY_PER_ORDER) instead of v7 $27k premium chunks
+V8_LIVE_SPOT    = True   # F2 (+F4): strikes picked around srlive.msgindexquote SPX; chain from msgliveimpliedquote
+V8_SMRK_ANCHOR  = True   # F3 (+F4): limit/working price anchored on sMark (+ gap offset); extra-spread fair on smrk
+import helpers_v8 as _hv8
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Send-order priority: these algos are placed at the FRONT of the config list so their
+# trades hit SR first in the synchronous-INSERT chain. Only list PARENT names; CLOSER/bumped
+# derivatives inherit their parent's position via helpers.insert_before_parent.
+PRIORITY_ALGOS = [
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS",
+]
+
+# --- Test-mode CLI (fed by test_run_algos.sh) ------------------------------------------------
+# Prod runs with NO arguments and behaves exactly as before. Passing ANY argument without
+# --test (or --simulation) is a hard error, so a prod launch can never be silently overridden.
+# --simulation is set only when running under simulate_prod.py via runpy, which passes
+# ["--simulation"] in sys.argv.
+import argparse as _argparse
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--test", action="store_true")
+_p.add_argument("--simulation", action="store_true")
+_p.add_argument("--trigger-all", action="store_true")
+_p.add_argument("--trigger-all-size", type=int, default=None)
+_p.add_argument("--send-trades", type=lambda s: s.strip().lower() == "true", default=None)
+_p.add_argument("--test-340pm-imbal", type=float, default=None)
+_p.add_argument("--test-350pm-imbal", type=float, default=None)
+_p.add_argument("--test-ndx-imbal", type=float, default=None)
+_p.add_argument("--test-first-tick-bps", type=float, default=None)
+_p.add_argument("--test-spy-340", type=float, default=None)
+_p.add_argument("--test-spy-350", type=float, default=None)
+_p.add_argument("--test-spy-high", type=float, default=None)
+_p.add_argument("--test-spy-low", type=float, default=None)
+_p.add_argument("--test-closer", action="store_true")
+_p.add_argument("--force-bumped-test", action="store_true")
+_p.add_argument("--test-rebal-355-b", type=float, default=None)
+_p.add_argument("--test-realized-change", type=int, choices=range(10), default=None)
+_a = _p.parse_args()
+if len(sys.argv) > 1 and not (_a.test or _a.simulation):
+	raise AssertionError(f"CLI args are only allowed in test mode. Got {sys.argv[1:]}. Pass --test.")
+
+IS_TEST = False or _a.test   # prod: real v8 accounts (EOD41+). --test (test_run_algos.sh) routes all orders to T.AGMV8.01.
+IS_SIMULATION = _a.simulation
+TRIGGER_ALL = False or _a.trigger_all
+TRIGGER_ALL_SIZE = 4 if _a.trigger_all_size is None else _a.trigger_all_size
+SEND_TRADES = True if _a.send_trades is None else _a.send_trades
+
+TEST_340PM_IMBAL = -.31e9 if _a.test_340pm_imbal is None else _a.test_340pm_imbal
+TEST_350PM_IMBAL = .2e9 if _a.test_350pm_imbal is None else _a.test_350pm_imbal
+TEST_NDX_IMBAL = None if _a.test_ndx_imbal is None else _a.test_ndx_imbal  #1.1e9
+# First tick normally comes from spy_data.csv, written by save_spy_prices.py. That script is
+# NOT part of the test fleet, so test runs must inject the value directly. None = read the CSV.
+TEST_FIRST_TICK_BPS = None if _a.test_first_tick_bps is None else _a.test_first_tick_bps
+TEST_SPY_HIGH = None if _a.test_spy_high is None else _a.test_spy_high
+TEST_SPY_LOW = None if _a.test_spy_low is None else _a.test_spy_low
+TEST_SPY_340 = None if _a.test_spy_340 is None else _a.test_spy_340  # SPY price override for 3:40 BBG snap (ignored unless IS_TEST=True)
+TEST_SPY_350 = None if _a.test_spy_350 is None else _a.test_spy_350  # SPY price override for 3:50 BBG snap (ignored unless IS_TEST=True)
+FORCE_BUMPED_TEST = False or _a.force_bumped_test  # True = bumped spreads trigger on any parent fire, not just 1-lot days
+# Overrides the BINNED factor_realized_change (0-9 percentile bin), not the raw vol change.
+TEST_REALIZED_CHANGE = None if _a.test_realized_change is None else _a.test_realized_change
+TEST_CLOSER = False or _a.test_closer  # True (with IS_TEST=True) = closer overrides fire on any eligible parent regardless of signal/price gates
+TEST_REBAL_355_B = None if _a.test_rebal_355_b is None else _a.test_rebal_355_b  # $B override for the IMBAL_GROWS CLOSER/BUMPED adverse-rebal veto (rebal_veto.py). Ignored unless IS_TEST=True; test runs otherwise use the prior day's CSV row.
+
+if IS_TEST:
+	MAX_BUY_PRICE_SPREAD = 10
+	helpers.EDGE_TARGET_4_LEGGED_1 *= 3
+	helpers.MAX_EDGE_4_LEGGED_1 *= 3
+	helpers.EDGE_TARGET_4_LEGGED_2 *= 3
+	helpers.MAX_EDGE_4_LEGGED_2 *= 3
+	# 2-legged IS_TEST 3x multiplier removed -- 350PM now uses regime-aware edges
+	# via compute_edge_mult, which reads dict configs not module-level scalars.
+
+	# from position_logging_helper import clear_log_of_test_trades
+	# clear_log_of_test_trades()
+
+
+if __name__ == "__main__":
+	# _____________________________________________________________Preparation Logic_____________________________________________________________
+	if is_month_end():
+		send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")} Not running 350pm V8 script because it is month end.", my_chat)
+		exit()
+
+	if TRIGGER_ALL and not IS_TEST:
+		raise AssertionError("TRIGGER_ALL is set to True but IS_TEST is False. This is not allowed.")
+
+	if not SEND_TRADES and not IS_TEST and not IS_SIMULATION:
+		raise AssertionError("SEND_TRADES is set to False but IS_TEST is False (and not in simulation). This is not allowed.")
+
+	from position_logging_helper import warn_if_log_large
+	warn_if_log_large()
+
+	# load all config dictionaries
+	configs = load_configs_from_directory("./configs", time="350PM", priority_algos=PRIORITY_ALGOS)
+	print("Loaded configs:")
+	for cfg in configs:
+		print(cfg["name"])
+
+	# V8 sizing note: NOTHING here is scaled. The ENTIRE pipeline (prep_trades, closer, bumped,
+	# loss caps at v7 values) runs at exact v7 sizing; the single ratio pass lives in the clearly
+	# delimited "V8 RESIZING SECTION" (#~~~~) immediately before the send block. Decommission of
+	# the v7 scripts = delete that section (and extra_spread_trader.SIZE_RATIO, set inside it).
+
+	# ---------------- V8: account remap -> EOD41_C42..EOD99_C42 (v8-only accounts) ----------------
+	# STATIC map covering every account 350PM order flow can produce: the 19 config accounts PLUS
+	# the trader-module accounts that never appear in configs (bumped EOD20/25/28, closer EOD31/32,
+	# extra spreads EOD9). Rule: EODn_C42 -> EOD(n+40)_C42; the A.350.* accounts -> EOD90-97.
+	# Keep in sync with spdr_to_bbg_my_accounts in D:/PycharmProjects/scratch/get_spdr_execs.py.
+	_V8_ACCT_FLOOR, _V8_ACCT_CEIL = 41, 99
+	V8_ACCOUNT_MAP = {
+		# config accounts (EODn -> EOD n+40)
+		"EOD1_C42":  "EOD41_C42",   # SPREAD_SALES_SPX_IMBAL_SHRINKS
+		"EOD6_C42":  "EOD46_C42",   # SPREAD_SALES_SPX_IMBAL_GROWS
+		"EOD7_C42":  "EOD47_C42",   # SPREAD_SALES_SPX_IMBAL_VS_MARKET
+		"EOD8_C42":  "EOD48_C42",   # SPREAD_SALES_SPX_IMBAL_GROWS_SML
+		"EOD10_C42": "EOD50_C42",   # SPREAD_SALES_SPX_HIGH_PAIRED
+		"EOD11_C42": "EOD51_C42",   # SPREAD_SALES_NDX_IMBAL_VS_MARKET (disabled today)
+		"EOD12_C42": "EOD52_C42",   # SPREAD_SALES_SPX_DUAL_IMBAL
+		"EOD17_C42": "EOD57_C42",   # SPREAD_SALES_SPX_IMBAL_VS_MOVE_NO_MKT
+		"EOD22_C42": "EOD62_C42",   # SPREAD_SALES_SPX_IMBAL_GROWS_EXTRA_CALLS
+		"EOD23_C42": "EOD63_C42",   # SPREAD_SALES_SPX_IMBAL_GROWS_EXTRA_PUTS
+		"EOD24_C42": "EOD64_C42",   # SPREAD_SALES_SPX_IMBAL_GROWS_SML2
+		# trader-module accounts (NOT in configs -- bumped / closer / extra spreads)
+		"EOD9_C42":  "EOD49_C42",   # extra_spread_trader (EXTRA_SPREAD_ACCOUNT)
+		"EOD20_C42": "EOD60_C42",   # bumped: IMBAL_GROWS_BUMPED
+		"EOD25_C42": "EOD65_C42",   # bumped: IMBAL_SHRINKS_BUMPED
+		"EOD28_C42": "EOD68_C42",   # bumped: IMBAL_VS_MARKET_BUMPED
+		"EOD31_C42": "EOD71_C42",   # closer: IMBAL_VS_MARKET_CLOSER
+		"EOD32_C42": "EOD72_C42",   # closer: IMBAL_GROWS_CLOSER
+		# A.350.* accounts -> EOD90-97
+		"A.350.BS_C42":  "EOD90_C42",   # SPREAD_BUYS_SPX
+		"A.350.SO_C42":  "EOD91_C42",   # OUTRIGHT_SALES_SPX
+		"A.350.SO2_C42": "EOD92_C42",   # OUTRIGHT_SALES_SPX_LOW_VIX
+		"A.350.SO3_C42": "EOD93_C42",   # OUTRIGHT_SALES_SPX_IMBAL_GROWS
+		"A.350.SO4_C42": "EOD94_C42",   # OUTRIGHT_SALES_SPX_IMBAL_VS_MARKET
+		"A.350.SO5_C42": "EOD95_C42",   # SPREAD_IMBAL_AND_TICK
+		"A.350.SS_C42":  "EOD96_C42",   # SPREAD_SALES_SPX
+		"A.350.SS1_C42": "EOD97_C42",   # SPREAD_SALES_SPX_LOW_VIX
+	}
+	# Sanity: every loaded config account must be in the static map (fail LOUD at 3:38, not at send).
+	_unmapped_cfg = sorted({c["account"] for c in configs} - set(V8_ACCOUNT_MAP))
+	if _unmapped_cfg:
+		raise AssertionError(f"[V8] config account(s) missing from V8_ACCOUNT_MAP: {_unmapped_cfg} "
+		                     f"-- add them (and get_spdr_execs.py entries) before running")
+	print(f"{pretty_time()} -- [V8] Static account map active ({len(V8_ACCOUNT_MAP)} v7 accounts -> EOD41-97)")
+
+	# extra_spread_trader sends to its module-level EXTRA_SPREAD_ACCOUNT directly (imported by
+	# value from configs_extra_spreads) -- it never reads trade_dict accounts, so the send-time
+	# remap below can't catch it. Patch the module attr; in IS_TEST its TEST_ACCOUNTS lookup must
+	# also resolve the v8 account -> T.AGMV8.01.
+	import extra_spread_trader as _est
+	_est.EXTRA_SPREAD_ACCOUNT = V8_ACCOUNT_MAP["EOD9_C42"]
+	_est.TEST_ACCOUNTS = {V8_ACCOUNT_MAP["EOD9_C42"]: "T.AGMV8.01"}
+	print(f"{pretty_time()} -- [V8] extra_spread_trader account patched -> {_est.EXTRA_SPREAD_ACCOUNT}")
+
+	#~~~~~~~~~~~~~~~~~~~~~~ V8 F1/F3/F4: SEND-PATH PATCHES (helpers_v8) ~~~~~~~~~~~~~~~~~~~~~~~~~~
+	# Process-local monkeypatch of spdr_rock_order_functions.trade_complex (F1 chunking + F3 smrk
+	# anchor) and, with F3 on, the wave-2 leg refreshers (F4 table, brings smrk to every wave).
+	# Signature-checked: a v7-side edit to those shared functions fails HERE at 3:38, not at send.
+	# The extra-spread ladder fair (long - short) is pegged to smrk as well (module default sprc).
+	_hv8.install_send_patches(qty_chunking=V8_QTY_CHUNKING, smrk_anchor=V8_SMRK_ANCHOR)
+	if V8_SMRK_ANCHOR:
+		_est.FAIR_PRICE_COL = "smrk"
+		print(f"{pretty_time()} -- [V8 F3] extra_spread_trader.FAIR_PRICE_COL -> smrk")
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+	print(f"{pretty_time()} -- Starting checkForIconStrikes")
+	icon_strikes, extra_magnets = checkForIconStrikes()
+	print(f"{pretty_time()} -- Finished checkForIconStrikes")
+	magnets = []
+	if icon_strikes:
+		magnets += [icon_strikes[1], icon_strikes[2]]  # only get the dealer long strikes
+	if extra_magnets:
+		magnets += extra_magnets
+
+	if not IS_TEST:
+		print(f"{pretty_time()} -- Building start message")
+		start_msg = f"{getNowEst().time().strftime("%I:%M:%S %p")} Starting 350pm V8 algo script (size ratio {V8_SIZE_RATIO})."
+		if magnets:
+			start_msg += f"\nSPX magnets today: {magnets}"
+		print(f"{pretty_time()} -- Sending start message")
+		send_message(start_msg, my_chat)
+		print(f"{pretty_time()} -- Finished sending start message")
+	summary = f"{dt.date.today().strftime('%m/%d/%Y')} {'3:50 PM V8 Algo' if not IS_TEST else 'TEST V8'} RECAP (size ratio {V8_SIZE_RATIO}):\n\n"
+	if magnets:
+		summary += f"\nSPX magnets today: {magnets}\n"
+
+	while getNowEst().time() <= _v8_gate(8 if IS_TEST else LAST_HOUR, 38, 1): # 3:38 PM (+V8_GATE_DELAY_S)
+		time.sleep(30)  # wait 30 seconds
+
+	# Warm A: 7s before 3:40pm -- pre-open pool conns so 3:50pm sends never pay handshake cost.
+	# Runs in a separate wait-loop so warm timing is precise even if the outer 3:38 gate above returns late.
+	while getNowEst().time() <= _v8_gate(8 if IS_TEST else LAST_HOUR, 39, 55): # 3:39:55 PM (+V8_GATE_DELAY_S)
+		time.sleep(.5)
+	print(f"{pretty_time()} -- Warm A: opening srtrade pool ({SRTRADE_POOL_SIZE}) + sranalytics pool ({SRANALYTICS_POOL_SIZE})")
+	try:
+		_t_warm_a = time.perf_counter()
+		srtrade_pool     = ConnPool("srtrade",     SRTRADE_POOL_SIZE)
+		sranalytics_pool = ConnPool("sranalytics", SRANALYTICS_POOL_SIZE)
+		print(f"{pretty_time()} -- Warm A done in {(time.perf_counter()-_t_warm_a)*1000:.0f}ms")
+	except Exception as e:
+		print(f"{pretty_time()} -- Warm A FAILED ({e}); falling back to fresh conns for 350PM")
+		srtrade_pool = None
+		sranalytics_pool = None
+
+	if IS_TEST: time.sleep(4.5)
+
+	while getNowEst().time() <= _v8_gate(8 if IS_TEST else LAST_HOUR, 40, 3): # v7: 3:40:03 (+V8_GATE_DELAY_S)
+		time.sleep(.5)  # wait .5 second
+
+	# _____________________________________________________________Capturing 340pm Data_____________________________________________________________
+
+	# Capture live SPY price at ~3:40 for spy_chg_1540_1550_bps factor (used by IMBAL_GROWS dont_trade / SML2 trade)
+	print(f"{pretty_time()} -- Starting pull SPY price 3:40 via BBG")
+	if IS_TEST:
+		spy_price_340 = TEST_SPY_340
+	else:
+		try:
+			from xbbg import blp
+			spy_price_340 = float(blp.bdp("SPY US Equity", "PX_LAST").iloc[0, 0])
+		except Exception as e:
+			print(f"  WARNING: failed to pull SPY price at 3:40 -- {e}. spy_price_340 = None")
+			spy_price_340 = None
+	print(f"{pretty_time()} -- Finished pull SPY price 3:40: {spy_price_340}")
+
+	print(f"{pretty_time()} -- Starting get_340_imbal()")
+	imbal340 = get_340_imbal(is_test=IS_TEST, test_imbal=TEST_340PM_IMBAL)
+	print(f"{pretty_time()} -- Finished get_340_imbal()")
+
+	print(f"{pretty_time()} -- Starting get_market_measurements()")
+	market340, today_move340, std340 = get_market_measurements()
+	print(f"{pretty_time()} -- Finished get_market_measurements()")
+	# if IS_TEST:
+	# 	today_move340=0.016
+	# 	market340="UP"
+	print(f"{pretty_time()} -- Starting get_imbal_mag() 340PM")
+	imbal_mag340 = get_imbal_mag(imbal340)
+	print(f"{pretty_time()} -- Starting get_imbal_signed() 340PM")
+	imbal_signed340 = get_imbal_signed(imbal340)
+	print(f"{pretty_time()} -- Finished imbal calculations 340PM")
+
+	print(f"{pretty_time()} -- Starting get_high_low() 340PM")
+	hl_raw340 = get_high_low()
+	print(f"{pretty_time()} -- Finished get_high_low() 340PM")
+	hl340 = hl_raw340 / std340
+	print(f"{pretty_time()} -- Starting get_rsi() 340PM	340PM")
+	rsi340 = get_rsi(today_move340)
+	print(f"{pretty_time()} -- Finished get_rsi() 340PM")
+	print(f"{pretty_time()} -- Starting get_vix() 340PM")
+	vix340 = get_vix()
+	print(f"{pretty_time()} -- Finished get_vix() 340PM")
+	print(f"{pretty_time()} -- Starting get_change_in_realized() 340PM")
+	change_in_realized = get_change_in_realized()
+	print(f"{pretty_time()} -- Finished get_change_in_realized() 340PM")
+	print(f"{pretty_time()} -- Starting run_query(get_closest_puts_sql) 340PM")
+	puts = run_query(get_closest_puts_sql, verbose=True, tag="vol0dte_340")
+	print(f"{pretty_time()} -- Finished run_query(get_closest_puts_sql) 340PM")
+	today_vol340 = puts.satm.iloc[0]
+
+	print(f"{pretty_time()} -- Starting factor_dict construction")
+	factor_dict = {
+		"factor_imbal_mag340": bin_imbal_mag(imbal_mag340),
+		"factor_imbal_signed340": bin_imbal_signed(imbal_signed340),
+		"factor_vol340": bin_today_vol(today_vol340),
+		"factor_vix340": bin_vix(vix340),
+		"factor_rsi340": bin_rsi(rsi340),
+		"factor_high_low340": bin_high_low(hl340),
+		"factor_market_type340": 1 if market340 == "UP" else -1 if market340 == "DOWN" else 0,
+		"factor_realized_change": bin_realized_change(change_in_realized),
+	}
+	# Test override BEFORE factor_realized_change_gte_8 below, which derives from this value.
+	if IS_TEST and TEST_REALIZED_CHANGE is not None:
+		factor_dict["factor_realized_change"] = TEST_REALIZED_CHANGE
+		print(f"{pretty_time()} -- TEST override: factor_realized_change = {TEST_REALIZED_CHANGE}")
+
+	factor_dict["factor_340_buy_imbal_greater_than_700"] = 1 if imbal340 > .7e9 else 0
+	# Above-80th-percentile realized-vol change (bins 8-9). Used by put_size_multiplier_factors
+	# half-size rules on the spread-sale algos (see prod_change_logs/8_7_2026.md).
+	factor_dict["factor_realized_change_gte_8"] = 1 if factor_dict["factor_realized_change"] >= 8 else 0
+	print(f"{pretty_time()} -- Finished factor_dict construction")
+
+	if imbal340 == NO_IMBAL_VAL:
+		imbal340 = "*Not Found*"
+
+	if isinstance(imbal340, str):
+		summary += "No 3:40pm imbalance found. Exited.\n"
+		send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")}\n" + summary, my_chat)
+		exit()
+
+
+	while getNowEst().time() <= _v8_gate(8 if IS_TEST else LAST_HOUR, 48, 1): # 3:48 PM (+V8_GATE_DELAY_S)
+		time.sleep(30)  # wait 30 seconds
+	while getNowEst().time() <= _v8_gate(8 if IS_TEST else LAST_HOUR, 49, 55): # v7: 3:49:55 (+V8_GATE_DELAY_S)
+		time.sleep(.5)  # wait .5 second
+
+	# ================= ADVERSE LEVERED-REBAL VETO (added 2026-09-09) =====================
+	# IMBAL_GROWS CLOSER/BUMPED do not trade a side when the projected 3:55pm levered-ETF rebal is
+	# adverse by > rebal_veto.REBAL_VETO_THRESHOLD_B (4.5B prod; backtests model 5.0B). The number
+	# is read from the CSV btic_and_imbal_script.py writes at ~15:49:03 (rebal_veto.REBAL_355_CSV);
+	# same file as v7, so both scripts veto identically. Read here at 3:49:55 -- after btic's write,
+	# still inside the pre-3:50 wait -- so it adds nothing to the post-15:50 path. FAIL-OPEN:
+	# unreadable -> loud banner, both layers trade exactly as before. Test runs use the prior day's
+	# row unless --test-rebal-355-b overrides. Consumed only by the rebal_355_B= kwargs on the
+	# closer + bumped calls; no other algo sees it.
+	try:
+		from rebal_veto import load_rebal_355_B
+		rebal_355_B, rebal_355_desc = load_rebal_355_B(today, is_test=IS_TEST,
+		                                               test_override=TEST_REBAL_355_B if IS_TEST else None)
+	except Exception as _rebal_e:   # belt-and-braces: even an import failure must not take down the 3:50 run
+		rebal_355_B, rebal_355_desc = None, f"UNAVAILABLE (rebal_veto error: {_rebal_e}) -- veto inactive, layers trade as normal"
+		print(f"!!!!!!!!!!!!!!!! REBAL VETO INACTIVE -- {_rebal_e} -- IMBAL_GROWS CLOSER/BUMPED trade as normal today !!!!!!!!!!!!!!!!")
+	print(f"{pretty_time()} -- 355 levered rebal for IMBAL_GROWS CLOSER/BUMPED veto: {rebal_355_desc}")
+	# ============================ END ADVERSE LEVERED-REBAL VETO ==========================
+
+	# Get 0DTE vol early (3:49:55) since it won't change significantly by 3:50:02
+	print(f"{pretty_time()} -- Starting run_query(get_closest_puts_sql) Note: used for 0dte Vol")
+	puts = run_query(get_closest_puts_sql, verbose=True, tag="vol0dte_350")
+	print(f"{pretty_time()} -- Finished run_query(get_closest_puts_sql) Note: used for 0dte Vol")
+	today_vol = puts.satm.iloc[0]
+
+	# NDX 0DTE vol (from NDXP puts) - disabled, NDX strat not enabled yet
+	# print(f"{pretty_time()} -- Starting run_query(get_closest_ndxp_puts_sql) Note: used for NDX 0dte Vol")
+	# ndxp_puts = run_query(get_closest_ndxp_puts_sql)
+	# print(f"{pretty_time()} -- Finished run_query(get_closest_ndxp_puts_sql) Note: used for NDX 0dte Vol")
+	# ndx_vol = ndxp_puts.satm.iloc[0]
+	ndx_vol = None
+
+	# Pull SPY price pre-3:50 for IMBAL_VS_MOVE factor (won't change meaningfully in a few seconds)
+	print(f"{pretty_time()} -- Starting SPY price pull (pre-350pm, for IMBAL_VS_MOVE)")
+	spy_price_for_move = blp.bdp("SPY US EQUITY", "PX_LAST").iloc[0, 0]
+	print(f"{pretty_time()} -- Finished SPY price pull: {spy_price_for_move:.2f}")
+	print(f"{pretty_time()} -- Starting get_high_low_with_prices() (pre-350pm, for IMBAL_VS_MOVE)")
+	hl_raw_move, spy_high, spy_low = get_high_low_with_prices()
+	if IS_TEST and (TEST_SPY_HIGH is not None):
+		spy_high = TEST_SPY_HIGH
+	if IS_TEST and (TEST_SPY_LOW is not None):
+		spy_low = TEST_SPY_LOW
+	print(f"{pretty_time()} -- Finished get_high_low_with_prices(): high={spy_high:.2f}, low={spy_low:.2f}")
+
+	# Warm B: ~10-min idle window since Warm A. Cheap: 1 SELECT 1 per conn.
+	if srtrade_pool is not None:
+		try:
+			srtrade_pool.ping_and_repair()
+		except Exception as e:
+			print(f"{pretty_time()} -- Warm B srtrade ping FAILED ({e}); pool may have stale conns")
+	if sranalytics_pool is not None:
+		try:
+			sranalytics_pool.ping_and_repair()
+		except Exception as e:
+			print(f"{pretty_time()} -- Warm B sranalytics ping FAILED ({e}); pool may have stale conns")
+
+	if IS_TEST: time.sleep(4.5)
+
+	while getNowEst().time() <= _v8_gate(8 if IS_TEST else LAST_HOUR, 50, 1, 100000): # v7: 3:50:01.1 (+V8_GATE_DELAY_S)
+		time.sleep(.1)  # wait .1 second
+
+	# _____________________________________________________________Capturing 350pm Data_____________________________________________________________
+
+	# Capture live SPY price at ~3:50 for spy_chg_1540_1550_bps factor (used by IMBAL_GROWS dont_trade / SML2 trade)
+	print(f"{pretty_time()} -- Starting pull SPY price 3:50 via BBG")
+	if IS_TEST:
+		spy_price_350 = TEST_SPY_350
+	else:
+		try:
+			from xbbg import blp
+			spy_price_350 = float(blp.bdp("SPY US Equity", "PX_LAST").iloc[0, 0])
+		except Exception as e:
+			print(f"  WARNING: failed to pull SPY price at 3:50 -- {e}. spy_price_350 = None")
+			spy_price_350 = None
+	print(f"{pretty_time()} -- Finished pull SPY price 3:50: {spy_price_350}")
+
+	print(f"{pretty_time()} -- Starting get_350_imbal()")
+	imbal = get_350_imbal(is_test=IS_TEST, test_imbal=TEST_350PM_IMBAL)
+	print(f"{pretty_time()} -- Finished get_350_imbal()")
+
+	print(f"{pretty_time()} -- Starting get_market_measurements() (350pm)")
+	market, today_move, std = get_market_measurements()
+	print(f"{pretty_time()} -- Finished get_market_measurements() (350pm)")
+	print(f"{pretty_time()} -- Starting get_market_measurements_qqq() (350pm)")
+	qqq_market_ratio, qqq_today_move, qqq_std = get_market_measurements_qqq()
+	print(f"{pretty_time()} -- Finished get_market_measurements_qqq(): ratio={qqq_market_ratio:.3f}")
+	if IS_TEST:
+		qqq_market_ratio = 1
+	# 	today_move = 0.016
+	# 	market = "UP"
+	print(f"{pretty_time()} -- Starting imbal calculations (350pm)")
+	imbal_mag = get_imbal_mag(imbal)
+	imbal_signed = get_imbal_signed(imbal)
+	print(f"{pretty_time()} -- Finished imbal calculations (350pm)")
+	print(f"{pretty_time()} -- Starting get_high_low() (350pm)")
+	hl_raw = get_high_low()
+	print(f"{pretty_time()} -- Finished get_high_low() (350pm)")
+	hl = hl_raw / std
+	print(f"{pretty_time()} -- Starting get_rsi() (350pm)")
+	rsi = get_rsi(today_move)
+	print(f"{pretty_time()} -- Finished get_rsi() (350pm)")
+	print(f"{pretty_time()} -- Starting get_vix() (350pm)")
+	vix = get_vix()
+	print(f"{pretty_time()} -- Finished get_vix() (350pm)")
+
+	# Scale EDGE_OFFSET_OUTRIGHT with VIX (legacy outright path -- regime sizing only covers 2-legged spreads).
+	helpers.EDGE_OFFSET_OUTRIGHT = round(helpers.EDGE_OFFSET_OUTRIGHT * get_vix_edge_multiplier(vix), 2)
+	print(f"{pretty_time()} -- EDGE_OFFSET_OUTRIGHT scaled by VIX={vix:.2f} -> {helpers.EDGE_OFFSET_OUTRIGHT}")
+
+	print(f"{pretty_time()} -- Starting factor_dict updates (350pm)")
+	factor_dict["factor_imbal_mag"] = bin_imbal_mag(imbal_mag)
+	factor_dict["factor_imbal_signed"] = bin_imbal_signed(imbal_signed)
+	factor_dict["factor_vol"] = bin_today_vol(today_vol)
+	factor_dict["factor_vix"] = bin_vix(vix)
+	factor_dict["factor_rsi"] = bin_rsi(rsi)
+	factor_dict["factor_high_low"] = bin_high_low(hl)
+	factor_dict["factor_market_type"] = 1 if market == "UP" else -1 if market == "DOWN" else 0
+	factor_dict["factor_sell_imbal_greater_than_2"] = 1 if imbal < -2e9 else 0
+	print(f"{pretty_time()} -- Finished factor_dict updates (350pm)")
+
+	if imbal == NO_IMBAL_VAL:
+		imbal = "*Not Found*"
+
+	if isinstance(imbal, str):
+		summary += "No 3:50pm imbalance found. Exited.\n"
+		send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")}\n" + summary, my_chat)
+		exit()
+
+	# QQQ net imbalance from BasketSnapshots (.NDX basket)
+	print(f"{pretty_time()} -- Starting get_qqq_net_imbal()")
+	qqq_imbal_350 = get_qqq_net_imbal(is_test=IS_TEST)
+	print(f"{pretty_time()} -- Finished get_qqq_net_imbal(): {qqq_imbal_350 / 1e9:.2f}B" if qqq_imbal_350 is not None else f"{pretty_time()} -- Finished get_qqq_net_imbal(): None")
+
+	if IS_TEST and TEST_NDX_IMBAL is not None:
+		qqq_imbal_350 = TEST_NDX_IMBAL
+
+	if qqq_imbal_350 is None:
+		print("WARNING: QQQ net imbalance not available. NDX IMBAL_VS_MARKET strategy will not trigger.")
+
+	while getNowEst().time() <= _v8_gate(8 if IS_TEST else LAST_HOUR, 50, 5, 200000):  # v7: 3:50:05.2 (+V8_GATE_DELAY_S)
+		time.sleep(.01)
+	print(f"{pretty_time()} -- Starting getFirstTick()")
+	firstTickBps = getFirstTick(IS_TEST, retries=10, test_tick_bps=TEST_FIRST_TICK_BPS) * 100 * 100
+	print(f"{pretty_time()} -- Finished getFirstTick(): {firstTickBps:.2f} bps")
+	factor_dict["factor_first_tick"] = 1 if firstTickBps > 5 else -1 if firstTickBps < -5 else 0
+
+	# Paired imbalance from BasketSnapshots (same-day, seenPct > 80%)
+	print(f"{pretty_time()} -- Starting get_recreated_paired_imbal()")
+	paired_recreated = get_recreated_paired_imbal(is_test=IS_TEST)
+	print(f"{pretty_time()} -- Finished get_recreated_paired_imbal(): {paired_recreated / 1e9:.2f}B" if paired_recreated is not None else f"{pretty_time()} -- Finished get_recreated_paired_imbal(): None")
+	# paired_recreated = None
+	# paired_recreated = 22e9
+	if paired_recreated is None:
+		print("WARNING: Recreated paired imbalance not available. HIGH_PAIRED strategy will not trigger.")
+
+	# Additional factors for new algos - 12/23/2025
+	factor_dict["factor_340_imbal_less_than_minus_800m"] = 1 if imbal340 < -.8e9 else 0
+	factor_dict["factor_340_imbal_greater_than_800m"] = 1 if imbal340 > .8e9 else 0
+	factor_dict["factor_350_imbal_greater_than_minus_200m"] = 1 if imbal > -.2e9 else 0
+	factor_dict["factor_350_imbal_less_than_200m"] = 1 if imbal < .2e9 else 0
+	factor_dict["factor_350_imbal_greater_than_1b"] = 1 if imbal > 1e9 else 0
+	factor_dict["factor_350_imbal_less_than_minus_1p5b"] = 1 if imbal < -1.5e9 else 0
+	factor_dict["factor_first_tick_sign"] = 1 if firstTickBps > 0 else -1 if firstTickBps < 0 else 0
+	factor_dict["factor_340_imbal_less_than_500m"] = 1 if imbal340 < .5e9 else 0
+	factor_dict["factor_340_imbal_greater_than_minus_500m"] = 1 if imbal340 > -.5e9 else 0
+
+	# Recreated paired imbalance factors for HIGH_PAIRED strategy
+	factor_dict["factor_350_imbal_greater_than_1p35b"] = 1 if imbal > 1.35e9 else 0
+	factor_dict["factor_350_imbal_less_than_minus_0p6b"] = 1 if imbal < -0.6e9 else 0
+	factor_dict["factor_spy_paired_recreated_gt_18p9b"] = 1 if (paired_recreated is not None and paired_recreated > 18.9e9) else 0
+	factor_dict["factor_spy_paired_recreated_gt_18b"] = 1 if (paired_recreated is not None and paired_recreated > 18e9) else 0
+
+	# Improved HIGH_PAIRED factors (2026-03-23 revision)
+	factor_dict["factor_350_imbal_greater_than_1p2b"] = 1 if imbal > 1.2e9 else 0
+	factor_dict["factor_350_imbal_less_than_minus_1p2b"] = 1 if imbal < -1.2e9 else 0
+	# DUAL_IMBAL factors
+	factor_dict["factor_350_imbal_greater_than_1p5b"] = 1 if imbal > 1.5e9 else 0
+	factor_dict["factor_350_imbal_less_than_minus_1p5b"] = 1 if imbal < -1.5e9 else 0
+	# Against-the-trade veto for spread-sale algos (LOW_VIX, base SPX): skip when imbal is >2.4B against us
+	factor_dict["factor_350_imbal_less_than_minus_2p4b"] = 1 if imbal < -2.4e9 else 0
+	factor_dict["factor_350_imbal_greater_than_2p4b"] = 1 if imbal > 2.4e9 else 0
+	factor_dict["factor_spy_paired_recreated_gt_21b"] = 1 if (paired_recreated is not None and paired_recreated > 21e9) else 0
+	# 8/27/26: HIGH_PAIRED half-size band -- full size only above 32B (see size_multiplier_factors)
+	factor_dict["factor_spy_paired_recreated_gt_32b"] = 1 if (paired_recreated is not None and paired_recreated > 32e9) else 0
+	# Serial day exclusion
+	factor_dict["factor_is_serial"] = 1 if getNowEst().date() in SERIALS else 0
+	# NDX imbal confirmation: dont trade if NDX not confirming direction
+	factor_dict["factor_ndx_lt_10pct_spx"] = 1 if (qqq_imbal_350 is not None and qqq_imbal_350 < 0.1 * imbal) else 0
+	factor_dict["factor_ndx_gt_10pct_spx"] = 1 if (qqq_imbal_350 is not None and qqq_imbal_350 > 0.1 * imbal) else 0
+	# 8/27/26: tighter 50% NDX confirmation (HIGH_PAIRED); fail-open to 0 if QQQ imbal pull failed
+	factor_dict["factor_ndx_lt_50pct_spx"] = 1 if (qqq_imbal_350 is not None and qqq_imbal_350 < 0.5 * imbal) else 0
+	factor_dict["factor_ndx_gt_50pct_spx"] = 1 if (qqq_imbal_350 is not None and qqq_imbal_350 > 0.5 * imbal) else 0
+
+	# SML imbalance band factors for IMBAL_VS_MARKET
+	factor_dict["factor_350_imbal_500m_to_1b"] = 1 if (imbal >= 0.5e9 and imbal <= 1e9) else 0
+	factor_dict["factor_350_imbal_minus_1b_to_minus_500m"] = 1 if (imbal >= -1e9 and imbal <= -0.5e9) else 0
+
+	# QQQ market ratio factors (NDX IMBAL_VS_MARKET strategy)
+	factor_dict["factor_qqq_mkt_ratio_gt_0p8"] = 1 if qqq_market_ratio > 0.8 else 0
+	factor_dict["factor_qqq_mkt_ratio_lt_0p8"] = 1 if qqq_market_ratio < 0.8 else 0
+
+	# SPY imbalance alias for NDX config clarity
+	factor_dict["factor_spy_imbal_less_than_minus_1p5b"] = 1 if imbal < -1.5e9 else 0
+
+	# SPY 15:40 -> 15:50 bps change factors (IMBAL_GROWS dont_trade + IMBAL_GROWS_SML2 trade)
+	if spy_price_340 is not None and spy_price_350 is not None and spy_price_340 > 0:
+		spy_chg_1540_1550_bps = (spy_price_350 - spy_price_340) / spy_price_340 * 10000
+	else:
+		spy_chg_1540_1550_bps = None
+	factor_dict["factor_spy_chg_1540_1550_gt_7"]    = 1 if (spy_chg_1540_1550_bps is not None and spy_chg_1540_1550_bps >  7) else 0
+	factor_dict["factor_spy_chg_1540_1550_lt_neg7"] = 1 if (spy_chg_1540_1550_bps is not None and spy_chg_1540_1550_bps < -7) else 0
+
+	# NDX ATM vol factor - disabled, NDX strat not enabled
+	factor_dict["factor_ndx_atm_vol_lt_17"] = 0  # ndx_vol not pulled
+
+	# QQQ imbalance factors (NDX IMBAL_VS_MARKET strategy)
+	factor_dict["factor_qqq_imbal_greater_than_1b"] = 1 if (qqq_imbal_350 is not None and qqq_imbal_350 > 1e9) else 0
+	factor_dict["factor_qqq_imbal_less_than_minus_0p5b"] = 1 if (qqq_imbal_350 is not None and qqq_imbal_350 < -0.5e9) else 0
+	# QQQ imbalance factors (DUAL_IMBAL strategy)
+	factor_dict["factor_qqq_imbal_less_than_minus_1b"] = 1 if (qqq_imbal_350 is not None and qqq_imbal_350 < -1e9) else 0
+
+	# IMBAL_VS_MOVE factors: SPY move from intraday high/low normalized by rolling std
+	move_from_low = (spy_price_for_move - spy_low) / (spy_price_for_move * std)
+	move_from_high = (spy_high - spy_price_for_move) / (spy_price_for_move * std)
+	factor_dict["factor_market_move_from_low"] = 1 if move_from_low > 1.0 else 0
+	factor_dict["factor_market_move_from_high"] = 1 if move_from_high > 1.0 else 0
+	factor_dict["factor_imbal_gt_neg_500M"] = 1 if imbal > -0.5e9 else 0
+	factor_dict["factor_imbal_lt_500M"] = 1 if imbal < 0.5e9 else 0
+
+	# _____________________________________________________________Refresh Data_____________________________________________________________
+
+	# NDXP data refresh - disabled, NDX strat not enabled
+	# print(f"{pretty_time()} -- Refreshing NDXP data at 350PM")
+	# ndxp_calls = run_query(get_closest_ndxp_calls_sql)
+	# ndxp_puts = run_query(get_closest_ndxp_puts_sql)
+	# ndx = ndxp_puts.uprc.iloc[0]
+	# print(f"{pretty_time()} -- Finished refreshing NDXP data at 350PM")
+	ndxp_calls, ndxp_puts, ndx = None, None, None
+
+	print(f"{pretty_time()} -- Refreshing SPXW data at 350PM")
+	# Pull wider chain that includes up to 1 ITM strike (used only by CLOSER).
+	# All other algos use the OTM-only filtered subsets below (identical to the old behavior).
+	#~~~~~~~~~~~~~~~~~~~ V8 F2/F4: LIVE-SPOT STRIKE SELECTION (helpers_v8) ~~~~~~~~~~~~~~~~~~~~~~
+	# One SELECT (calls+puts, sranalytics.msgliveimpliedquote) + live SPX from srlive.msgindexquote,
+	# run concurrently; frames rebuilt in the exact v7 shape around the live spot with uprc := spot
+	# (SR row value kept in uprc_sr). Prints uPrc vs spot + any strike shift. ANY failure or guard
+	# (spot lag, |spot-uPrc| > 40, short frames) -> the original adj-table SQLs run unchanged.
+	_v8_chain_info = None
+	if V8_LIVE_SPOT:
+		try:
+			calls_with_itm, puts_with_itm, _v8_chain_info = _hv8.fetch_v8_chains(today, tag="refresh350")
+		except Exception as _v8_e:
+			_hv8.record_fallback(str(_v8_e))
+			print(f"{pretty_time()} -- [V8 F2] FALLBACK to adj-table SQLs: {_v8_e}")
+	if _v8_chain_info is None:
+		calls_with_itm = run_query(get_closest_and_slightly_itm_calls_sql, verbose=True, tag="refresh350_calls")
+		puts_with_itm  = run_query(get_closest_and_slightly_itm_puts_sql, verbose=True, tag="refresh350_puts")
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	calls = calls_with_itm[calls_with_itm.okey_xx > calls_with_itm.uprc].reset_index(drop=True)
+	puts  = puts_with_itm[puts_with_itm.okey_xx  < puts_with_itm.uprc].reset_index(drop=True)
+	spx = puts.uprc[0]
+	print(f"{pretty_time()} -- Finished refreshing SPXW data at 350PM")
+
+	# _____________________________________________________________Prep Trades_____________________________________________________________
+
+	option_chains = {
+		"SPXW": {"puts": puts, "calls": calls, "underlying": spx},
+		# "NDXP": {"puts": ndxp_puts, "calls": ndxp_calls, "underlying": ndx},  # disabled, NDX strat not enabled
+	}
+
+	print(f"{pretty_time()} -- Starting prep_trades() 350PM")
+	# 340->350 change-in-imbal factor (parallels 355PM's 350->355). Uses the DEFAULT
+	# ABS_CHG_IMBAL_STATS (empirical ~2B/1.8B) -- 350PM does NOT pass abs_chg_stats.
+	abs_chg_imbal_350 = None
+	if (isinstance(imbal, (int, float)) and isinstance(imbal340, (int, float))
+	    and imbal != NO_IMBAL_VAL and imbal340 != NO_IMBAL_VAL):
+		abs_chg_imbal_350 = abs(imbal - imbal340)
+	_chg_str = f"{abs_chg_imbal_350/1e9:.2f}B" if abs_chg_imbal_350 is not None else "None"
+	print(f"{pretty_time()} -- Regime edge inputs: VIX={vix:.2f}, atmVol={today_vol:.3f}, absImbal={abs(imbal)/1e9:.2f}B, absChgImbal={_chg_str}")
+	# Live-reload SIZE_MULT_350_PUTS/CALLS from algo_globals so mid-run edits take effect.
+	from algo_globals import get_live_size_mults
+	_puts_mult_350, _calls_mult_350 = get_live_size_mults("350")
+	print(f"{pretty_time()} -- Live size mults (350): puts={_puts_mult_350}, calls={_calls_mult_350}")
+	trade_dict, explanations_dict = prep_trades(configs=configs,
+												factor_dict=factor_dict,
+												option_chains=option_chains,
+												today=today,
+												trigger_all=TRIGGER_ALL,
+												trigger_all_size=TRIGGER_ALL_SIZE,
+												magnets=magnets,
+												vix=vix,
+												atm_vol_0dte=today_vol,
+												abs_imbal=abs(imbal),
+												abs_chg_imbal=abs_chg_imbal_350,
+												is_test=IS_TEST,
+												puts_size_mult=_puts_mult_350,
+												calls_size_mult=_calls_mult_350,
+												)
+	print(f"{pretty_time()} -- Finished prep_trades() 350PM")
+
+	# CLOSER overrides (replace parent strikes with $5-closer strikes on well-within + cheap-credit days)
+	# Must run BEFORE bumped so bumped doesn't double-fire on parents we just zeroed.
+	# Also runs BEFORE apply_size_limits so the loss-cap sees the post-CLOSER strikes/widths.
+	# Full try/except/finally: if ANYTHING goes wrong, restore trade_dict and proceed as if CLOSER never ran.
+	closer_spread_summary = ""
+	_closer_ok = False
+	_closer_saved = None
+	try:
+		import copy as _closer_copy
+		_closer_saved = {
+			"trades":      _closer_copy.deepcopy(trade_dict["trades"]),
+			"trade_types": _closer_copy.deepcopy(trade_dict["trade_types"]),
+		}
+		from closer_spread_trader import get_closer_spread_trades
+		_market_ratio = (today_move / std) if std else 0.0
+		closer_decisions = get_closer_spread_trades(
+			trade_dict=trade_dict, configs=configs,
+			puts=puts_with_itm, calls=calls_with_itm, today=today,
+			raw_signals={
+				"market_ratio": _market_ratio,
+				"imbal_350":    imbal,
+				"imbal_340":    imbal340,
+			},
+			vix=vix, atm_vol_0dte=today_vol, abs_imbal=abs(imbal),
+			abs_chg_imbal=abs_chg_imbal_350,
+			force_test=TEST_CLOSER if (TEST_CLOSER and IS_TEST) else False,
+			rebal_355_B=rebal_355_B,   # adverse levered-rebal veto (loaded at 3:49:55, ADVERSE LEVERED-REBAL VETO block)
+		)
+		_n_overrides = sum(1 for d in closer_decisions if d.startswith("OVERRIDE"))
+		for _d in closer_decisions:
+			print(f"  [closer_spread] {_d}")
+		if _n_overrides:
+			closer_spread_summary = f"{_n_overrides} closer override(s) applied"
+			print(f"{pretty_time()} -- {closer_spread_summary}")
+		_closer_ok = True
+	except Exception as _closer_e:
+		closer_spread_summary = f"ERROR in closer spread trader: {_closer_e} -- rolling back trade_dict"
+		print(f"{pretty_time()} -- {closer_spread_summary}")
+		try:
+			import traceback as _closer_tb
+			_closer_tb.print_exc()
+		except Exception:
+			pass
+	finally:
+		# Restore trade_dict if CLOSER did NOT complete cleanly. Uses identity-preserving
+		# mutation (list slice assignment) so any external references still see the rollback.
+		if not _closer_ok and _closer_saved is not None:
+			try:
+				trade_dict["trades"][:]      = _closer_saved["trades"]
+				trade_dict["trade_types"][:] = _closer_saved["trade_types"]
+				print(f"{pretty_time()} -- [closer_spread] trade_dict restored from snapshot")
+			except Exception as _restore_e:
+				# Last-resort: if even the restore fails, log loudly. The pre-CLOSER state is gone;
+				# the script will continue with whatever trade_dict currently looks like.
+				print(f"{pretty_time()} -- CRITICAL: closer rollback failed: {_restore_e}")
+
+	# Apply size limits (loss-cap pro-rata) -- runs AFTER CLOSER so it sees post-resize strikes/widths.
+	# Runs BEFORE bumped spreads (bumped intentionally bypasses the cap, same as prior behavior).
+	try:
+		from position_logging_helper import apply_size_limits
+		print(f"{pretty_time()} -- Starting size limit check (350PM)")
+		apply_size_limits(trade_dict, is_test=IS_TEST, explanations_dict=explanations_dict, max_loss_cap=MAX_LOSS_CAP_350)  # v7 cap: pipeline runs at v7 sizing until the V8 RESIZING SECTION
+		print(f"{pretty_time()} -- Finished size limit check (350PM)")
+	except Exception as e:
+		print(f"{pretty_time()} -- ERROR in size limit check (350PM): {e}")
+
+	# Bumped spread trades (sell bumped strikes on 1-lot days, low vol only)
+	bumped_spread_summary = ""
+	try:
+		from bumped_spread_trader import get_bumped_spread_trades
+		bumped_trades = get_bumped_spread_trades(
+			trade_dict=trade_dict, puts=puts, calls=calls,
+			today=today, today_vol=today_vol,
+			vix=vix, abs_imbal=abs(imbal),
+			abs_chg_imbal=abs_chg_imbal_350,
+			force_test=FORCE_BUMPED_TEST if (FORCE_BUMPED_TEST and IS_TEST) else False,
+			rebal_355_B=rebal_355_B,   # adverse levered-rebal veto (loaded at 3:49:55, ADVERSE LEVERED-REBAL VETO block)
+		)
+		# Insert each bumped trade IMMEDIATELY BEFORE its parent (inherits parent's send-order
+		# priority + fires ahead of the parent's 1-lot residual). Same pattern as CLOSER.
+		from helpers import insert_before_parent
+		for trade_entry, trade_type, parent_trade in bumped_trades:
+			insert_before_parent(trade_dict, trade_entry, trade_type, parent_trade=parent_trade)
+		if bumped_trades:
+			bumped_spread_summary = f"{len(bumped_trades)} bumped spread(s) added to trade queue"
+			print(f"{pretty_time()} -- {bumped_spread_summary}")
+	except Exception as e:
+		bumped_spread_summary = f"ERROR in bumped spread trader: {e}"
+		print(f"{pretty_time()} -- {bumped_spread_summary}")
+
+	# _____________________________________________________________Send Trades_____________________________________________________________
+	# 350PM uses the batched orchestrator (script-level batched fill-check + deduped refresh_legs)
+	# instead of per-order send_complex_two_waves. Saves ~3-4 seconds during the send phase on
+	# multi-order days. Grouping_codes are attached to each trade dict by the orchestrator so
+	# downstream position_logging_helper + algo_trade_logger pick them up unchanged.
+	# 340PM and 355PM still use send_complex_two_waves (unchanged).
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~ V8 RESIZING SECTION (TEMPORARY) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	# The ONLY place sizes are scaled for the v8 parallel run. Everything upstream (prep_trades,
+	# closer, bumped, loss caps) ran at exact v7 sizing; every trade_dict entry -- parents,
+	# outrights, closer, bumped -- is scaled here in one pass, immediately before the send.
+	# v7_unscaled_size is audit-only; nothing may consume it.
+	# extra_spread_trader's ladder never enters trade_dict (it sends its own orders after the
+	# orchestrator), so its module SIZE_RATIO is set HERE to keep all resizing in this section.
+	# NOTE: 355PM_V8 hacker trades are deliberately NOT touched by this pattern -- they derive
+	# from already-scaled 350PM_V8 fills (scaling them again would double-scale).
+	# DECOMMISSION (when the v7 scripts retire): delete this whole section; sizing is then
+	# byte-identical to v7. Nothing else in this script scales sizes.
+	print("_" * 66)
+	print(f"Applying V8_SIZE_RATIO = {V8_SIZE_RATIO:.2f}")
+	for _t in trade_dict["trades"]:
+		if _t.get("size", 0) > 0:
+			_t["v7_unscaled_size"] = _t["size"]
+			_t["size"] = max(1, int(_t["size"] * V8_SIZE_RATIO))
+			print(f"{_t['name']}: {_t['v7_unscaled_size']} --> {_t['size']}")
+	_est.SIZE_RATIO = V8_SIZE_RATIO   # extra-spread ladder sizes (scaled inside extra_spread_trader)
+	print(f"extra_spread_trader.SIZE_RATIO = {V8_SIZE_RATIO:.2f}")
+	print("_" * 66)
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ END V8 RESIZING SECTION ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+	# V8 account swap -- runs AFTER closer/bumped so derived trades (which copy parent accounts)
+	# are covered too. IS_TEST -> everything to the v8 test account (T.AGM* only exists on v7).
+	# Prod -> V8_ACCOUNT_MAP (EOD41+); an account missing from the map (shouldn't happen -- the map
+	# is built from the same configs) gets the next free slot with a LOUD warning. Hard assert at
+	# the end: no order may leave this script on a non-v8 account.
+	if IS_TEST:
+		for trade in trade_dict["trades"]:
+			trade["account"] = "T.AGMV8.01"
+	else:
+		_used_slots = {int(v[3:-4]) for v in V8_ACCOUNT_MAP.values()}
+		for trade in trade_dict["trades"]:
+			_acct = trade["account"]
+			if _acct not in V8_ACCOUNT_MAP:
+				_free = next((n for n in range(_V8_ACCT_FLOOR, _V8_ACCT_CEIL + 1) if n not in _used_slots), None)
+				if _free is None:
+					raise AssertionError(f"[V8] no free v8 account slot for unmapped '{_acct}'")
+				V8_ACCOUNT_MAP[_acct] = f"EOD{_free}_C42"
+				_used_slots.add(_free)
+				print(f"{'!' * 10} [V8] account '{_acct}' was NOT in the static map; assigned "
+				      f"{V8_ACCOUNT_MAP[_acct]} on the fly -- ADD IT to V8_ACCOUNT_MAP + "
+				      f"get_spdr_execs.py {'!' * 10}")
+			trade["account"] = V8_ACCOUNT_MAP[_acct]
+		for trade in trade_dict["trades"]:
+			assert trade["account"].startswith("EOD") and trade["account"].endswith("_C42") and \
+				_V8_ACCT_FLOOR <= int(trade["account"][3:-4]) <= _V8_ACCT_CEIL, \
+				f"[V8] account '{trade['account']}' outside EOD{_V8_ACCT_FLOOR}-{_V8_ACCT_CEIL}_C42"
+
+	print(f"{pretty_time()} -- Starting orchestrate_batched_send() 350PM")
+	if SEND_TRADES:
+		asyncio.run(orchestrate_batched_send(
+			trade_dict, orderDuration=30,
+			srtrade_pool=srtrade_pool, sranalytics_pool=sranalytics_pool,
+		))
+	print(f"{pretty_time()} -- Finished orchestrate_batched_send() 350PM")
+
+	# Log net option positions
+	try:
+		from position_logging_helper import log_positions
+		print(f"{pretty_time()} -- Starting position logging (350PM)")
+		log_positions(trade_dict, script_name="350PM_V8", is_test=IS_TEST)
+		print(f"{pretty_time()} -- Finished position logging (350PM)")
+	except Exception as e:
+		print(f"{pretty_time()} -- ERROR in position logging (350PM): {e}")
+
+	# Extra spread limit orders (supplementary to parent outright strategies)
+	extra_spread_summary = ""
+	try:
+		from extra_spread_trader import send_extra_spread_orders
+		print(f"{pretty_time()} -- Starting extra spread orders")
+		extra_spread_summary = send_extra_spread_orders(
+			trade_dict=trade_dict, puts=puts, calls=calls,
+			today=today, counter=counter, is_test=IS_TEST, send_trades=SEND_TRADES,
+		)
+		print(f"{pretty_time()} -- Finished extra spread orders")
+	except Exception as e:
+		extra_spread_summary = f"ERROR in extra spread trader: {e}"
+		print(f"{pretty_time()} -- ERROR in extra spread trader: {e}")
+
+	# _____________________________________________________________Summary_____________________________________________________________
+
+	summary += f"SPX: {spx:,.2f}. Imbal: {imbal if isinstance(imbal, str) else f'{imbal:,.0f}'}. Market: {market} since current SPY move is {today_move:.4f} and {LOOKBACK} day std dev is {std:.4f}.\n"
+	summary += f"QQQ Market Ratio: {qqq_market_ratio:.2f}. QQQ Imbal: {f'{qqq_imbal_350 / 1e9:.2f}B' if qqq_imbal_350 is not None else 'N/A'}.\n"
+	summary += f"Imbal: {imbal_mag}. Imbal signed: {imbal_signed}. 340PM: {imbal340:,.0f}.\n"
+	summary += f"First Tick: {firstTickBps:.1f} bps.\n"
+	summary += f"Today's Vol: {today_vol:.3f} ({to_percentile_string(bin_today_vol(today_vol))}). VIX: {vix:.2f} ({to_percentile_string(bin_vix(vix))}). High/Low: {hl_raw:.2f} ({to_percentile_string(bin_high_low(hl))}).\n"
+	summary += f"RSI: {rsi} ({to_percentile_string(bin_rsi(rsi))}). Chg 3M Realized: {'+' if change_in_realized > 0 else '-'}{abs(change_in_realized * 100):.2f} Vol Points. ({to_percentile_string(bin_realized_change(change_in_realized), n=10)})\n"
+	if paired_recreated is not None:
+		summary += f"Paired Imbal: {paired_recreated / 1e9:.1f} Bil.\n"
+	else:
+		summary += "Paired Imbal: N/A.\n"
+	summary += f"Regime inputs: VIX={vix:.2f}, atmVol={today_vol:.3f}, absImbal={abs(imbal) / 1e9:.2f}B.\n"
+
+	summary_dict = {}
+
+	for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+		if not trade["name"] in summary_dict:
+			summary_dict[trade["name"]] = f"""\n*{trade["name"]}* ({trade["account"]}):\n"""
+		if trade_type == "complex":
+			if trade["symbol"] == "SPXW":
+				if trade["direction"] == "Sell":
+					equiv_str = f" (Equivalents: {myGetSpyEquivalent(trade['short_legs'][0].okey_xx):.2f} - {myGetSpyEquivalent(trade['long_legs'][0].okey_xx):.2f})"
+				else:
+					equiv_str = f" (Equivalents: {myGetSpyEquivalent(trade['long_legs'][0].okey_xx):.2f} - {myGetSpyEquivalent(trade['short_legs'][0].okey_xx):.2f})"
+			else:
+				equiv_str = ""
+			if trade["direction"] == "Sell":
+				summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["short_legs"][0].okey_xx} {trade["long_legs"][0].okey_xx} {trade["structure"]} for {trade["price"]}.{equiv_str}\n"""
+			else:
+				summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["long_legs"][0].okey_xx} {trade["short_legs"][0].okey_xx} {trade["structure"]} for {trade["price"]}.{equiv_str}\n"""
+		else:
+			equiv_str = f" (Equivalents: {myGetSpyEquivalent(trade['option'].okey_xx):.2f})" if trade["symbol"] == "SPXW" else ""
+			summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["option"].okey_xx} {trade["structure"]} for {trade["price"]}.{equiv_str}\n"""
+		
+	for single_algo_summary in summary_dict.values():
+		summary += single_algo_summary
+
+	summary += "\n*Explanations:*"
+	for algo_name, explanations in explanations_dict.items():
+		summary += f"""\n{algo_name}:\n"""
+		summary += explanations["put"]
+		summary += explanations["call"]
+
+	if extra_spread_summary:
+		summary += f"\n*Extra Spreads:*\n{extra_spread_summary}\n"
+
+	if bumped_spread_summary:
+		summary += f"\n*Bumped Spreads:*\n{bumped_spread_summary}\n"
+
+	if closer_spread_summary:
+		summary += f"\n*Closer Spreads:*\n{closer_spread_summary}\n"
+
+	if np.isnan(firstTickBps):
+		summary = "WARNING: first tick was NaN.\n\n" + summary
+
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~ V8 FEATURES RECAP (helpers_v8) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	# LOG ONLY (not added to the chat summary): F2 spot-vs-uPrc line (+ any fallback) and one line
+	# per order/wave: chunks, sprc/smrk/anchor, limit sent vs the v7 sprc-based limit.
+	print(_hv8.format_v8_recap(_v8_chain_info))
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+	# Prepend any loud send-phase warnings (wave-1 not confirmed terminal -> hedged wave-2 from the
+	# orchestrator; FULL-SIZE-NOT-SENT 4-order-cap drops from trade_complex) so they sit at the TOP.
+	_warns = (trade_dict.get("send_warnings") or []) + drain_send_warnings()
+	_warn_block = ("\n".join(_warns) + "\n\n") if _warns else ""
+	print(summary)
+	send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")}\n" + _warn_block + summary, my_chat)
+
+	# Log per-algo trade attempts to optionsResearch.algo_trade_log (60s wait for SR fills to settle).
+	# Wrapped in try/except so logging failure never affects trading (trading is already done at this point).
+	# Skipped entirely in test mode -- we don't want test trades polluting the prod log table.
+	if IS_TEST:
+		print(f"{pretty_time()} -- algo_trade_logger SKIPPED (IS_TEST=True)")
+	else:
+		try:
+			from algo_trade_logger import log_trades
+			factors_for_log = {
+				"spx_price":       float(spx) if spx is not None else None,
+				"vix":             float(vix) if vix is not None else None,
+				"atm_vol":         float(today_vol) if today_vol is not None else None,
+				"market_ratio":    float(today_move / std) if std else None,
+				"rsi":             float(rsi) if rsi is not None else None,
+				"high_low_ratio":  float(hl) if hl is not None else None,
+				"realized_3m_chg": float(change_in_realized) if change_in_realized is not None else None,
+				"imbal_340":       int(imbal340) if (not isinstance(imbal340, str) and imbal340 is not None) else None,
+				"imbal_350":       int(imbal) if (not isinstance(imbal, str) and imbal is not None) else None,
+				"imbal_355":       None,
+				"qqq_imbal":       int(qqq_imbal_350) if qqq_imbal_350 is not None else None,
+				"paired_imbal":    int(paired_recreated) if paired_recreated is not None else None,
+			}
+			print(f"{pretty_time()} -- Starting algo_trade_logger (60s wait for SR fills)")
+			log_trades(trade_dict, factors_for_log, wait_seconds=60, script_name="350PM_V8")
+			print(f"{pretty_time()} -- Finished algo_trade_logger")
+		except Exception as _log_e:
+			print(f"{pretty_time()} -- ERROR in algo_trade_logger (non-fatal): {_log_e}")
+			import traceback as _log_tb; _log_tb.print_exc()
+
+	# Close pool conns cleanly. Non-fatal on error -- script is done anyway.
+	try:
+		if srtrade_pool is not None:
+			srtrade_pool.close()
+		if sranalytics_pool is not None:
+			sranalytics_pool.close()
+		print(f"{pretty_time()} -- Closed srtrade + sranalytics pools")
+	except Exception as _e:
+		print(f"{pretty_time()} -- Non-fatal: pool close raised: {_e}")
+
+
+
+
+
+
+
+

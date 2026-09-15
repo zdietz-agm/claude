@@ -1,0 +1,626 @@
+SPIDERROCK v7 -> v8 MIGRATION NOTES
+===================================
+Purpose: running log of what changed and every gotcha hit while moving the EOD algos from
+SpiderRock v7 to v8. Started during the 340PM_script.py migration (Jul/Aug 2026). Use this to
+make migrating 350PM_script.py / 350PM_script_fast.py / 355pm_script.py / 350PM_stock_script_fast.py
+faster.
+
+STATUS
+------
+- 340PM_script.py: MIGRATED. Uses legacy send path (send_complex_two_waves / send_outright_limit_order).
+  Validated in test (T.AGMV8.01): data reads on v8, complex + outright orders INSERT and FILL on v8.
+- 350PM_script_fast.py: MIGRATED + VALIDATED on v8 (see 2026-08-05 note below).
+- 350PM_stock_script_fast.py: MIGRATED + VALIDATED on v8 (see 2026-08-05 note below). NOTE: was
+  flipped BACK to v7 for a period (observed 2026-08-19, reason not recorded; the v7-only .56 host
+  pin applied during that window); flipped to v8 again 2026-08-24 (USE_V8/SEND_V8=True). All v8
+  machinery (msgsrparentbrkrstate fills, MOC parentBalanceHandling='None', hex ids, v8 cancel
+  columns) was untouched by the revert -- only the two flags moved.
+- 350pm_stock_script.py (non-fast): MIGRATED 2026-08-24 (USE_V8/SEND_V8=True in-place, same pattern
+  as stock_fast). Script-only change: use_v8() BEFORE the get_closest_calls_sql import (it copies
+  the SQL string by value -- this script pulls the ATM-vol chain, unlike fast), .56 pin gated under
+  `not USE_V8 and not _TEST_MODE`, T.AGMV8.01 test swap. Stock order module fixes (fills via
+  msgsrparentbrkrstate, MOC parentBalanceHandling='None', hex ids, v8 cancel columns) apply
+  automatically. Accounts EOD2/3/4/5/14/15 + BBB + A.350.SO5 confirmed provisioned on v8 (per
+  Zach). VXX_SELL disabled same day (enabled: False) -- VXX paths no longer load; ATM-vol pull
+  KEPT (FIRST_TICK_VARY_SIZE sizes off factor_atm_vol). Live prod test pending.
+- 355pm_stock_script.py: MIGRATED 2026-08-24 (USE_V8/SEND_V8=True in-place, simplest conversion:
+  no .56 pin, no get_closest_* SQL imports -- only SR data read is getLivePrices(SPY)). Script-only
+  change: flags + use_v8_connection + T.AGMV8.01 test swap. MOC-retry chain (6 attempts
+  15:55:30-15:56:30) and TWAP fallback (15:59:30-16:00) route through the SEND_V8-gated stock
+  primitives (tradeSharesMOC / tradeSharesImmediate slices / getFillData / cancelOrder) -- the
+  primitives are v8-validated but this SEQUENCE first runs live on v8 now: watch the first
+  MOC-retry session. Accounts CCC/DDD provisioned on v8 (per Zach). Live prod test pending.
+- btic_and_imbal_script.py: MIGRATED 2026-08-24 (USE_V8/SEND_V8=True in-place). CORRECTION to an
+  earlier fleet survey: this script is NOT data-only -- it SENDS via the legacy
+  send_complex_two_waves / send_outright_limit_order paths (EOD34/EOD39, provisioned on v8 per
+  Zach). Script-only change: flags + use_v8() BEFORE the spdr_rock_order_functions star-import
+  (copy-by-value SQL strings; both chain pulls -- early + pre-send refresh -- verified rebuilt to
+  msgliveimpliedquoteadj). No .56 pin. BTIC price = Bloomberg, imbal = VBAM (unaffected).
+  CAVEAT: IS_TEST exits BEFORE any trading (no test-account send path exists), so the first v8
+  send is the first LIVE prod send -- watch the first fired session's fill/cancel behavior.
+- 4pm_script_v3.py: BACK ON v7 2026-09-03 -- Zach repointed the icon accounts (ICON1_C04/ICON4/
+  ICON5/ICON1_C42) to v7 on the SR side, so USE_V8/SEND_V8 flipped True -> False (lines 36-37, the
+  ONLY edit). All v8 machinery stays in the file behind the flags: the `if USE_V8:` block
+  (use_v8() + V8_MARKET_SESSION='AllDay') is skipped -> chain SQLs read the v7
+  msgoptionimpliedquote default and orders go out with v7 timeInForce=Day; the T.AGMV8.01 test
+  swap is off with SEND_V8. To move back to v8 later: flip the two flags (accounts must be
+  repointed on SR first). History below kept for the AllDay lesson.
+  Previously: RE-ENABLED on v8 2026-08-24 evening after root-causing the day's failure:
+  ALL icon orders sent at 16:00:16 were engine-rejected "Order Expired On Arrival" -- v8 KILLS
+  marketSession='RegMkt' orders arriving after 16:00 (v7 tolerated post-close 'Day' orders; this
+  is the fleet's only post-close sender). FIX: new module global
+  spdr_rock_order_functions.V8_MARKET_SESSION (default 'RegMkt', used by both the complex and
+  outright v8 send paths); 4pm_script_v3 overrides it to AllDay (works post-close AND intraday tests) inside its USE_V8
+  block, process-local. The mid-crisis v7 revert + ICON_MEAN_REVERSION-only filter + temporary
+  account repoints (RATIO.CAL/SHORT.VOL/RV.SS) were all reverted same evening -- accounts back
+  to ICON1_C04/ICON4/ICON5/ICON1_C42. NOT yet validated live: first post-fix 4pm session should
+  confirm orders rest instead of expiring.
+  Originally: MIGRATED 2026-08-24 (USE_V8/SEND_V8=True in-place). Sends via SEND_V8-gated
+  send_complex_two_waves (NDXP secKey_ts case already handled). Script changes: flags +
+  _srof.use_v8() at import; the two INLINE chain SQLs now read _srof.IMPLIED_QUOTE_TABLE at call
+  time (they hardcoded msgoptionimpliedquote); T.AGMV8.01 test swap. SHARED-LIB change
+  (utils/spdr_rock_functions.py, USING_V8-gated, v7 byte-identical + live-verified): getVols now
+  routes via _host_port_for AND, on v8 only, builds an EXPLICIT MINIMAL SELECT (redesigned same
+  day per Zach: v7 query untouched; v8 selects only what getVols consumes -- ekey_tk/yr/mn/dy,
+  atmVol, the 22 skew columns, plus caller extra_columns appended dynamically). Rationale: v8's
+  msglivesurfaceatm dropped ~30 v7 metadata columns so the wide v7 SELECT 1054s there, and the
+  minimal list also survives future v8 removals of unused columns. Verified live both envs:
+  atmOnly 41 rows, skew frame (41,23) identical columns v7 vs v8, extra_columns works. NOTE: v7 vs v8 atmVol differ slightly (0.0845 vs 0.0819 for tomorrow on
+  8/24) -- different surface engines; implied_move (big_move trigger input) shifts accordingly.
+  getResVol still hardcodes 3307 (unused by any migrated script; fix if ever needed).
+  Accounts ICON1-5/ICON1_C04 provisioned per Zach. IS_TEST routes to T.AGMV8.01.
+- 350pm_ss_script.py: MIGRATED 2026-08-24 (USE_V8/SEND_V8=True). extra_spread_trader CLASS: it
+  builds its OWN outright order INSERT (msgoptordergateway) + cancel INSERT, so the shared-path
+  fixes never applied -- all gated inline on _srf_flags.SEND_V8 (v7 byte-identical, PROVEN by
+  rendering the order SQL both ways): Timeinforce->marketSession (Day->RegMkt), groupingcode/
+  riskgroupid -> hex to_v8_id (with !r formatting: quotes hex on v8, bare digits on v7), cancel
+  userName->modifiedBy + clientFirm='AGM' + no timestamp_us. Three quote-table SQLs (chain pull,
+  quote refresh, 0DTE probe) -> _srof.IMPLIED_QUOTE_TABLE at call time. gc WHERE clauses use !r
+  (hex-safe). spdrBrokerStatus terminal check UNCHANGED: v7/v8 enums near-identical, 'Closed' is
+  the terminal value on both (the tuple's Filled/Cancelled/Expired never existed in either enum).
+  .56 pin gated under not USE_V8. Stock legs (tradeSharesLOC/Limit) ride the gated stock module.
+  ENUM FIX (8/24 test run): v8's OUTRIGHT gateway dropped 'Seeker' from parentOrderHandling
+  (COMPLEX gateway kept it -- spread sends still use Seeker everywhere). The ss W1 surface send
+  passed Seeker -> 1265, order never sent (Buy 0 / $0 recap). Fixed in the builder: Seeker ->
+  ActiveTaker when SEND_V8 (per Zach; matches the shared outright path). W1 fill character
+  changes on v8 (ActiveTaker vs seek-liquidity). Verified by rendering SQL both ways.
+  Account EOD30 provisioned per Zach. IS_TEST -> T.AGMV8.01. BUILD BUG CAUGHT BY PARITY TEST:
+  first cut read SEND_V8 off spdr_rock_order_functions (no such attr; lives in
+  spdr_rock_functions) -> would have crashed at first order send. Live prod test pending.
+- 350PM_script.py (full) / 355pm_script.py: NOT migrated (orchestrator + ConnPool -- see MUST-DO below).
+  Still v7 (SEND_V8 defaults False -> byte-identical). Their v8 PARALLEL-RUN duplicates
+  (350pm_script_v8.py / 355pm_script_v8.py) run alongside them at V8_SIZE_RATIO.
+  2026-09-04: the v8 duplicates ALSO carry four EXPLORATORY FEATURES via NEW helpers_v8.py (F1 400-lot
+  chunking, F2 live-spot strike selection, F3 sMark price anchor, F4 msgliveimpliedquote table), each
+  behind a flag in the scripts. Test-validated on T.AGMV8.01 same day; first prod session pending.
+  See the "2026-09-04 -- EXPLORATORY FEATURES" section at the end of this file.
+- LIVE IN PROD (IS_TEST=False, 2026-08-06): 340PM_script.py, 350PM_script_fast.py,
+  350PM_stock_script_fast.py. All three sending real v8 orders to their prod accounts.
+
+
+HOW THE TOGGLE WORKS (already built, shared library)
+----------------------------------------------------
+Per-script flags at top of the script:
+  USE_V8  = True   -> DATA reads (sranalytics / srlive) go to v8
+  SEND_V8 = True   -> srtrade order/fill traffic goes to v8  (False = send to v7 while reading v8 data)
+Wiring in the script (ORDER MATTERS):
+  USE_V8 / SEND_V8 flags, then:
+     if USE_V8:
+         from spdr_rock_order_functions import use_v8 as _use_v8
+         _use_v8(True, send=SEND_V8)
+     from spdr_rock_order_functions import *      # MUST come AFTER use_v8()
+  GOTCHA: `import *` copies the get_closest_* SQL strings by value. If use_v8() runs AFTER the
+  import *, the script keeps the stale v7 table name. Always flip before the star-import.
+
+Routing is by DATABASE (spdr_rock_functions.run_query -> _host_port_for):
+  database == "srtrade"  -> follows SEND_V8
+  everything else        -> follows USE_V8
+  (so order sends AND their fill/cancel lookups stay together on the same env.)
+
+
+DATA-SIDE CHANGES (USE_V8)  -- already handled in the shared libs
+-----------------------------------------------------------------
+- Option quote table: sranalytics.msgoptionimpliedquote -> sranalytics.msgliveimpliedquoteadj.
+  Columns we read (okey_*, uprc, satm, sprc, obid, oask, svol) are identical-named on v8. 3 v7-only
+  cols (calcType, veSlope, timestamp_us) are dropped but unused -> pure table-name swap, no aliasing.
+  Implemented via IMPLIED_QUOTE_TABLE + _build_quote_sql() + use_v8() in spdr_rock_order_functions.py.
+- getCashIndex: msgoptionimpliedquoteadj -> msgliveimpliedquoteadj when USING_V8.
+- Stock prices (getLivePrices/get_prints): v7 sranalytics.msgstockprintset is GONE. v8 source is
+  srlive.msgstockprint (connect database='srlive'). It is a per-print STREAM (many rows/ticker) vs
+  v7's one-row-per-ticker set -> must ORDER BY TIMESTAMP DESC + dedupe latest per ticker. Column
+  remap: bidPrice->ebid, askPrice->eask, bidSize->ebsz, askSize->easz (aliased back so getLivePrices
+  is unchanged). srlive access had to be granted by SR.
+
+
+SEND-SIDE CHANGES (SEND_V8)  -- order-gateway + cancel schema/enum differences
+------------------------------------------------------------------------------
+All gated on _srf.SEND_V8 in spdr_rock_order_functions.py so v7 stays byte-identical.
+
+1. timeInForce -> marketSession, value 'Day' -> 'RegMkt'.
+   Applies to BOTH msgparentordergatewayext (complex) and msgoptordergateway (outright).
+   (v7 'ExtDay' would map to 'AllDay' per SR, but we only ever send 'Day'.)
+
+2. groupingCode + riskGroupId -> hex string "XXXX-XXXX-XXXX-XXXX" (16 hex, 4 blocks).
+   Helper to_v8_id(n): mask to 63 bits so leading digit is 0-7 (v8 rejects ids that parse as
+   negative). _gen_id() returns the hex string when SEND_V8, else the plain v7 int. The value's
+   TYPE (str vs int) also drives SQL quoting (hex ids get quoted).
+   mlegLegId LEFT AS PLAIN INT for now -- SR only required hex for groupingCode/riskGroupId; mleg
+   ids were accepted as ints in the working 340 test. Revisit if a future reject points at them.
+
+3. secKey_ts (parent-level, complex only): v7 sent 'CBOE' for SPX MLeg parents. v8's
+   msgparentordergatewayext enum does NOT allow 'CBOE' (error 1265). Fix: send 'NMS' for SPX on v8.
+   Line: "secKey_ts": "NMS" if (_srf.SEND_V8 or symbol == "NDXP") else "CBOE".
+   (Leg secKeys mlegSecKeyN_ts were already 'NMS'; outright msgoptordergateway has no parent
+   secKey_ts, only okey_ts='NMS', so the outright never hit this.)
+
+4. progressRule (complex only): v7 'Immediate' NOT in v8 enum (error 1265). SR recommends 'None'
+   as the v8 default ('AllowImmediate' also accepted). We send 'None' on v8.
+   v8 progressRule enum: None, Twap, Vwap, TwapReset, VwapReset, FastReset, SlowReset, TwapAlpha,
+   VwapAlpha, TwapAlphaC, VwapAlphaC, AutoComplete, AllowImmediate, Manual, SpdrPulse, IOC,
+   FlashMakeTake.
+
+5. Parent CANCEL INSERT srtrade.msgsrparentcancel (cancel_order): v8 dropped userName + timestamp_us.
+   userName -> modifiedBy; drop timestamp_us; timestamp = NOW() (v8 timestamp is
+   yyyy-mm-dd hh:mm:ss.sssss). v8 columns: accnt, parentNumber, clientFirm, sysEnvironment,
+   runStatus, cxlReason, altCancelId, engineName, modifiedBy, modifiedIn, timestamp.
+   ALSO REQUIRED (SR-confirmed): set clientFirm='AGM'. v8 error 1105 "AccountMatches rule violated"
+   comes from a blank clientFirm -- the rule keys on accnt+clientFirm. v7 had NO clientFirm column
+   (it matched on userName), which is why this is brand-new in v8. The order's own
+   msgsrmlegbrkrstate row shows clientFirm='AGM' for our accounts. NOTE: this error only surfaces on
+   an order that did NOT fill within the 3s wait (fills skip cancel). v8 fills observed ~6s after
+   send (slower than the 3s wait) -> the cancel path DOES get hit; and a failed cancel currently
+   raises and kills the script even though SR may still fill the order (open risk to harden).
+
+
+KEY GOTCHAS / DIAGNOSTIC TIPS
+-----------------------------
+- MySQL error 1265 "Data truncated for column X" = an ENUM value not in v8's allowed list. It only
+  reports the FIRST bad column, so fixes surface one at a time on live sends. To find them all at
+  once: query information_schema.columns COLUMN_TYPE for every enum column and compare the values
+  we send against each enum's allowed set. (That is how we caught progressRule proactively.)
+- MySQL error 1054 "Unknown column X" = column renamed/removed on v8 (e.g. Timeinforce, userName,
+  timestamp_us).
+- FILL DETECTION differs on v8 (RESOLVED for 340 legacy path): a filled order in msgsrmlegbrkrstate
+  shows spdrOrderStatus='Closed' AND spdrCloseReason='Filled'. v7 code (GetParentNumber) gated
+  "filled" on spdrCloseReason=='Closed', which NEVER matches v8 -> it tried to cancel an
+  already-filled order. FIX (SEND_V8-gated): gate "done" on spdrOrderStatus in
+  {Closed,Rejected,SendReject}. SR (Saurav) confirmed spdrOrderStatus enum =
+  ('PendNew','New','PendClose','Closed','Rejected','SendReject') -- same as v7.
+- FILL QUANTITY (RESOLVED for 340 legacy path): use cumSquareQty for the overall PACKAGE fill on v8,
+  NOT fillQuan1 (which is a per-leg qty). SR (Saurav) said leverage cumSquareQty. Applied in
+  cancel_order + _get_fill_quantity (SEND_V8-gated, else fillquan1).
+- Test account: when SEND_V8 and IS_TEST, swap T.AGM* -> T.AGMV8.01 (v8 test account). PROD uses the
+  real _C42 accounts as-is; confirm they are provisioned on v8 before a live prod send.
+- run_query default hostname changed to None (resolves via _host_port_for). __defaults__ length is
+  still 7, so the `assert len(run_query.__defaults__)==7` in the fast scripts still passes.
+
+
+STATUS UPDATE (2026-08-05): 350PM_script_fast.py MIGRATED + FULLY VALIDATED on v8 (test acct T.AGMV8.01).
+Script-only change, no shared-lib edits. It uses the LEGACY path (send_complex_two_waves) and NO
+ConnPool -- same shape as 340 -- so all the send-path fixes below applied automatically. Script-specific
+work: gated its temporary .56 host-pin block under `if not USE_V8:`, standard USE_V8/SEND_V8 wiring +
+use_v8() before `import *`, and the T.AGMV8.01 test-account swap.
+  Validated both paths on v8:
+   - FILL case: wave-1 filled 1/1, terminal-detect + cumSquareQty correct, no cancel.
+   - NO-FILL case (temp min_price=99 forced unmarketable): wave-1 rested New -> cancel_order succeeded
+     (clientFirm=AGM, no 1105) -> wave-2 resent -> both expired. No oversell. Temp min_price=99 block
+     has since been REMOVED.
+  Go-live = flip IS_TEST=False (real orders to EOD26_C42/EOD27_C42 on v8). Status scripts DONE: 340, 350_fast.
+CORRECTION to the note below: the FAST script is NOT an orchestrator/pool user -- only 350PM_script.py
+(full) and 355pm_script.py are. Items A/B/C below apply to THOSE TWO ONLY.
+STATUS UPDATE (2026-08-05): 350PM_stock_script_fast.py MIGRATED + FULLY VALIDATED on v8 (test acct T.AGMV8.01).
+It uses a SEPARATE order module (spdr_rock_stock_order_functions.py) with its own stock tables, so the
+options send-path fixes did NOT apply -- they were PORTED into the stock module (all gated on _srf.SEND_V8,
+v7 byte-identical; the non-fast 350pm_stock_script.py shares this module and stays v7-safe). No ConnPool
+(pool-less run_query -> _run_query_legacy, already ACTIVE_PORT-aware). helpers_stock unchanged (only SR
+touch is getLivePrices). Backup: spdr_rock_stock_order_functions_backup.py.
+  Stock-module v8 changes (spdr_rock_stock_order_functions.py):
+   - msgStkOrderGateway: timeInForce -> marketSession (Day->RegMkt, ExtDay->AllDay); progressRule
+     'Immediate'->'None'; groupingCode/riskGroupId -> hex to_v8_id (char(19), imported from options module).
+   - Fill/parent reads: srtrade.msgsrstkbrkrstate (DENIED on v8) -> srtrade.msgsrparentbrkrstate
+     (has cumFillQuantity/avgFillPrice/parentNumber/spdrBrokerStatus). getOrderStatus already used it.
+   - cancelOrder: userName->modifiedBy, drop timestamp_us, add clientFirm='AGM' (same as options).
+   - MOC parentBalanceHandling (tradeSharesMOC): v8's msgStkOrderGateway.parentBalanceHandling is
+     NOT NULL DEFAULT 'PostLimit'. v7 code passed Python None -> OMITS the column -> on v8 the REPLACE
+     backfills 'PostLimit' -> SR rejects with SysReject "ParentBalanceHandling not allowed with MktOnCls".
+     FIX (SEND_V8-gated): send the LITERAL enum 'None' on v8 (v7 keeps the omit). Same value
+     tradeSharesLOC already used (also MktOnCls; documented by SR support 2026-05-04). Saurav suggested
+     "set it on parentOrderHandling instead" -- real mechanism is the column default, resolved by the
+     explicit 'None'. Other close types (LOC) were already correct; no VWAP MOC path.
+   - VWAP path (tradeSharesVWAP, takeReachRule='Immediate' -- NOT in v8 enum) is NOT used by the fast
+     configs (they use marketOpenThenMocOrStartTimeClose) -> left as-is; fix only if VWAP is ever used.
+  Script (350PM_stock_script_fast.py): USE_V8/SEND_V8 flags, .56 pin gated under `if not USE_V8`,
+  use_v8_connection(True, send=SEND_V8) after imports, T.AGMV8.01 swap, IS_TEST=True for first run.
+  VALIDATED 2026-08-05 (T.AGMV8.01): opening market Buy 900 filled 900 @ 771.74 -- confirms SR POPULATES
+  cumFillQuantity for stock orders in msgsrparentbrkrstate (resolves the 7/29 zero-fill unknown; feeds
+  _await_fill -> MOC exit sizing). MOC Sell then accepted after the parentBalanceHandling fix:
+  spdrBrokerStatus='Active', spdrOrderStatus='New' (unfilled, correct -- MOC executes at 4pm close, not
+  on send), no reject, leaves 900. NOTE: getOrderStatus reads spdrBrokerStatus ('Active'=working), which
+  is a DIFFERENT column from spdrOrderStatus ('New'=not yet filled) -- don't confuse them. Go-live =
+  IS_TEST=False (real acct EOD13_C42).
+
+POST-TRADE LOGGER (algo_trade_logger.py) -- v8 fixes (2026-08-05)
+----------------------------------------------------------------
+Applies to the OPTIONS scripts only (350PM_FAST, and 350PM-full / 355PM once migrated). This logger
+runs AFTER trading inside a try/except, so its failures are non-fatal to the trade -- but they DROP
+the row from optionsResearch.algo_trade_log. Both bugs are pure v8 side-effects of the hex groupingCode
++ v8 schema. Gated on _srf.SEND_V8 so v7 stays byte-identical. Found via the 2026-08-05 350PM_FAST
+prod run (traded + filled fine; logger threw). Stock scripts do NOT use this logger -> unaffected.
+
+1. groupingCode int() crash: v7 groupingCode was an int; the logger did int(row.groupingCode) as a dict
+   key in _query_sr_fills AND _query_fill_times. v8's hex 'XXXX-XXXX-XXXX-XXXX' -> ValueError: invalid
+   literal for int(). FIX: added _norm_gc(gc)=str(gc).strip().upper(), used on BOTH the map-build side
+   and every consumer lookup (fill_map/fill_times in log_trades). For v7 ints _norm_gc is just str(int),
+   so keys stay internally consistent -> v7 unchanged.
+   LATENT 2nd half of this bug (would have silently logged 0 fills even after the int() fix): the sender
+   writes groupingCode LOWERCASE ('...110d') but SR returns it UPPERCASE ('...110D'). The SQL IN(...)
+   still matches (MySQL char compare is case-insensitive) but the Python dict lookups are case-sensitive.
+   _norm_gc uppercasing both sides closes this too.
+
+2. fillDttm_us dropped on v8: _query_fill_times' CASE fallback used 'fillDttm + INTERVAL fillDttm_us
+   MICROSECOND'. v8's srtrade.msgsrparentexecution has NO fillDttm_us -> whole query 1054s at parse time
+   (MySQL validates every column even in an unexecuted CASE branch). engTimestamp (primary branch) and
+   fillDttm both still exist on v8. FIX: fallback term = 'fillDttm' on v8, full v7 expression otherwise.
+   Did NOT surface in the 8/5 run because bug #1 threw first; would break the next run once #1 is fixed.
+
+Note: _query_sr_fills reads fillQuan1 from msgsrmlegbrkrstate for the package qty -- fine on v8 for
+equal-leg fills (validated: 350PM_FAST 1-lot logged size_filled=1). This is the SAME table/column the
+340/350_fast legacy send path already reads; do NOT confuse with the cumSquareQty fix, which is for the
+ORDER module's fill DETECTION, not this logger.
+IMPLICATION FOR 350PM-full / 355PM: they call this same log_trades on v8 hex codes -> both fixes above
+already cover them. No extra logger work needed when those scripts migrate.
+
+355pm_script_v8.py (NEW, 2026-08-07): PARALLEL-RUN duplicate of 355pm_script.py on v8, same recipe
+as 350pm_script_v8.py (flags before star-import, V8_SIZE_RATIO=0.10 with script-cap-only scaling,
+V8_GATE_DELAY_S=0.10 on all 9 wait_until gates, script_name=355PM_V8, IS_TEST=True first run).
+355-specific points:
+  - Account map: EODn -> EOD(n+40): 16->56, 18->58, 19->59, 21->61, 29->69, 33->73, 35->75,
+    36->76, 37->77, 38->78; A.355.BO -> EOD98 (config inactive today, mapped for safety). Slots
+    disjoint from 350_v8's. get_spdr_execs.py: 11 matching entries added.
+  - HACKER TRADES NOT IMPLEMENTED on v8: HACKING_350_ENABLED=False + HARD ASSERT at startup that
+    refuses to run if flipped True. TODO to enable: query_closer_fills needs a script_name param
+    (read '350PM_V8' closer fills, not '350PM'), and fire_hackers needs an account_map param (it
+    resolves v7 closer accounts EOD31/32 from CLOSER_PARENT_CONFIGS at fire time, BYPASSING the
+    script's account swap -- same leak class as extra_spread_trader in 350).
+  - V8 sizing composes ON TOP of MONTHEND_SIZE_MULT on month-end runs (ratio applied after).
+  - No bumped/closer/extra module patches needed (355 has none; its CLOSER variants are configs).
+
+*** ORCHESTRATOR + POOLS: ITEMS A-C DONE (2026-08-07). 350pm_script_v8.py BUILT. ***
+----------------------------------------------------------------------------------------------
+340PM and 350PM_fast use the LEGACY path (send_complex_two_waves / fresh conns), so only
+_run_query_legacy needed routing. The orchestrator scripts (350PM full, 355PM) are different:
+
+A. DONE (2026-08-07): ConnPool._open_conn (utils/spdr_rock_functions.py) now resolves host/port via
+   _host_port_for(db_name) per-open; __init__ hostname default changed to None (explicit hostname=
+   still wins for the HOST, port follows routing -- same precedent as run_query). Flags off ->
+   (HOSTNAME, V7_PORT), byte-identical to the old hardcoded behavior. VERIFIED LIVE both ways:
+   flags off -> pool conn on .63:3307; flags on -> pool conn on v8 (@@port=3701, the backend behind
+   the 3700 listener). run_query's pooled/fresh instrumented path already routed via _host_port_for.
+
+B. DONE (2026-08-07): batched_fill_check_and_cancel cancel INSERT gated on _srf.SEND_V8:
+   userName->modifiedBy, drop timestamp_us, timestamp=NOW(), clientFirm='AGM'. v7 branch unchanged.
+
+C. DONE (2026-08-07): orchestrator fill reads gated: fillQuan1 -> cumSquareQty on v8 (SELECTs +
+   every row read). PLUS two hazards items B/C never listed, found on inspection:
+   - int(row.groupingcode) / int(pn) crash on v8 hex ids -> _row_gc() maps DB-returned codes
+     (UPPERCASE) back to the CALLER's original gc objects (to_v8_id emits lowercase; dict keys are
+     case-sensitive even though SQL matching is not -- same bug family as algo_trade_logger).
+     parentNumber kept as string on v8.
+   - Step-1 "active vs done" gate: v7 keys on parentNumber cleared; v8 KEEPS parentNumber populated
+     on Closed/Filled orders -> gate on _is_terminal_status(spdrOrderStatus) instead (SEND_V8 only).
+     Without this every filled order would get a spurious cancel.
+
+D. Same enum/column fixes (marketSession, hex ids, secKey_ts, progressRule) live in the shared
+   _send_single_complex_order, so they apply automatically once SEND_V8 is set -- no per-script work.
+
+350pm_script_v8.py (NEW, 2026-08-07): PARALLEL-RUN duplicate of 350PM_script.py on v8 -- v7 prod
+script keeps running simultaneously and was NOT touched. Deliberate diffs (all marked "V8" in-file):
+  - USE_V8/SEND_V8=True wired BEFORE the spdr_rock_order_functions star-import (SQL copy-by-value).
+  - V8_SIZE_RATIO knob (0.10) -- FINAL ARCHITECTURE 2026-08-19: "V8 RESIZING SECTION". The ENTIRE
+    pipeline (prep_trades, closer, bumped, apply_size_limits at v7 MAX_LOSS_CAP values) runs at
+    exact v7 sizing; ONE #~~~~-delimited section immediately before the send scales every
+    trade_dict entry (parents/outrights/closer/bumped) in a single pass, floor 1 contract, with
+    the "Applying V8_SIZE_RATIO" banner. trade["v7_unscaled_size"] kept for audit only.
+    Consequences: bumped's 1-lot gate sees real v7 parent sizes NATURALLY (no gate hack), and
+    bumped/closer modules were REVERTED to byte-original v7 (their SIZE_RATIO globals removed).
+    Only extra_spread_trader keeps a SIZE_RATIO global (its ladder never enters trade_dict; sends
+    its own orders post-orchestrator) -- set INSIDE the resizing section so it dies with it.
+    Hacker trades are deliberately NOT rescaled (sized from already-scaled 350PM_V8 fills).
+    DECOMMISSION (v7 retirement): delete the section in each v8 script (+ extra_spread_trader's
+    SIZE_RATIO global) -> sizing byte-identical to v7.
+    BUMPED SIZING AT DECOMMISSION (2026-09-11): configs_bumped_spreads/bumped_spread_config.py is
+    now LITERAL (removed from scaled()/SIZE_KNOB) at GROWS 42,900/86, VS_MARKET 10,725/25,
+    SHRINKS 32,175/64. Today v7 sends 1.0x and v8 sends V8_SIZE_RATIO (0.20) of that, so total
+    bumped exposure is 1.2x the config (or whatever the ratio is at the time). When v7 retires
+    and only the v8 script runs at 1.0x, that top-up disappears -> consider scaling the three
+    bumped configs up ~20% (x1.2) to hold total exposure constant. Same logic applies to any
+    other module-owned config that is not on a SIZE_KNOB dial. See
+    D:/agent_projects/eod_option_algos/prod_change_logs/9_11_2026.md.
+    History: first design scaled configs -> 2026-08-18 v8 prod run sent bumped at FULL v7 size
+    (33+114 lots into EOD68/EOD60, filled): bumped/closer/extra size from MODULE-OWNED configs
+    that never pass through the script's configs list, and bumped's "parent==1 lot" trigger fired
+    spuriously (ratio-floored parents are 1-lot almost daily). LESSON (2nd hit, after the
+    extra_spread account leak): sweep for MODULE-OWNED sizing/accounts whenever adding a
+    script-level v8 transform -- the script's configs list is not the whole surface.
+  - HACKERS ENABLED on v8 (2026-08-19) via hacker_trades module globals (defaults = v7,
+    byte-identical; set by 355pm_script_v8 + hard-asserted at startup when HACKING_350_ENABLED):
+      SCRIPT_NAME_FILTER ('350PM' -> '350PM_V8'): hacks the v8 book's own closer fills;
+        hack_size = size_filled // 2 inherits the ratio from the source fills (NOT rescaled).
+      ACCOUNT_MAP (None -> the v8 map): applied after _lookup_parent_account resolves v7 closer
+        accounts EOD31/32 -> EOD71/72; FAIL-CLOSED (missing key = skip hacker, loud print).
+      TEST_ACCOUNT_OVERRIDE (None -> 'T.AGMV8.01').
+    THIRD v7 coupling found on inspection: _fetch_legs hardcoded sranalytics.msgoptionimpliedquote
+    (does not exist on v8) -> now reads spdr_rock_order_functions.IMPLIED_QUOTE_TABLE at call
+    time (v7 default = same string byte-identical; use_v8 flips it). fire_hackers sends via
+    send_complex_two_waves (already v8-gated). EOD31/32 added to the 355 map (same 71/72 slots
+    as the 350 map). Operational dependency: hackers only see closers if 350pm_script_v8 ran and
+    logged that day (~3:51:10, query at ~3:54:50).
+  - Script loss cap scaled (V8_MAX_LOSS_CAP_350); GLOBAL cap deliberately NOT scaled (2026-08-07):
+    the global check counts ALL scripts' positions, so a 0.1x global cap reads as exhausted by
+    full-size v7 books -> every v8 trade would collapse to the 1-lot floor. Full global cap stays
+    the firm-wide backstop shared with v7; the script cap does the ratio work.
+  - Accounts: STATIC V8_ACCOUNT_MAP (25 entries) in the script. Rule: EODn_C42 -> EOD(n+40)_C42;
+    A.350.* -> EOD90-97. Covers all 19 config accounts PLUS trader-module accounts that never
+    appear in configs: bumped EOD20/25/28 -> EOD60/65/68, closer EOD31/32 -> EOD71/72, extra
+    spreads EOD9 -> EOD49. extra_spread_trader is SPECIAL: it sends to its module-level
+    EXTRA_SPREAD_ACCOUNT (imported by value), NOT trade_dict accounts -> the script patches
+    extra_spread_trader.EXTRA_SPREAD_ACCOUNT (+ its TEST_ACCOUNTS for test mode). Startup assert:
+    every loaded config account must be in the map (fails at 3:38, not at send). Send-time swap
+    runs AFTER closer/bumped; hard assert no order leaves on a non-EOD41-99 account. IS_TEST ->
+    T.AGMV8.01. get_spdr_execs.py (D:/PycharmProjects/scratch): 25 matching EOD41-97 entries added
+    to spdr_to_bbg_my_accounts (strategy name + ' V8'). KEEP THE TWO FILES IN SYNC.
+  - ALL 7 wait-gates fire V8_GATE_DELAY_S (0.10s) after the corresponding v7 gate via _v8_gate(),
+    which takes v7's exact base time (3:38:01, 3:39:55, 3:40:03, 3:48:01, 3:49:55, 3:50:01.1,
+    3:50:05.2). Single knob: V8_GATE_DELAY_S=0.0 -> timing byte-identical to v7. TEMPORARY.
+  - script_name="350PM_V8" for log_positions AND algo_trade_logger (PK includes script_name;
+    reusing "350PM" would OVERWRITE the v7 prod rows). Chat labels say "V8" + the ratio.
+  - NOTE: v8 positions logged under 350PM_V8 consume global-cap headroom seen by 355PM -- accepted
+    (real risk; small at ratio 0.10). Per user 2026-08-07.
+  - extra_spread_trader.py (FIXED 2026-08-07, found in first v8 test run): builds its OWN order
+    INSERT (trade_complex_absolute_price), so the shared send-path fixes never applied -- 1054 on
+    timeInForce at send. All four v7-isms gated on _srf.SEND_V8 in the module: hex grouping ids,
+    secKey_ts CBOE->NMS, progressRule Immediate->None, timeInForce->marketSession (Day->RegMkt).
+    goodTillDttm verified present on v8 (datetime(6)). Send-only module (no fill reads/cancels).
+    LESSON: grep for OTHER self-built INSERTs into srtrade.* before assuming shared-path coverage.
+  - IS_TEST=True until first clean v8 test; flip to `False or _a.test` for prod.
+  - Smoke-verified: module import OK, USING_V8/SEND_V8 set, quote SQL targets msgliveimpliedquoteadj.
+  - 2026-09-09 ported: ADVERSE LEVERED-REBAL VETO block (after the 3:49:55 gate, right before the
+    0DTE vol pull -- inside the pre-3:50 wait, zero cost on the post-15:50 path) + rebal_355_B=
+    kwargs on the closer/bumped calls + --test-rebal-355-b argparse flag (log-only; no chat recap
+    line, per Zach). Both scripts
+    read the SAME CSV (algos/levered_rebal_355_daily.csv, written by btic_and_imbal_script at
+    ~15:49:03 -- a v8 script itself), so v7 and v8 veto identically. Fail-open on read failure.
+  - REMEMBER: any future edit to 350PM_script.py must be ported here until v7 is retired.
+
+E. VERBOSE QUERY TIMING for the v8 data reads. On 2026-08-06 we added per-query split-phase timing
+   (verbose=True, tag=...) to the direct SR run_query calls in 350PM_script.py (vol0dte_340/350,
+   refresh350_calls/puts) and 355pm_script.py (prefetch_calls/puts, refresh355_calls/puts). Those hit
+   the v7 run_query, which already has the verbose/tag plumbing. run_query_v8 (spdr_rock_functions.py)
+   is a SEPARATE function and does NOT have that instrumentation. When 350-full/355 move their DATA
+   reads onto run_query_v8, port the same split-phase timing + tag args into run_query_v8 (or route
+   those reads through the unified run_query) so the prefetch/refresh timing lines survive the v8 cutover.
+
+
+ROLLBACK SAFETY
+---------------
+Backup copies of the two shared algos-dir modules live alongside them: helpers_backup.py and
+spdr_rock_order_functions_backup.py (in scratch/algos). They are the last known-good snapshot. If a
+change breaks a v7 prod script, restore by copying the _backup over the live file. Re-sync the
+backups (copy live -> _backup) only when the live version is confirmed good. NOTE: utils/
+spdr_rock_functions.py is NOT backed up (its v8 edits are gated + confirmed non-breaking for v7).
+
+CONFIRMED BY SR (no longer open)
+--------------------------------
+- progressRule='None' (v8), secKey_ts='NMS' (v8 SPX MLeg parent), timeInForce->marketSession/'RegMkt'.
+- Cancel: userName->modifiedBy, timestamp_us dropped, timestamp=NOW().
+- groupingCode/riskGroupId hex.
+- spdrOrderStatus enum = (PendNew,New,PendClose,Closed,Rejected,SendReject); terminal =
+  {Closed,Rejected,SendReject}. Package fill qty = cumSquareQty (not fillQuan1).
+
+
+2026-09-04 -- EXPLORATORY FEATURES F1-F4 ON THE v8 EOD SCRIPTS ONLY (helpers_v8.py)
+  STATUS: TEST-VALIDATED on T.AGMV8.01 (350_v8, two runs 9/4 pm: F1 chunking, F2, F3 W1+W2). 355_v8 +
+  hackers NOT yet run. First PROD session (IS_TEST=False) pending -- see "NOT YET VALIDATED" below.
+==============================================================================================================
+Scope: 350pm_script_v8.py / 355pm_script_v8.py + NEW helpers_v8.py. v7 prod scripts (350pm_script.py /
+355pm_script.py) untouched and import nothing from helpers_v8. Shared-module edits are comments + ONE gated
+global (see "SHARED-MODULE EDITS"). Design: helpers_v8.install_send_patches() monkeypatches five shared
+functions IN THE v8 PROCESS ONLY, each signature-checked against the live shared function at startup
+(inspect.signature equality + sync/async kind) -> a v7-side edit to those functions fails at 3:38, not at send.
+Same precedent as the existing module-global patches (_est.SIZE_RATIO, hacker_trades globals).
+Patched (F3 on): trade_complex, compute_spread_limit, batched_refresh_legs_deduped, refresh_legs,
+hacker_trades._fetch_legs. Patched (F3 off, F1 on): trade_complex only.
+
+FLAGS (single disable switch per feature; all False -> pre-2026-09-04 v8 parallel-run behavior):
+  350pm_script_v8.py lines 77-86 / 355pm_script_v8.py lines 80-89 ("V8 EXPLORATORY FEATURES" block):
+    V8_QTY_CHUNKING = True   (F1)     V8_LIVE_SPOT = True   (F2 + F4)     V8_SMRK_ANCHOR = True   (F3 + F4)
+  Tuning knobs: helpers_v8.py lines 40-78. (helpers_v8 line refs below are as of the 9/4 pm state:
+  F1 94-125, F3 128-243, send path trade_complex_v8 246-313, F2 316-427, refresh patches 430-543,
+  installer 546-604, recap 607+. grep the "# =====" section headers if they drift.)
+
+F1 -- FIXED MAX-QTY CHUNKING (replaces v7 $PREMIUM_LIMIT=27k chunking; no per-order premium cap exists on v8)
+  helpers_v8.build_qty_chunks / trade_complex_v8 (lines 94-125, 246-313). V8_MAX_QTY_PER_ORDER=400,
+  V8_MAX_ORDERS=8. Chunks 5-8 keep the v7 unique-size decrement (-1..-4, floor 1) for SR's repeat-order block;
+  past 8 orders the rest is DROPPED with the same loud print + record_send_warning (chat recap). Applies to
+  every trade_complex call: orchestrator W1/W2 (parents, closer, bumped), hackers W1/W2/W3.
+  Chunking runs on the POST-V8_SIZE_RATIO size (inside the send), so at ratio 0.20 it only splits when the
+  v7 size exceeds 2000 lots; the day-one change is the other way round: v8 sends ONE order where v7 sent 2-3.
+  With F1 off (and F3 on) trade_complex_v8 uses build_premium_chunks = exact port of the v7 premium math.
+  TEST: no test-size override (removed per Zach 2026-09-04 review) -- test chunking by sending a giant
+  order (--trigger-all-size > 400 after V8_SIZE_RATIO, i.e. > 2000 at ratio 0.20) into T.AGMV8.01.
+
+F2 -- LIVE-SPOT STRIKE SELECTION (+F4 table)
+  helpers_v8.fetch_v8_chains (lines 316-427); script blocks "V8 F2/F4: LIVE-SPOT STRIKE SELECTION":
+  350pm_script_v8.py lines 598-614 (3:50 refresh), 355pm_script_v8.py lines 529-545 (3:55 refresh).
+  ONE SELECT (calls+puts, +-V8_CHAIN_BAND=100 of each row's own uPrc) from V8_QUOTE_TABLE and the live SPX
+  from srlive.msgindexquote (key ticker_at/ts/tk = EQT/NMS/SPX, CBOE 'Quote' feed) run CONCURRENTLY
+  (~20ms each). Frames rebuilt in the EXACT v7 shape (puts <= spot+1 DESC / calls >= spot-1 ASC, 11 rows,
+  index reset) around the LIVE spot, and the uprc column is overwritten with the live spot on every row (SR
+  row value kept as uprc_sr) -> spx = puts.uprc[0], the 350 OTM filter, prep_trades' msd filter and
+  closer_spread_trader's chain uprc all agree on ONE spot with zero edits to helpers.py / trader modules.
+  PRINTS (per Zach): "[V8 F2] SPX spot ... = X" vs "chain uPrc median/range", delta, spot lag vs newest chain
+  row (SR clock; local-clock age is info only -- SR skews ~1s vs this box), closest-to-ATM put/call by uPrc
+  vs by live spot -> "STRIKE SHIFT" / "same strikes". Also one recap line in the LOG-ONLY recap block.
+  OBSERVED 9/4 pm: one 3:50-style pull took 112ms (fresh-connection setup; 14-30ms on the other runs).
+  Still concurrent with the spot query, but passing the existing sranalytics_pool into get_v8_wide_chain
+  would take the conn setup off the hot path -- NOT done yet (candidate follow-up).
+  FAIL-OPEN: any exception or guard (spot lags newest chain row > V8_SPOT_MAX_AGE_S=2s, |spot - uPrc median|
+  > V8_SPOT_MAX_GAP=40, < 11 rows on a side) -> the ORIGINAL adj-table SQLs run unchanged + loud
+  record_send_warning ("LIVE-SPOT FALLBACK"). Prefetch (355 today_vol), 3:40/3:50 vol pulls, getCashIndex
+  and refresh_legs in v7 mode stay on the adj table (agreed).
+  OBSERVED midday 9/4: the SPX index row lagged the newest chain row by ~1.0s (index disseminates ~1/s while
+  Tick chain rows update continuously). 2s leaves ~1s of headroom; if the 3:50 test shows spurious
+  fallbacks, raise V8_SPOT_MAX_AGE_S (3-5s still catches a dead feed).
+  Note: this also fixes the 8/24 per-row-uPrc CLOSER strike miss by construction (single scalar spot).
+
+F3 -- sMark PRICE ANCHOR (+ gap offset), hackers + extra spreads included
+  helpers_v8.compute_v8_anchor / compute_v8_limit / trade_complex_v8 (lines 128-243, 246-313). Per order, recomputed
+  at EVERY wave: sprc_net = sum(short sprc) - sum(long sprc), smrk_net same with smrk; gap = sprc_net -
+  smrk_net (positive = smrk is the MORE aggressive of the two).
+    gap <= 0 : anchor_net = sprc_net -> priced exactly as v7 (smrk less aggressive is ignored; Zach 9/4).
+    gap >  0 : anchor_net = smrk_net, plus offset = V8_SMRK_GAP_OFFSET_RATIO(0.5) * gap back toward sprc
+               when gap > max(V8_SMRK_GAP_MIN_ABS=0.03, V8_SMRK_GAP_MIN_PCT=3% * |sprc_net|), else pure smrk.
+  => the anchor is never less aggressive than sprc. LIMIT sent = anchor_net - max_edge (same min_price
+  clamp/2dp as compute_spread_limit). SR WORKING PRICE: takeLimitClass stays 'Surface' (no mark class on
+  v8) but takesurfPrcoffset = edge_target + (sprc_net - anchor_net) so SR works at anchor_net - edge_target;
+  (sprc_net - anchor_net) >= 0 by construction so the offset is never below edge_target (never negative).
+  HISTORY: the first cut (9/4 morning) anchored on pure smrk in BOTH directions, which produced a NEGATIVE
+  takesurfPrcoffset whenever sprc sat below the bid on a sale (the 7/21-type dislocation) -- flagged in
+  review (SR acceptance of a negative offset unknown -> possible Rejected W1+W2 = zero traded). Fixed same
+  day to the rule above per Zach: "when smrk is less aggressive than sprc, just use sprc".
+  edge_target/max_edge themselves unchanged.
+  Fallback per order: any leg with missing/NaN/0 smrk -> sprc anchor (limit identical to v7), loud print.
+  HARDENING (9/4 pm review, items 3+4): (a) _apply_leg_row writes sprc/obid/oask strictly first (v7
+  semantics) and the v8-only smrk/uprc_sr/calcSource via _safe_float (NaN on None/bad) -- a single bad
+  sMark row can no longer raise out of the batched refresh and skip wave 2 for EVERY strategy, nor leave a
+  leg half-updated; refresh prints are try/except-wrapped. (b) In trade_complex_v8 the F3/F1 diagnostic
+  prints run BEFORE the INSERT, so they are try/except-wrapped (a print can never block a send) and use
+  _safe_float; the INSERT loop records a "[V8] SEND FAILED" chat warning on exception and re-raises, so
+  the orchestrator's existing _safe handling is unchanged but the failure now reaches the recap.
+  DATA: wave-1 legs carry smrk from the F2 frames (or from the adj SELECT * on fallback -- adj has smrk too).
+  Wave-2 needs refreshed smrk, so with F3 on the installer ALSO patches:
+    spdr_rock_order_functions.batched_refresh_legs_deduped -> helpers_v8.batched_refresh_legs_deduped_v8
+      (orchestrator wave-2; refreshes sprc/smrk/obid/oask/uprc_sr/calcSource from V8_QUOTE_TABLE)
+    spdr_rock_order_functions.refresh_legs -> helpers_v8.refresh_legs_v8 (hacker wave-2 via
+      send_complex_two_waves)
+    hacker_trades._fetch_legs -> helpers_v8._fetch_legs_v8 (hacker legs fetched WITH smrk; 355 only,
+      skipped with a print in 350 where hacker_trades is not imported)
+  Hackers: same math applies automatically (send_complex_two_waves -> patched trade_complex); their sizing/
+  edge blend stays on sprc (strategy math); wave-3 forced clamp unaffected (limit binds at min_price).
+  Extra spreads (350): ladder prices stay fixed limits; only the fair used to cap a level above fair moves
+  to smrk via extra_spread_trader.FAIR_PRICE_COL = "smrk" (set in the 350 install block, lines 241-243).
+  PRINTS: the F3/F1 block is built as ONE string and printed once (no interleaving across concurrent
+  send threads). When the gap offset fires it is preceded by a one-liner in the orchestrator's
+  PREMIUM ADD-ON style: "[V8 F3] GAP OFFSET +0.111 to anchor for <name> W1 (gap 0.222 > thr 0.049;
+  ratio 0.5; anchor smrk 1.445 -> 1.536; surfOff 0.03 -> 0.141)". Then per order/wave
+  "[V8 F3] <name> W<n>: sprc_net smrk_net gap thr offset anchor (reason)", "limit
+  sent=X (v7 sprc-based would be Y); takesurfPrcoffset sent=Z", one line per leg (sprc smrk nbbo uPrc
+  calcSource). Recap: one line per order/wave PRINTED TO THE LOG ONLY ("V8 FEATURES RECAP" blocks, 350 lines
+  889-893 / 355 lines 739-743) -- removed from the Google Chat summary 9/4 pm per Zach (too long).
+  CHEAP-PRICE GUARDS + LOGGED LIMITS (9/4 pm review item 7): the orchestrator's closer wave-2 cheap-price
+  cap (spdr_rock_order_functions ~L1048-1063, wave2_limit <= cheap_price_threshold -> cap remainder) and
+  closer_spread_trader's wave-1 cheap-price guard (~L241-257) both evaluate compute_spread_limit, i.e. the
+  sprc limit, while F3 sends the anchor limit (never higher) -> guard could under-trigger (sprc limit 0.34,
+  smrk limit 0.28, full remainder rests at 0.28). FIX: with F3 on the installer ALSO patches
+  spdr_rock_order_functions.compute_spread_limit -> helpers_v8.compute_spread_limit_v8 (same signature;
+  returns the F3 anchor limit, v7 math when smrk unusable). Every shared caller resolves it at call time
+  (orchestrator wave1_limit/wave2_limit + cap, closer guard's in-function import, send_complex_two_waves
+  capture), so the guards and algo_trade_log's wave1_limit/wave2_limit now carry the limit ACTUALLY sent;
+  srprc1/srprc2 stay the surface fair, so sprc-vs-smrk divergence is still recoverable from the log.
+  trade_complex_v8's "v7 would have sent" print uses the saved ORIGINAL. Five patched functions total.
+  Pointer comment added above compute_spread_limit (spdr_rock_order_functions.py, comment only).
+
+F4 -- QUOTE TABLE sranalytics.msgliveimpliedquote (fresher than the ...adj proxy)
+  helpers_v8.V8_QUOTE_TABLE + V8_QUOTE_SELECT_COLS / V8_LEG_SELECT_COLS (lines 58-78). Used by F2's chain
+  pull and F3's three refresh/fetch patches ONLY. SELECT * on this table returns camelCase labels (uPrc, sPrc,
+  sMark, oBid, atmVol...), so every helpers_v8 SELECT aliases back to the lowercase names all consumers
+  read (sMark AS smrk, atmVol AS satm, uPrc AS uprc + uPrc AS uprc_sr, oBid/oAsk, sPrc) -- verified
+  2026-09-04 that MySQL returns explicit alias spelling. Column list CUT DOWN in review to what downstream
+  code reads (okey_tk/yr/mn/dy/xx/cp, uprc, obid, oask, sprc, smrk, satm, calcErr, calcSource,
+  netTimestamp, timestamp); greeks/IVs/slides/ticker_*/okey_at/ts are not read anywhere. The adj
+  fallback path still returns full SELECT * frames (harmless: superset). uPrcAdjResult does not exist here; the
+  refresh prints show calcErr + calcSource instead. Semantics: Tick rows carry the uPrc that prevailed when
+  THAT option's NBBO last changed (rows in one pull disagree on spot; sPrc on a quiet strike is priced off a
+  stale underlier) -- which is why F2 overwrites uprc with the live spot and F3 anchors on the NBBO-bounded
+  sMark (stale sPrc only leaks in through the gap offset). _srof.IMPLIED_QUOTE_TABLE is NOT flipped: the
+  shared SELECT * readers depend on the adj table's lowercase names.
+  OBSERVED 9/4 pm test: quiet long legs came back 1-2 MINUTES old (7735C src=Loop row_ts 13:23:40 at a
+  13:25:07 send; 7695P 13:24:11). Expected for this table: a row only republishes on an NBBO change or the
+  2-3 min loop, so its NBBO (and smrk) are still current but its sPrc/uPrc are priced off an old underlier.
+  This is the argument FOR anchoring on smrk; treat the "v7 would have sent" sprc limit on quiet strikes
+  as the less trustworthy number.
+
+SHARED-MODULE EDITS (v7 behavior byte-identical -- comments + one gated global):
+  spdr_rock_order_functions.py: pointer comments above refresh_legs (line 136), compute_spread_limit (250),
+    trade_complex (284-285), batched_refresh_legs_deduped (717): "replaced at runtime by helpers_v8.* --
+    port edits there too".
+  hacker_trades.py line 209: same pointer above _fetch_legs.
+  extra_spread_trader.py lines 26-29: new module global FAIR_PRICE_COL = "sprc" (v7 default); line 168:
+    spread_fair = getattr(long, FAIR_PRICE_COL, long.sprc) - getattr(short, FAIR_PRICE_COL, short.sprc)
+    -> identical numbers at the default (verified); only 350pm_script_v8 sets it to "smrk".
+  helpers_backup.py / spdr_rock_order_functions_backup.py NOT re-synced (live changes are comments only).
+
+VERIFIED OFFLINE 2026-09-04 (scratch/.venv, read-only v8 data, INSERT stubbed -- no orders sent):
+  - build_qty_chunks: 401 -> [400,1]; 2000 -> [400,400,400,400,399]; 3300 -> 8 chunks + 100 DROPPED warning.
+  - compute_v8_anchor sign cases (sale sprc above ask, sale sprc below bid -> pure smrk, sub-threshold gap,
+    debit spread, missing smrk -> sprc anchor); limit vs v7 limit printed for each.
+  - install_send_patches against the REAL shared modules: 5 signature checks pass; name resolution inside
+    send_wave1_only / orchestrate_batched_send / send_complex_two_waves / fire_hackers sees the patches;
+    a faked signature change raises at install; uninstall restores originals.
+  - fetch_v8_chains live: 80 rows (59 Tick / 21 Loop), spot 7723.84 vs uPrc median 7723.27, ~20ms per query
+    concurrent; frames carry every column consumers read; OTM filter + spx = puts.uprc[0] behave.
+  - Dry run through the SHARED coroutines with a stubbed INSERT: W1 size 5 at a 2-lot cap -> chunks
+    [2,2,1]; takesurfPrcoffset = edge_target + (sprc_net - anchor_net) and limit = anchor_net - max_edge
+    asserted; W2 after batched_refresh_legs_deduped_v8 (smrk refreshed). Both v8 scripts import cleanly;
+    a plain v7-style process leaves trade_complex/refresh_legs/batched_refresh/_fetch_legs/FAIR_PRICE_COL
+    at their originals and never loads helpers_v8.
+FIRST TEST RUN 2026-09-04 (T.AGMV8.01, 350_v8): F2 ran (spot 7708.53 vs uPrc 7708.45, no strike shift),
+  F3 anchored every order on pure smrk (2-5c below sprc -> limits 2-5c more aggressive than v7; gaps under
+  the 3% threshold so no offset), F1 nothing to chunk (max 50 lots). Orders accepted (no negative
+  surfOff case yet). BUG FIXED same day: recap wave label keyed on strategy name only, so a config's CALL
+  trade (same name as its PUT trade) printed as "W2". _next_wave now keys on (name, short strikes, long
+  strikes). Label-only; no pricing/size impact.
+SECOND + THIRD TEST RUNS 2026-09-04 pm (T.AGMV8.01, 350_v8, run directly from PyCharm, after the review fixes):
+  Run 2 (ratio 0.20): F2 ok (spot 7714.44 vs uPrc 7714.07, same strikes), F3 put spreads = v7 (smrk == sprc),
+    call spreads pure smrk (gap 0.014 < thr; limit 0.58 vs v7 0.60), extra-spread fair now smrk (-0.53),
+    75/75 filled, no W2.
+  Run 3 (V8_SIZE_RATIO temporarily 3.00 to force chunking): F1 VALIDATED -- 720 lots -> [400, 320], two
+    INSERTs 40ms apart, both accepted; batched fill check saw both gcs, cancelled each (dedupe 0: on v8 each
+    chunk has its OWN parentNumber, unlike the v7 comment in batched_fill_check_and_cancel), summed fills
+    across chunks (349/720) and W2 resent the 371 remainder as ONE order. F3 W2 anchors used the REFRESHED
+    smrk (batched_refresh_legs_deduped_v8). Premium add-ons composed with F3 (ET 0.07 + gap -> surfOff
+    0.0747). One SR-side INSERT commit took 525ms (216-lot call spread) stretching Phase 2 to 0.58s --
+    infrastructure variance, not new code. Extra spreads also went out at 3x (597-lot ladder) because they
+    follow V8_SIZE_RATIO.
+  GOTCHA (resolved same day): run 3 needed V8_SIZE_RATIO=3.00 in 350pm_script_v8.py; it was restored to
+  .20 afterwards (verified 9/4 pm, both scripts at 0.20). Any future forced-chunking test must do the same
+  -- check before a prod session: grep -n "^V8_SIZE_RATIO" 350pm_script_v8.py 355pm_script_v8.py
+REVIEW LOG 2026-09-04 pm (Citadel-style adversarial review by a second chat; handoff prompt listed every
+  edited line). Findings and what was done:
+  #1 HIGH  negative takesurfPrcoffset on sprc-below-bid sales -> FIXED by the anchor rule change (F3 HISTORY).
+  #3 MED   NULL sMark/uPrc at wave 2 could raise out of the batched refresh and skip W2 for ALL strategies ->
+           FIXED (_safe_float, strict sprc/obid/oask first, prints wrapped). See F3 HARDENING (a).
+  #4 MED   F3 diagnostics ran before the INSERT and could block a send on a bad field -> FIXED (try/except
+           block, one-string print, SEND FAILED chat warning + re-raise). See F3 HARDENING (b).
+  #7 MED   cheap-price guards evaluated the sprc limit while F3 sent the smrk limit -> FIXED by patching
+           compute_spread_limit (5th patch). See F3 CHEAP-PRICE GUARDS.
+  Other review-driven changes: V8_TEST_MAX_QTY env override REMOVED (test chunking with a giant order
+  instead); V8_QUOTE_SELECT_COLS cut to the 17 columns actually read; recap moved to LOG ONLY (chat too
+  long); wave label keyed on (name, strikes); "[V8 F3] GAP OFFSET ..." one-liner added (PREMIUM ADD-ON
+  style) and the F3/F1 block printed as one string.
+NOT YET VALIDATED (next runs should confirm):
+  1. First LIVE order with a large positive surfOff (smrk well below sprc, gap offset firing) is accepted by
+     SR and works at anchor - edge_target. (Negative offsets are impossible by construction since 9/4 pm.)
+  2. VALIDATED IN TEST 9/4 pm (run 3): multi-chunk W1 at 400/order, per-chunk cancel, W2 remainder resend.
+     Not yet seen in prod (needs a post-ratio size > 400).
+  3. Live-spot frames feeding closer / bumped at the real gates (neither triggered in the 9/4 tests; parents,
+     outrights and extra spreads did). F2 wall time at the gate: 17-112ms observed, concurrent with the spot
+     query.
+  4. 355_v8 end to end: hackers (_fetch_legs_v8 rows + refresh_legs_v8 + W3 rest through trade_complex_v8)
+     and the 3:55 F2 refresh. NOT RUN YET on 9/4.
+  5. Fallback path (force by setting V8_SPOT_MAX_AGE_S=0.0 in a test) lands on the adj SQLs cleanly.
+  6. First PROD session (IS_TEST=False, real EOD41-99 accounts) -- watch the [V8 F2]/[V8 F3] lines and the
+     chat for LIVE-SPOT FALLBACK / SEND FAILED warnings.
+DECOMMISSION: delete helpers_v8.py + the "V8 EXPLORATORY FEATURES", "V8 F1/F3/F4", "V8 F2/F4",
+  "V8 FEATURES RECAP" blocks in both v8 scripts, the five NOTE comments (spdr_rock_order_functions x4,
+  hacker_trades x1) and extra_spread_trader.FAIR_PRICE_COL.

@@ -1,0 +1,119 @@
+"""
+Large index flows -- step 1: build the list of effective dates with > $7B of
+estimated index flow in a single name.
+
+Population:
+  * Regular-cycle S&P 500 adds from sp500_helpers.INDIVIDUAL_ADDS (read via AST,
+    no liberator import chain). Announcement date = the ANNOUNCEMENT_CYCLES entry
+    within 21 days before the effective date.
+  * Estimated index buying = FLOW_PCT (12%) x CUR_MKT_CAP on the announcement
+    date (Bloomberg, $mm -> $). Pure ballpark proxy.
+  * MANUAL_EVENTS: other large index events Zach flagged (AVGO sell 12/19/25,
+    AAPL buy 12/20/24). Sizes TBD -- assumed > $7B for now, flagged as such.
+
+Output: large_flow_events.csv next to this script (all adds, with a
+`passes_7b` flag) -- the > $7B subset is what feeds the 0DTE options study.
+
+Run standalone as  python -c "exec(open('build_flow_list.py').read())"  or run the
+cells in a kernel (my_bdh spawns a child process; a plain `python file.py` would
+re-execute the module in the child).
+"""
+#%% Imports / config
+import ast
+import datetime as dt
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import bloomberg_helpers as bbg
+
+HELPERS_PATH = 'D:/agent_projects/sp500_adds/sp500_helpers.py'
+OUT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else 'D:/agent_projects/large_index_flows'
+OUT_CSV = os.path.join(OUT_DIR, 'large_flow_events.csv')
+
+FLOW_PCT = 0.12            # indexers need to buy ~12% of market cap on an add
+FLOW_THRESHOLD = 7e9       # $7B -- keep events at or above this
+TICKER_FIXES = {'SQ': 'XYZ', 'FLTR': 'FLUT'}
+
+# Other large index events (not S&P adds). Flow sizes per Zach (9/10/26).
+MANUAL_EVENTS = [
+    # eff_date,          symbol, direction, est_flow_usd, note
+    (dt.date(2025, 12, 19), 'AVGO', 'sell', 16e9, 'indexers sold ~$16B of AVGO (Zach, 9/10/26)'),
+    (dt.date(2024, 12, 20), 'AAPL', 'buy',  30e9, 'indexers bought ~$30B of AAPL (Zach, 9/10/26)'),
+]
+
+pd.set_option('display.width', 250)
+pd.set_option('display.max_columns', 40)
+
+
+def _bbg(sym):
+    """Map a symbol to its Bloomberg equity ticker, applying TICKER_FIXES."""
+    return f"{TICKER_FIXES.get(sym, sym)} US Equity"
+
+
+def load_cycle_lists(path):
+    """Return (ANNOUNCEMENT_CYCLES, INDIVIDUAL_ADDS) from sp500_helpers.py by
+    exec-ing only those two assignment statements with dt in scope."""
+    tree = ast.parse(open(path, encoding='utf-8').read())
+    ns = {'dt': dt}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in ('ANNOUNCEMENT_CYCLES', 'INDIVIDUAL_ADDS')
+                for t in node.targets):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), path, 'exec'), ns)
+    return ns['ANNOUNCEMENT_CYCLES'], ns['INDIVIDUAL_ADDS']
+
+
+def build_add_events():
+    """One row per regular-cycle S&P add: eff_date, symbol, annc_date (matched
+    from ANNOUNCEMENT_CYCLES, first annc within 21 days before eff)."""
+    cycles, adds = load_cycle_lists(HELPERS_PATH)
+    annc_dates = sorted(a for a, _ in cycles)
+    rows = []
+    for eff, sym in adds:
+        cands = [a for a in annc_dates if 0 < (eff - a).days <= 21]
+        rows.append({'eff_date': eff, 'symbol': sym, 'annc_date': cands[-1] if cands else None,
+                     'event_type': 'sp500_add', 'direction': 'buy'})
+    return pd.DataFrame(rows)
+
+
+def add_mkt_caps(events):
+    """Attach CUR_MKT_CAP ($) on annc_date per row via my_bdh (raw, cached)."""
+    caps = []
+    for annc, grp in events.groupby('annc_date'):
+        df = bbg.my_bdh([_bbg(s) for s in grp.symbol], 'CUR_MKT_CAP', annc, annc,
+                        adjust='-', timeout=120, verbose=True)
+        s = df.iloc[0].droplevel(1) if len(df) else pd.Series(dtype=float)
+        s.index = [t.replace(' US Equity', '') for t in s.index]
+        for sym in grp.symbol:
+            caps.append({'annc_date': annc, 'symbol': sym,
+                         'mkt_cap_usd': float(s.get(TICKER_FIXES.get(sym, sym), np.nan)) * 1e6})
+    return events.merge(pd.DataFrame(caps), on=['annc_date', 'symbol'], how='left')
+
+
+#%% Build
+if __name__ == '__main__' or 'get_ipython' in dir():
+    adds = add_mkt_caps(build_add_events())
+    adds['est_flow_usd'] = FLOW_PCT * adds['mkt_cap_usd']
+    adds['note'] = f'{FLOW_PCT:.0%} x CUR_MKT_CAP on annc date'
+
+    manual = pd.DataFrame(MANUAL_EVENTS, columns=['eff_date', 'symbol', 'direction', 'est_flow_usd', 'note'])
+    manual['event_type'] = 'other_index_event'
+    manual['annc_date'] = pd.NaT
+    manual['mkt_cap_usd'] = np.nan
+
+    events = pd.concat([adds, manual], ignore_index=True)
+    events['passes_7b'] = events['est_flow_usd'] >= FLOW_THRESHOLD
+    events['passes_10b'] = events['est_flow_usd'] >= 10e9
+    events = events.sort_values(['eff_date', 'symbol'], ascending=[False, True]).reset_index(drop=True)
+    events['mkt_cap_bn'] = events['mkt_cap_usd'] / 1e9
+    events['est_flow_bn'] = events['est_flow_usd'] / 1e9
+
+    cols = ['eff_date', 'annc_date', 'symbol', 'event_type', 'direction', 'mkt_cap_bn', 'est_flow_bn', 'passes_7b', 'passes_10b', 'note']
+    events[cols].to_csv(OUT_CSV, index=False)
+    print(f"Saved {OUT_CSV}")
+    print(events[cols].to_string(index=False, float_format=lambda x: f'{x:,.2f}'))
+    print(f"\n>= ${FLOW_THRESHOLD/1e9:.0f}B events: {int(events.passes_7b.sum())} of {len(events)};  >= $10B: {int(events.passes_10b.sum())}")

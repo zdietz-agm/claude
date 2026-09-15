@@ -1,0 +1,112 @@
+"""
+Large index flows -- step 1b: intraday price path on the effective date for
+every > $10B event (large_flow_events.csv, passes_10b).
+
+Timestamps pulled per (symbol, eff_date):
+  * 14:00 .. 15:50 every 5 minutes (23 snaps)
+  * 15:50:01, 15:55:00, 15:55:01, 15:59:59
+  * PX_LAST from Bloomberg (raw, adjust='-')
+
+Sources (team-cached, per Zach 9/10/26):
+  * vbam_utilities.cloudquant.get_prices_batch -- CloudQuant ICE trade prints, the print
+    NEAREST the requested timestamp (not as-of), cached in agentData.cloudquant_intraday_prices.
+  * vbam_utilities.bloomberg.my_bdh -- cached in agentData.bloomberg_bdh_cache.
+
+Output: intraday_prices.csv (one row per event, one column per snap) + the move in
+bps from 15:50:00 to PX_LAST.
+
+Run standalone as  python -c "exec(open('pull_intraday_prices.py').read())"  (my_bdh spawns a
+child process; a plain `python file.py` re-executes the module in the child).
+"""
+#%% Imports / config
+import datetime as dt
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+
+from vbam_utilities.bloomberg import my_bdh
+from vbam_utilities.cloudquant import get_prices_batch
+
+PROJ_DIR = 'D:/agent_projects/large_index_flows'
+EVENTS_CSV = os.path.join(PROJ_DIR, 'large_flow_events.csv')
+OUT_CSV = os.path.join(PROJ_DIR, 'intraday_prices.csv')
+FLOW_COL = 'passes_7b'   # was passes_10b for the first pass (9/10/26); 7B superset now, filter on est_flow_bn
+
+# 14:00 .. 15:50 every 5 min, then the post-publication / late snaps
+SNAP_TIMES = [dt.time(14 + (m // 60), m % 60) for m in range(0, 111, 5)] + [
+    dt.time(15, 50, 1), dt.time(15, 55, 0), dt.time(15, 55, 1), dt.time(15, 59, 59)]
+SNAP_TIMES = sorted(set(SNAP_TIMES))
+
+pd.set_option('display.width', 300)
+pd.set_option('display.max_columns', 60)
+
+
+def _col(t):
+    """Column label for a snap time: HH:MM, or HH:MM:SS when seconds != 0."""
+    return t.strftime('%H:%M') if t.second == 0 else t.strftime('%H:%M:%S')
+
+
+def load_events(csv_path=EVENTS_CSV, flag=FLOW_COL):
+    """Events passing `flag`, one row per (eff_date, symbol)."""
+    ev = pd.read_csv(csv_path, parse_dates=['eff_date', 'annc_date'])
+    ev = ev[ev[flag]].copy()
+    ev['eff_date'] = ev['eff_date'].dt.date
+    ev = ev[ev['eff_date'] < dt.date.today()]   # future eff dates (e.g. BE 2026-09-18) have no prints yet
+    return ev.sort_values(['eff_date', 'symbol'], ascending=[False, True]).reset_index(drop=True)
+
+
+def pull_cloudquant_snaps(events, snap_times=SNAP_TIMES, pause=0.2):
+    """CloudQuant trade price nearest each snap time, per event. One batch call per
+    (date, snap) covers every symbol on that date; results cached team-wide."""
+    out = {}
+    for date, grp in events.groupby('eff_date'):
+        syms = list(grp.symbol)
+        for t in snap_times:
+            ts = dt.datetime.combine(date, t)
+            px = get_prices_batch(syms, ts)
+            for s in syms:
+                out[(date, s, _col(t))] = px[s]
+            time.sleep(pause)
+        print(f"  {date}: {syms} done", flush=True)
+    ser = pd.Series(out)
+    ser.index.names = ['eff_date', 'symbol', 'snap']
+    return ser.unstack('snap')[[_col(t) for t in snap_times]]
+
+
+def pull_px_last(events):
+    """Bloomberg raw PX_LAST on eff_date per event (cached my_bdh)."""
+    rows = []
+    for date, grp in events.groupby('eff_date'):
+        tk = [f"{s} US Equity" for s in grp.symbol]
+        df = my_bdh(tk, 'PX_LAST', date, date, adjust='-', timeout=120, verbose=True)
+        for s in grp.symbol:
+            try:
+                val = float(df.loc[:, (f"{s} US Equity", 'PX_LAST')].iloc[0])
+            except (KeyError, IndexError):
+                val = np.nan
+            rows.append({'eff_date': date, 'symbol': s, 'PX_LAST': val})
+    return pd.DataFrame(rows).set_index(['eff_date', 'symbol'])['PX_LAST']
+
+
+#%% Build
+if __name__ == '__main__' or 'get_ipython' in dir():
+    events = load_events()
+    print(f"{len(events)} events, {len(SNAP_TIMES)} CloudQuant snaps each")
+    snaps = pull_cloudquant_snaps(events)
+    px_last = pull_px_last(events)
+
+    prices = snaps.join(px_last)
+    prices['move_1550_to_last_bps'] = (prices['PX_LAST'] / prices['15:50'] - 1) * 1e4
+    prices['move_1500_to_last_bps'] = (prices['PX_LAST'] / prices['15:00'] - 1) * 1e4
+
+    meta = events.set_index(['eff_date', 'symbol'])[['direction', 'est_flow_bn']]
+    prices = meta.join(prices).reset_index()
+    prices = prices.sort_values(['eff_date', 'symbol'], ascending=[False, True]).reset_index(drop=True)
+    prices.to_csv(OUT_CSV, index=False)
+    print(f"Saved {OUT_CSV}")
+
+    show = ['eff_date', 'symbol', 'direction', 'est_flow_bn', 'move_1550_to_last_bps', 'move_1500_to_last_bps']
+    print(prices[show].to_string(index=False, float_format=lambda x: f'{x:,.0f}'))

@@ -1,0 +1,358 @@
+import datetime as dt
+import time
+import asyncio
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+
+# --- SpiderRock v8 migration toggle (per-script) --------------------------------------------
+# USE_V8=True -> pull DATA (option chains, refresh) from v8. SEND_V8=True -> send ORDERS + read
+# fills on v8 too. When USE_V8, the v7-only .56 host-pin below is SKIPPED and use_v8()/_host_port_for
+# handle routing to v8 (192.81.231.66:3700). USE_V8=False -> everything stays v7, byte-for-byte.
+USE_V8  = True
+SEND_V8 = True
+
+# ==================== SR host routing (v7 ONLY): run this script's queries against 198.102.4.56 ====================
+# See D:/agent_projects/eod_option_algos/sr_host_routing_findings.md. TEMPORARY until SRSE ships.
+# Skipped under USE_V8 -- v8 is a single host reached via use_v8_connection, so the .56 pin is moot there.
+if not USE_V8:
+    import spdr_rock_functions as _srf
+    _srf.hostname = "198.102.4.56"
+    _srf.HOSTNAME = "198.102.4.56"
+    _defaults = list(_srf.run_query.__defaults__)
+    assert len(_defaults) == 7, f"run_query.__defaults__ has {len(_defaults)} elements; expected 7 (signature changed?)."
+    _defaults[2] = "198.102.4.56"   # position: (database, fetch, hostname, pool, verbose, t_await, tag)
+    _srf.run_query.__defaults__ = tuple(_defaults)
+    del _srf, _defaults
+# =========================================================================================================
+
+from google_chat_webhook import send_message, my_chat
+from calendar_utils import getNowEst
+from spdr_rock_functions import run_query
+today = dt.date.today()
+
+import helpers
+from helpers import *
+# Flip to v8 BEFORE `import *` so the rebuilt get_closest_* SQL (msgliveimpliedquoteadj) binds here.
+if USE_V8:
+    from spdr_rock_order_functions import use_v8 as _use_v8
+    _use_v8(True, send=SEND_V8)
+from spdr_rock_order_functions import *
+seed = int(dt.datetime.now().strftime("%f")) % 10000
+counter = create_counter(seed)
+
+# Parent strategies and max sizes
+PARENT_STRATEGIES = [
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS",
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET",
+]
+MAX_SIZES = {
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS": 1,
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET": 1,
+}
+ACCOUNTS = {
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS": "EOD26_C42",
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET": "EOD27_C42",
+}
+
+# --- Test-mode CLI (fed by test_run_algos.sh) ------------------------------------------------
+# Prod runs with NO arguments and behaves exactly as before. Passing ANY argument without
+# --test is a hard error, so a prod launch can never be silently overridden.
+import argparse as _argparse
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--test", action="store_true")
+_p.add_argument("--send-trades", type=lambda s: s.strip().lower() == "true", default=None)
+_p.add_argument("--test-340pm-imbal", type=float, default=None)
+_p.add_argument("--test-350pm-imbal", type=float, default=None)
+_p.add_argument("--test-spy-340", type=float, default=None)
+_p.add_argument("--test-spy-350", type=float, default=None)
+_a = _p.parse_args()
+if len(sys.argv) > 1 and not _a.test:
+    raise AssertionError(f"CLI args are only allowed in test mode. Got {sys.argv[1:]}. Pass --test.")
+
+IS_TEST = False or _a.test
+SEND_TRADES = True if _a.send_trades is None else _a.send_trades
+
+TEST_340PM_IMBAL = .1e9 if _a.test_340pm_imbal is None else _a.test_340pm_imbal
+TEST_350PM_IMBAL = -2.8e9 if _a.test_350pm_imbal is None else _a.test_350pm_imbal
+TEST_SPY_340 = None if _a.test_spy_340 is None else _a.test_spy_340
+TEST_SPY_350 = None if _a.test_spy_350 is None else _a.test_spy_350
+
+if __name__ == "__main__":
+    warm_up_bloomberg_connection()   # pay blpapi Session.start() now, not at the 3:40 SPY snap (see helpers)
+    if not SEND_TRADES and not IS_TEST:
+        raise AssertionError("SEND_TRADES is set to False but IS_TEST is False. This is not allowed.")
+
+    configs = load_configs_from_directory("./configs", time="350PM")
+    configs = [c for c in configs if c["name"] in PARENT_STRATEGIES]
+    for cfg in configs:
+        cfg["max_size"] = MAX_SIZES[cfg["name"]]
+        cfg["account"] = ACCOUNTS[cfg["name"]]
+
+    print("Loaded configs:")
+    for cfg in configs:
+        print(f"  {cfg['name']} (max_size={cfg['max_size']})")
+
+    if IS_TEST:
+        for config in configs:
+            config["account"] = TEST_ACCOUNTS[config["account"]]
+            # Sending test orders to v8 -> route them to the v8 test account (T.AGM* only exists on v7).
+            if SEND_V8 and str(config["account"]).startswith("T.AGM"):
+                config["account"] = "T.AGMV8.01"
+
+    if not IS_TEST:
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')} Starting FAST 350pm options algo (IMBAL_GROWS + IMBAL_VS_MARKET, max_size=1).", my_chat)
+    summary = f"{dt.date.today().strftime('%m/%d/%Y')} {'3:50 PM FAST Options Algo' if not IS_TEST else 'TEST FAST OPTIONS'} RECAP:\n\n"
+
+    # _____________________________________________________________3:40 PM Data_____________________________________________________________
+
+    while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 38, 1):
+        time.sleep(30)
+    while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 40, 3):
+        time.sleep(.5)
+
+    # SPY price at 3:40 for spy_chg_1540_1550 dont_trade factor (IMBAL_GROWS)
+    print(f"{pretty_time()} -- Starting pull SPY price 3:40 via BBG")
+    if IS_TEST:
+        spy_price_340 = TEST_SPY_340
+    else:
+        try:
+            from xbbg import blp
+            spy_price_340 = float(blp.bdp("SPY US Equity", "PX_LAST").iloc[0, 0])
+        except Exception as e:
+            print(f"  WARNING: failed to pull SPY price at 3:40 -- {e}. spy_price_340 = None")
+            spy_price_340 = None
+    print(f"{pretty_time()} -- Finished pull SPY price 3:40: {spy_price_340}")
+
+    print(f"{pretty_time()} -- Starting get_340_imbal()")
+    imbal340 = get_340_imbal(is_test=IS_TEST, test_imbal=TEST_340PM_IMBAL)
+    print(f"{pretty_time()} -- Finished get_340_imbal(): {imbal340:,.0f}" if not isinstance(imbal340, str) else f"{pretty_time()} -- Finished get_340_imbal(): {imbal340}")
+
+    if imbal340 == NO_IMBAL_VAL:
+        imbal340 = "*Not Found*"
+    if isinstance(imbal340, str):
+        summary += "No 3:40pm imbalance found. Exited.\n"
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary, my_chat)
+        exit()
+
+    imbal_mag340 = get_imbal_mag(imbal340)
+    imbal_signed340 = get_imbal_signed(imbal340)
+
+    # _____________________________________________________________3:49:59 -- Market Type + Options Snaps_____________________________________________________________
+
+    while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 48, 1):
+        time.sleep(30)
+    while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 49, 58, 500000):
+        time.sleep(.5)
+
+    print(f"{pretty_time()} -- Starting get_market_measurements()")
+    market, today_move, std = get_market_measurements()
+    print(f"{pretty_time()} -- Finished get_market_measurements(): {market}")
+
+    # moving this to post 350
+    # print(f"{pretty_time()} -- Refreshing SPXW options snaps")
+    # calls = run_query(get_closest_calls_sql)
+    # puts = run_query(get_closest_puts_sql)
+    # spx = puts.uprc[0]
+    # print(f"{pretty_time()} -- Finished SPXW options snaps: SPX={spx:.2f}")
+
+    # SPY price at ~3:50 (pre-pulled for zero-latency factor computation once imbal arrives)
+    print(f"{pretty_time()} -- Starting pull SPY price ~3:50 via BBG")
+    if IS_TEST:
+        spy_price_350 = TEST_SPY_350
+    else:
+        try:
+            spy_price_350 = float(blp.bdp("SPY US Equity", "PX_LAST").iloc[0, 0])
+        except Exception as e:
+            print(f"  WARNING: failed to pull SPY price at ~3:50 -- {e}. spy_price_350 = None")
+            spy_price_350 = None
+    print(f"{pretty_time()} -- Finished pull SPY price ~3:50: {spy_price_350}")
+
+    # _____________________________________________________________3:50:00 -- Poll Imbal_____________________________________________________________
+
+    while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 50, 0, 700000):
+        time.sleep(.05)
+
+    print(f"{pretty_time()} -- Starting get_fast_imbal()")
+    imbal_result = get_fast_imbal(is_test=IS_TEST, test_imbal=TEST_350PM_IMBAL)
+    imbal = imbal_result["net_imbal"]
+    print(f"{pretty_time()} -- Finished get_fast_imbal(): {imbal:,.0f}" if imbal != NO_IMBAL_VAL else f"{pretty_time()} -- get_fast_imbal: NO DATA")
+
+    if imbal == NO_IMBAL_VAL:
+        imbal = "*Not Found*"
+    if isinstance(imbal, str):
+        summary += "No 3:50pm imbalance found. Exited.\n"
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary, my_chat)
+        exit()
+
+    print(f"{pretty_time()} -- Refreshing SPXW options snaps")
+    calls = run_query(get_closest_calls_sql)
+    puts = run_query(get_closest_puts_sql)
+    spx = puts.uprc[0]
+    print(f"{pretty_time()} -- Finished SPXW options snaps: SPX={spx:.2f}")
+
+    # _____________________________________________________________Build Factor Dict_____________________________________________________________
+
+    imbal_mag = get_imbal_mag(imbal)
+    imbal_signed = get_imbal_signed(imbal)
+
+    if spy_price_340 is not None and spy_price_350 is not None and spy_price_340 > 0:
+        spy_chg_1540_1550_bps = (spy_price_350 - spy_price_340) / spy_price_340 * 10000
+    else:
+        spy_chg_1540_1550_bps = None
+
+    factor_dict = {
+        # IMBAL_GROWS
+        "factor_imbal_signed":                    bin_imbal_signed(imbal_signed),
+        "factor_imbal_mag340":                    bin_imbal_mag(imbal_mag340),
+        "factor_imbal_signed340":                 bin_imbal_signed(imbal_signed340),
+        "factor_sell_imbal_greater_than_2":       1 if imbal < -2e9 else 0,
+        "factor_spy_chg_1540_1550_lt_neg7":       1 if (spy_chg_1540_1550_bps is not None and spy_chg_1540_1550_bps < -7) else 0,
+        "factor_spy_chg_1540_1550_gt_7":          1 if (spy_chg_1540_1550_bps is not None and spy_chg_1540_1550_bps > 7) else 0,
+        # IMBAL_VS_MARKET
+        "factor_market_type":                     1 if market == "UP" else -1 if market == "DOWN" else 0,
+        "factor_imbal_mag":                       bin_imbal_mag(imbal_mag),
+        "factor_350_imbal_500m_to_1b":            1 if (imbal >= 0.5e9 and imbal <= 1e9) else 0,
+        "factor_350_imbal_minus_1b_to_minus_500m": 1 if (imbal >= -1e9 and imbal <= -0.5e9) else 0,
+    }
+    print(f"{pretty_time()} -- factor_dict: {factor_dict}")
+
+    # _____________________________________________________________Prep Trades_____________________________________________________________
+
+    option_chains = {
+        "SPXW": {"puts": puts, "calls": calls, "underlying": spx},
+    }
+
+    print(f"{pretty_time()} -- Starting prep_trades()")
+    trade_dict, explanations_dict = prep_trades(
+        configs=configs,
+        factor_dict=factor_dict,
+        option_chains=option_chains,
+        today=today,
+        trigger_all=False,
+        trigger_all_size=1,
+        magnets=[],
+    )
+    print(f"{pretty_time()} -- Finished prep_trades()")
+
+    # _____________________________________________________________Build Summary_____________________________________________________________
+
+    spy_chg_str = f"{spy_chg_1540_1550_bps:.1f} bps" if spy_chg_1540_1550_bps is not None else "N/A"
+    summary += f"SPX: {spx:,.2f}. Imbal: {imbal:,.0f}. Market: {market}.\n"
+    summary += f"SPY 3:40->3:50: {spy_chg_str}. 340PM Imbal: {imbal340:,.0f}.\n"
+
+    summary_dict = {}
+    for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+        if not trade["name"] in summary_dict:
+            summary_dict[trade["name"]] = f"""\n*{trade["name"]}* ({trade["account"]}):\n"""
+        if trade_type == "complex":
+            if trade["direction"] == "Sell":
+                summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["short_legs"][0].okey_xx} {trade["long_legs"][0].okey_xx} {trade["structure"]} for {trade["price"]}.\n"""
+            else:
+                summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["long_legs"][0].okey_xx} {trade["short_legs"][0].okey_xx} {trade["structure"]} for {trade["price"]}.\n"""
+        else:
+            summary_dict[trade["name"]] += f"""{trade["direction"]} {trade["size"]} {trade["symbol"]} {trade["option"].okey_xx} {trade["structure"]} for {trade["price"]}.\n"""
+    for single_algo_summary in summary_dict.values():
+        summary += single_algo_summary
+
+    summary += "\n*Explanations:*"
+    for algo_name, explanations in explanations_dict.items():
+        summary += f"\n{algo_name}:\n"
+        summary += explanations["put"]
+        summary += explanations["call"]
+
+    # _____________________________________________________________Send Trades + Summary_____________________________________________________________
+
+    trades = []
+    for trade, trade_type in zip(trade_dict["trades"], trade_dict["trade_types"]):
+        if trade["size"] == 0:
+            continue
+        if trade_type == "complex":
+            trade["_wave_capture"] = {}
+            order = send_complex_two_waves(
+                trade["symbol"], trade["size"], trade["short_legs"], trade["long_legs"], trade["exp"],
+                trade["account"], edge_target1=trade["edge_target1"], max_edge1=trade["max_edge1"],
+                edge_target2=trade["edge_target2"], max_edge2=trade["max_edge2"],
+                is_sale=trade["is_sale"], userData=trade["name"], orderDuration=30, min_price=trade.get("min_price"),
+                capture=trade["_wave_capture"],
+            )
+        else:
+            order = send_outright_limit_order(
+                trade["symbol"], trade["option"], trade["size"], DIRECTION=trade["direction"],
+                ACCOUNT=trade["account"], offset=trade["offset"], userData=trade["name"],
+                orderDuration=30, min_price=trade.get("min_price"),
+            )
+        trades.append((order, trade["name"]))
+
+    async def safe_send(coro, trade_name):
+        """Returns the coroutine's result (list of grouping_codes for complex trades, None
+        otherwise) so algo_trade_logger can use them to look up SR fills."""
+        try:
+            return await coro
+        except Exception as e:
+            print(f"ERROR sending trade '{trade_name}': {e}")
+            return None
+
+    async def send_summary_async():
+        print(summary)
+        send_message(f"{getNowEst().time().strftime('%I:%M:%S %p')}\n" + summary, my_chat)
+
+    print(f"{pretty_time()} -- Starting asyncio.run(send_all())")
+    order_results = []
+    if SEND_TRADES:
+        async def send_all():
+            return await asyncio.gather(
+                *[safe_send(coro, name) for coro, name in trades],
+                send_summary_async(),
+            )
+        gathered = asyncio.run(send_all())
+        # gathered has N+1 entries: N trade results + 1 summary result (None). Drop the last.
+        order_results = gathered[:-1] if gathered else []
+
+        # Map grouping_codes back to their trade_dict entries (parallel order: trades was built
+        # by iterating trade_dict in order, appending size>0 entries; order_results is parallel).
+        _sized_trades = [t for t in trade_dict["trades"] if t.get("size", 0) > 0]
+        for _t, _result in zip(_sized_trades, order_results):
+            _t["grouping_codes"] = _result if isinstance(_result, list) else None
+            # Pull per-wave limits + gc split + cross/surface captured by send_complex_two_waves.
+            _cap = _t.get("_wave_capture") or {}
+            _t["wave1_limit"] = _cap.get("wave1_limit")
+            _t["wave2_limit"] = _cap.get("wave2_limit")
+            _t["wave1_grouping_codes"] = _cap.get("wave1_codes")
+            _t["wave2_grouping_codes"] = _cap.get("wave2_codes")
+            _t["cross_price1"] = _cap.get("cross_price1")
+            _t["srprc1"] = _cap.get("srprc1")
+            _t["cross_price2"] = _cap.get("cross_price2")
+            _t["srprc2"] = _cap.get("srprc2")
+    else:
+        asyncio.run(send_summary_async())
+    print(f"{pretty_time()} -- Finished asyncio.run(send_all())")
+
+    # Log per-algo trade attempts to optionsResearch.algo_trade_log (60s wait for SR fills to settle).
+    # Wrapped in try/except so logging failure never affects trading (trading is already done at this point).
+    # Skipped entirely in test mode -- we don't want test trades polluting the prod log table.
+    # Note: fast script doesn't capture vix / atm_vol / rsi / hl / 3m_realized_chg / qqq_imbal / paired_imbal -> logged NULL.
+    if IS_TEST:
+        print(f"{pretty_time()} -- algo_trade_logger SKIPPED (IS_TEST=True)")
+    else:
+        try:
+            from algo_trade_logger import log_trades
+            factors_for_log = {
+                "spx_price":       float(spx) if spx is not None else None,
+                "vix":             None,
+                "atm_vol":         None,
+                "market_ratio":    float(today_move / std) if std else None,
+                "rsi":             None,
+                "high_low_ratio":  None,
+                "realized_3m_chg": None,
+                "imbal_340":       int(imbal340) if (not isinstance(imbal340, str) and imbal340 is not None) else None,
+                "imbal_350":       int(imbal) if (not isinstance(imbal, str) and imbal is not None) else None,
+                "imbal_355":       None,
+                "qqq_imbal":       None,
+                "paired_imbal":    None,
+            }
+            print(f"{pretty_time()} -- Starting algo_trade_logger (60s wait for SR fills)")
+            log_trades(trade_dict, factors_for_log, wait_seconds=60, script_name="350PM_FAST")
+            print(f"{pretty_time()} -- Finished algo_trade_logger")
+        except Exception as _log_e:
+            print(f"{pretty_time()} -- ERROR in algo_trade_logger (non-fatal): {_log_e}")
+            import traceback as _log_tb; _log_tb.print_exc()

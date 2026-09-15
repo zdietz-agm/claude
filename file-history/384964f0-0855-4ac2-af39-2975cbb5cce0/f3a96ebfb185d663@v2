@@ -1,0 +1,157 @@
+"""
+Large index flows -- widen the cached 0DTE quote window from 15:00-16:00 to 14:00-16:00 so
+14:00 and 14:30 entries can be tested.
+
+Population (same contracts as before -- band is still +/-8% of the 15:00 spot, so the strike
+set is identical and this is purely a longer window):
+  * 19 event dates  (intraday_prices.csv, est flow >= $7B)   -- run first, ~10 min
+  * 91 baseline Fridays (baseline_spots.csv)                 -- ~45-60 min
+Also records the 14:00 / 14:30 spots for the baseline Fridays to baseline_spots_1400.csv
+(event-date spots at those times are already in intraday_prices.csv).
+
+SAFETY -- the wipe is always ONE (symbol, trade_date) at a time:
+    DELETE FROM t_opra_quotes WHERE symbol = :s AND trade_date = :d AND exp = :d
+Both parameters are always bound and asserted non-null (a NULL date matches no rows in MySQL),
+the deleted rowcount is checked against the pre-count, and --verify (default on) counts the
+symbol's distinct trade_dates before and after the wipe and aborts unless exactly one date
+was removed. Nothing else for that symbol can be touched.
+
+Resumable: _extended_pull_meta.csv checkpoints each (symbol, date); completed pairs are skipped.
+
+Run from Git Bash:
+    python /d/agent_projects/large_index_flows/pull_extended_quotes.py --dry-run --limit 2
+    python /d/agent_projects/large_index_flows/pull_extended_quotes.py
+"""
+import argparse
+import datetime as dt
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import vbam_helpers
+from thetadata_helpers import check_v3_connection
+
+import pull_0dte_quotes as pq
+import pull_baseline_quotes as pb
+
+PROJ_DIR = 'D:/agent_projects/large_index_flows'
+EVENTS_CSV = os.path.join(PROJ_DIR, 'intraday_prices.csv')
+BASELINE_SPOTS_CSV = os.path.join(PROJ_DIR, 'baseline_spots.csv')
+OUT_SPOTS_CSV = os.path.join(PROJ_DIR, 'baseline_spots_1400.csv')
+META_CSV = os.path.join(PROJ_DIR, '_extended_pull_meta.csv')
+
+NEW_START = dt.time(14, 0, 0)          # widened window start (END_TIME stays 16:00)
+NEW_SNAPS = [dt.time(14, 0), dt.time(14, 30)]
+MIN_FLOW_BN = 7.0
+
+
+def log(msg):
+    """Print with flush so progress shows live in Git Bash."""
+    print(msg, flush=True)
+
+
+def load_pairs(which):
+    """[(kind, symbol, date, px_1500)] for the events and/or baseline Fridays, events first."""
+    pairs = []
+    if which in ('all', 'events'):
+        ev = pd.read_csv(EVENTS_CSV, parse_dates=['eff_date']).rename(columns={'15:00': 'px_1500'})
+        ev = ev[(ev['est_flow_bn'] >= MIN_FLOW_BN) & ev['px_1500'].notna()]
+        pairs += [('event', r.symbol, r.eff_date.date(), float(r.px_1500)) for r in ev.itertuples(index=False)]
+    if which in ('all', 'baselines'):
+        b = pd.read_csv(BASELINE_SPOTS_CSV, parse_dates=['date']).rename(columns={'15:00': 'px_1500'})
+        b = b[b['px_1500'].notna()]
+        pairs += [('baseline', r.symbol, r.date.date(), float(r.px_1500)) for r in b.itertuples(index=False)]
+    return pairs
+
+
+def early_spots(symbol, date):
+    """{'14:00': px, '14:30': px} for one (symbol, date), reusing pull_baseline_quotes.spot_snaps."""
+    saved = pb.SNAP_TIMES
+    try:
+        pb.SNAP_TIMES = NEW_SNAPS
+        snaps = pb.spot_snaps(symbol, date)
+    finally:
+        pb.SNAP_TIMES = saved
+    return {t.strftime('%H:%M'): snaps.get(t.strftime('%H:%M')) for t in NEW_SNAPS}
+
+
+def done_pairs():
+    """(symbol, date) pairs already completed in this script's meta file."""
+    if not os.path.exists(META_CSV):
+        return set()
+    m = pd.read_csv(META_CSV, parse_dates=['date'])
+    m = m[m['status'].isin(pq.DONE_STATUSES)]
+    return {(r.symbol, r.date.date()) for r in m.itertuples()}
+
+
+def n_dates_for(eng, symbol):
+    """Distinct trade_dates present for a symbol (safety check around the wipe)."""
+    with eng.connect() as c:
+        return c.execute(text(f"SELECT COUNT(DISTINCT trade_date) FROM {pq.TABLE} WHERE symbol = :s"),
+                         {'s': symbol}).scalar()
+
+
+def safe_wipe(eng, symbol, date, verify):
+    """Delete one (symbol, trade_date, exp) and prove nothing else went with it.
+    Returns (n_deleted, n_dates_before, n_dates_after). Raises if more than that one date left."""
+    assert symbol and isinstance(date, dt.date), f"refusing to delete with symbol={symbol!r} date={date!r}"
+    n_before = pq.rows_in_db(eng, symbol, date)
+    d_before = n_dates_for(eng, symbol) if verify else None
+    n_deleted = pq.wipe_db(eng, symbol, date)
+    assert n_deleted == n_before, f"{symbol} {date}: deleted {n_deleted} but pre-count was {n_before}"
+    d_after = n_dates_for(eng, symbol) if verify else None
+    if verify and n_before:
+        assert d_after == d_before - 1, (f"ABORT {symbol} {date}: distinct dates went {d_before} -> {d_after}, "
+                                         f"expected {d_before - 1}")
+    return n_deleted, d_before, d_after
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--which', choices=['all', 'events', 'baselines'], default='all')
+    ap.add_argument('--limit', type=int, default=None, help='only the first N pairs (smoke test)')
+    ap.add_argument('--dry-run', action='store_true', help='pull but never wipe or write')
+    ap.add_argument('--no-verify', action='store_true', help='skip the distinct-date check around each wipe')
+    a = ap.parse_args()
+    verify = not a.no_verify
+
+    pairs = load_pairs(a.which)
+    done = done_pairs()
+    todo = [p for p in pairs if (p[1], p[2]) not in done]
+    if a.limit:
+        todo = todo[:a.limit]
+    log(f"{len(pairs)} pairs ({a.which}), {len(done)} already done, {len(todo)} to pull; "
+        f"window {NEW_START}-{pq.END_TIME} @ {pq.INTERVAL}, band +/-{pq.BAND_PCT:.0%} of the 15:00 px"
+        + ("  [DRY RUN]" if a.dry_run else ""))
+    assert check_v3_connection(), "ThetaData v3 auth failed -- check thetadata_creds.json / THETADATA_API_KEY"
+    eng = create_engine(vbam_helpers.dev_connection_string, pool_pre_ping=True)
+
+    t_all = time.perf_counter()
+    for i, (kind, sym, date, px) in enumerate(todo, 1):
+        tag = f"[{i}/{len(todo)}] {kind:<8} {sym:<5} {date}  15:00 px {px:.2f}"
+        if a.dry_run:
+            log(f"{tag}  would wipe (symbol={sym}, trade_date={date}, exp={date}) then pull "
+                f"{NEW_START}-{pq.END_TIME}; rows now {pq.rows_in_db(eng, sym, date):,}")
+            continue
+        n_del, d_before, d_after = safe_wipe(eng, sym, date, verify)
+        log(f"{tag}  wiped {n_del:,} rows"
+            + (f"; symbol dates {d_before} -> {d_after}" if verify else ""))
+        meta = pq.pull_pair(eng, sym, date, px, dry_run=False, start_time=NEW_START)
+        row = {'kind': kind, 'symbol': sym, 'date': date, 'px_1500': px, 'start': str(NEW_START),
+               'end': str(pq.END_TIME), 'n_wiped': n_del, **meta, 'pulled_at': dt.datetime.now()}
+        if kind == 'baseline':
+            pd.DataFrame([{'symbol': sym, 'date': date, **early_spots(sym, date)}]).to_csv(
+                OUT_SPOTS_CSV, mode='a', index=False, header=not os.path.exists(OUT_SPOTS_CSV))
+        pd.DataFrame([row]).to_csv(META_CSV, mode='a', index=False, header=not os.path.exists(META_CSV))
+
+    log(f"\nDone in {(time.perf_counter() - t_all) / 60:.1f} min. Checkpoints: {META_CSV}"
+        + ("" if a.which == 'events' else f"; baseline 14:00/14:30 spots: {OUT_SPOTS_CSV}"))
+
+
+if __name__ == '__main__':
+    main()

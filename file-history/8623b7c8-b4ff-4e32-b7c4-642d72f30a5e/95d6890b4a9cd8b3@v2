@@ -1,0 +1,46 @@
+# 9/11/2026 -- hacker waves 3/4: NBBO-priced Simple/Activetaker replaces the Seeker rest
+
+## What changed
+- hacker_trades.py: the wave-3 Seeker rest (surface-quoting, limit forced to -HACK_MAX_PRICE
+  via WAVE3_FORCE_CLAMP_EDGE=99) is replaced by two NBBO-priced waves:
+    WAVE 3: remainder sent Simple/Activetaker at limit = -(live cross + HACK_W3_NBBO_OFFSET
+      0.07), floored at -HACK_MAX_PRICE (1.70). Works HACK_W3_WORK_S = 10s, then the
+      status-gated batched_fill_check_and_cancel settles it.
+    WAVE 4: any W3 remainder re-priced off a REFRESHED NBBO at -(cross + HACK_W4_NBBO_OFFSET
+      0.15), same floor, resting orderDuration = seconds to 16:00:00 (self-expires; capped by
+      WAVE_REST_MAX_DURATION_S = 310 for test-harness runs).
+  NBBO source (_nbbo_table): v7 sranalytics.msgoptionimpliedquote; v8
+  sranalytics.msgliveimpliedquote (the F4 table, NOT the adj proxy). Refresh retries 3x, 1s
+  apart, on failure/missing leg/ask<=0/row older than 5s; after that it SENDS ANYWAY on the
+  freshest quote held (fire-time leg rows as last resort) -- per Zach: never a silent
+  no-order, and never a bare -1.70 limit (LmtCollar reject risk; cap can only bind when the
+  cross is already near it).
+- spdr_rock_order_functions.py: trade_complex/_send_single_complex_order gained
+  limit_class="Surface", parent_handling="Seeker", explicit_limit=None kwargs -- defaults
+  byte-identical for every existing caller; the hacker passes Simple/Activetaker + the
+  NBBO-derived limit. WAVE3_FORCE_CLAMP_EDGE deleted.
+- Exception isolation preserved: W3/W4 sit in the existing never-lose-wave-1/2-codes guard,
+  W4 nested so its failure cannot lose W3's code. Announced sleep ("sleeping 10s for WAVE-3
+  to work") keeps the daily review's gap classifier clean.
+
+## Why
+The old wave 3 was believed to be a plain working limit at 1.70 (chat "Hacker script max
+spread price", and the hacker backtest models fill-at-cross up to the cap), but as coded it
+was a Seeker quoting at surface+ET2 with 1.70 only as an outer bound -- more passive than the
+validated model exactly on fast-market days. 9/9 evidence: wave-3 fills at 1.00-1.10 vs
+quotes it could have crossed; the model/prod gap surfaced as "attempted but never filled,
+delta_pnl 0" lines.
+
+## Verified
+- Both files compile; ASCII/tabs clean; HACK_MAX_PRICE line untouched (run_backtest_hacker's
+  regex still resolves); no remaining WAVE3_FORCE_CLAMP_EDGE references.
+- Offline mock tests: fresh-quote path (cross 1.15 -> W3 limit -1.22), all-retries-fail path
+  (fire-time fallback, sends), cap-binding path (cross 1.90 -> clamp -1.70), stale-quote-used
+  path. Review pack: both announced sleeps parse; POSSIBLE WAVE-3 MALFUNCTION flag is
+  algo_trade_log-driven, unaffected.
+
+## Still pending
+- Gateway acceptance test: one-lot SPXW credit spread, Simple/Activetaker via the mleg
+  gateway with surf-offset columns present -- T.AGM (v7) and T.AGMV8.01 (v8), each send only
+  on Zach's explicit go.
+- First live session watch: W3/W4 lines in the daily review, fills vs the backtest model.

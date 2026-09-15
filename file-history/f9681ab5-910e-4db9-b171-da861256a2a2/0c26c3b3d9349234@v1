@@ -1,0 +1,196 @@
+---
+name: data-sources
+description: Directory of all market data sources and which to use for what -- Bloomberg (xbbg), SpiderRock (live + liberator historical + Snowflake on request), ThetaData OPRA quotes, cq_helpers intraday prices, VBAM SQL tables (imbalances, ETF NAV, price/index snaps, options), algo trade logs (algo_trade_log + raw script logs), and pre-pulled local CSVs. Use FIRST whenever deciding where to pull any market, imbalance, options, NAV, or price data, and when investigating prod algo trades or fills, before writing SQL or a data pull.
+---
+
+# Data Sources (router)
+
+This skill is the expert on WHERE to get data. Pull mechanics live in the provider skills: `bloomberg-data` (xbbg) and `spiderrock-data` (spdr_rock_functions + liberator). Load those for how-to once the source is chosen.
+
+Note that the user has access to many data providers. If data is needed that is not catalouged in this skill, prompt the user and ask about adding it to this skill.
+
+## Routing table: task -> source
+
+| Need | Use | Interface / skill |
+|---|---|---|
+| Daily OHLCV bars (raw or adjusted) | Team DB canonical bars (zero BBG budget; 2021-11-26+; T+2 lag; lows cleaner than BBG PX_LOW) | `vbam_utilities.get_daily_bars(deadjust=True)` -- see `data-oracle` skill; PREFER over Bloomberg for daily bars |
+| Bloomberg fields, dividends, pre-2021 daily history | Bloomberg | `vbam_utilities.bloomberg.my_bdh/my_bds` (team-shared DB cache, raw-only, per-machine counter; see `data-oracle` skill) or legacy `bloomberg_helpers.my_bdh` (local parquet cache, same semantics) -- see `bloomberg-data` skill |
+| Live options quotes / live IV surface | SpiderRock | `spdr_rock_functions` -- see `spiderrock-data` skill |
+| Historical options / IV | Check `optionsResearch.t_historical_options_snaps` first (both sources cache there); else SpiderRock liberator (last ~2 years) or `spdr_historical` AWS S3 backfill (older than ~2 years) | see `spiderrock-data` skill |
+| Historical options / IV **when the user explicitly asks for Snowflake** | SpiderRock Snowflake share | `snowflake_helpers` -- see Snowflake section below. Not the default path; use only on request |
+| Historical OPRA option quotes (1s bid/ask/size), INTRADAY index prints (SPX/NDX/VIX) | ThetaData | `thetadata_helpers` (below) -- for index prints, preferred for anything intraday |
+| Index CLOSE / official settlement (SPX, NDX) | Bloomberg | `my_bdh(ticker, 'PX_LAST', adjust='-')` -- faster pull and the official settlement print, which is NOT always the 4pm tape price |
+| Intraday historic prices (snaps, not bars) | CloudQuant | `cq_helpers` (T+1; see CloudQuant section below) |
+| Live/historic closing imbalances, intraday price snaps, index level snaps | VBAM SQL | [references/alpine_tables.md](references/alpine_tables.md) |
+| Official ETF NAV (return-to-NAV calcs) | VBAM `compositions.t_compositions_ETFDailyBasketHeaders` | NAV SQL template in [references/alpine_tables.md](references/alpine_tables.md) |
+| Pre-pulled daily research data (imbalances, market_ratio, RSI3, VIX snaps, realized vol, 0DTE panels) | Local CSVs | [references/local_csvs.md](references/local_csvs.md) |
+| Algo trade logs: per-algo attempts/fills + factor snapshot | VBAM dev `optionsResearch.algo_trade_log` | see Trade logs section below + [references/alpine_tables.md](references/alpine_tables.md) |
+| Raw prod script run logs (full stdout, per script per day) | Local text files | `D:/PycharmProjects/scratch/algos/logs/<YYYY-MM-DD>_<script_name>.txt` |
+| Historical SpiderRock executions (per-leg fill price/qty/time), any day before today | SR per-day execution archives | v7: `srtrade_agm_<YYYY_MM_DD>` on 198.102.4.55:3307; v8: `srtrade_<YYYY_MM_DD>` on 192.81.231.66:3700 -- see Trade logs |
+| Dates / trading calendar | `calendar_utils` | `from calendar_utils import *` (`SERIALS`, `FEDS`, `is_month_end`, `month_ends`, `trading_range`, `next_trade_day`, `x_days_ago`) |
+
+Utils library path: `d:/PycharmProjects/utils/` (add via `sys.path.insert(0, ...)`).
+
+## ThetaData
+
+`thetadata_helpers` (`from thetadata_helpers import *`) -- historical OPRA option quotes (bid/ask/size, 1s snapshots) and index price series (per-exchange-tick SPX/NDX/VIX/etc.). Two generations wrapped side by side; **prefer v3 for new code**:
+
+- **v3 (preferred)** -- official `thetadata` pip library, gRPC direct to Theta servers. **NO local terminal needed.** Creds: `THETADATA_API_KEY` env var or `thetadata_creds.json` next to the helpers file. Functions carry a `_v3` suffix: `check_v3_connection`, `list_expirations_v3`, `list_strikes_v3`, `get_bulk_chain_v3`, `get_option_quotes_v3`, `get_index_price_v3`.
+- **v2 (legacy)** -- local ThetaTerminal HTTP API; requires the terminal running on `127.0.0.1:25510` (`java -jar ThetaTerminal.jar <user> <password>`). Still used by older code. Raw columns: `ms_of_day`, `bid`, `ask`, `bid_size`, `ask_size`.
+
+### Index prices: intraday -> ThetaData, close/settlement -> Bloomberg
+
+- **Intraday index levels are a ThetaData job.** `get_index_price_v3('SPX', date, start_time=..., end_time=...)` is the preferred source for any index print during the session.
+- **Closes and settlement values are a Bloomberg job.** Use `my_bdh(ticker, 'PX_LAST', adjust='-')`. Two reasons: it is a much faster pull, and it returns the OFFICIAL settlement -- which is not necessarily the 4:00pm tape price. Do not substitute an intraday 16:00 index print for a settlement value.
+- **If a ThetaData index pull fails, STOP AND ASK THE USER.** The subscription does cover index data, so a `PERMISSION_DENIED` or similar error is a bug to debug, not an entitlement limit -- do not silently route around it or conclude the plan lacks access. (Seen 2026-07-30: `get_index_price_v3` returned `grpc StatusCode.PERMISSION_DENIED` citing a PROFESSIONAL requirement on some dates while succeeding on others. Unresolved.)
+
+Quote helpers in BOTH generations return the canonical `optionsResearch.t_opra_quotes` schema (`symbol, trade_date, exp, strike, cp, timestmp, bidPrc, askPrc, bidSize, askSize`). Index price pulls are cached to `optionsResearch.t_index_snaps_td` and options quotes to `optionsResearch.t_opra_quotes` on VBAM dev.
+
+**Half days:** on NYSE early closes (use `D:/PycharmProjects/utils/calendar_utils.py` `HALF_DAYS` to identify half days) equity/ETF options stop at 13:00 and index options (SPXW/SPX/NDXP/NDX/XSP/RUT/VIX) at 13:15, but ThetaData keeps returning stale bars afterwards. `get_option_quotes_v3` now clamps requests to that cutoff via `half_day_cutoff()` (this was added 9/14/26) and `t_opra_quotes` was scrubbed of ~11M post-cutoff rows (audit/scrub tool: `D:/agent_projects/large_index_flows/scrub_half_days.py`). Any new script/process that writes to `t_opra_quotes` should try to use `get_option_quotes_v3` so that we get the half-day guard for free. If user explicitly allows it, we can still access data via other access paths, but we need to be explicit about skipping half days in any custom-written code that does this.
+
+**`t_opra_quotes` is a study-driven cache, not a full archive -- spot-check before relying on it.** Rows exist only where some earlier pull requested them, so coverage is very uneven: same-day (0DTE) SPXW is usually rich (140-160 strikes, 14:00-16:00), while forward expiries are often just 8-10 strikes in a narrow band at a single timestamp, left over from that study's strike rule.
+
+Check by pulling **3-4 sample dates spread across your date range** and eyeballing the actual rows -- point lookups on indexed columns, back in seconds:
+
+```sql
+SELECT * FROM optionsResearch.t_opra_quotes
+WHERE trade_date = '2024-08-30' AND symbol = 'SPXW' AND exp = '2024-09-06'
+ORDER BY strike LIMIT 50;
+```
+
+Confirm the strike range brackets the strikes you need and that the timestamps cover the entry time you want. If a couple of spot-checked dates come back thin or empty, assume the rest are too and pull fresh from ThetaData rather than probing every date.
+
+**Never scan the whole table** (no unfiltered `GROUP BY symbol`, no `COUNT(*)` without a `trade_date` filter). It runs for many minutes, and from a Jupyter kernel it pins the kernel `busy` with no escape: pymysql blocks in a C-level socket read, so neither `KeyboardInterrupt` nor the Jupyter interrupt API will free it -- only a kernel restart, which loses all your variables.
+
+## SpiderRock Snowflake (snowflake_helpers)
+
+`snowflake_helpers` (`D:/PycharmProjects/utils/`) -- SpiderRock historical options via SQL.
+**Since 8/27/2026 this is the DEFAULT source for the daily 0DTE options cache**
+(`eod_option_algos/update_data.py` Step 1; `cache_data_with_liberator.py` is a manual
+fallback only). For other historical options work, liberator and the spdr_historical S3
+archive remain the defaults unless the user asks for Snowflake.
+Account `VCIERHT-ALPINE_GLOBAL`, warehouse `DEFAULT`, role `PUBLIC`, db `HIST_DATA_PROD`.
+Credentials are hardcoded in the module -- no env-var setup, unlike liberator.
+
+Server-side filters (updated 8/27/2026), ON by default in every managed pull and applied to
+the RAW collection time (`timestamp` column), not the 5-min `date` bucket label:
+- Session bounds: keep only 09:30:00 <= t <= 16:15:30 US/Eastern (drops overnight/globex rows).
+- Mid-day window: additionally keep only t < 10:33 OR t > 13:55 (matches the old liberator filter).
+- tte: index symbols (SPX/SPXW/NDX/NDXP/RUT/RUTW/VIX/VIXW) keep `years < (22*1+5)/252 ~ 0.107`;
+  all other symbols keep `years < (22*12+15)/252 ~ 1.107`.
+`no_time_filter=True` drops the session bounds AND the mid-day window; `no_tte_filter=True`
+drops the (per-symbol) tte clause (available on `pull_from_snowflake`,
+`get_options_data_snowflake`, `cache_options_range`) -- use these for one-off pre/post-market
+or far-expiry pulls. Measured 2026-08-11: filters barely change pull latency (~6s/query
+fixed cost dominates single names) -- their value is smaller frames and much smaller DB writes.
+
+- `HIST_DATA_PROD.V8_US` -- canonical, stable, reproducible. DEFAULT; use for anything cached.
+- `HIST_DATA_PROD.V8_US_LATEST` -- same tables; corrections land here immediately and are
+  promoted into V8_US weekly after 30 stable days. Use only to re-check a suspect date.
+
+Key functions: `pull_from_snowflake(symbol, date)` (one symbol-day, already in the
+t_historical_options_snaps schema), `get_options_data_snowflake(...)` (DB-first, pulls and
+autosaves on a miss -- the Snowflake analog of the liberator `get_options_data`),
+`cache_options_range(symbols, start, end)` (bulk backfill; one query spans many symbols),
+`run_query(sql)` (arbitrary SQL), `list_tables()` / `describe_table()`.
+
+Pulls autosave into `optionsResearch.t_historical_options_snaps` in the same 33-column schema
+the liberator pulls used, but Snowflake-era rows (8/27/2026+) are NOT row-identical to
+liberator history: TIMESTMP is the raw collection time on a ~5-min grid (e.g. 15:55:05.5;
+liberator was a 1-min-ish offset grid, e.g. 15:56:01), days end at 16:15:30 (liberator kept
+to 16:55), and index-symbol expiries stop at tte ~0.107 (liberator kept 0.583). Code matching
+snap times exactly should use windows/ranges, and studies spanning the cutover should expect
+the grid shift. One SPY day is 1.1M raw rows / 312k filtered.
+
+Performance: tables are partitioned on `date_p` -- ALWAYS constrain it in the WHERE clause,
+and select only the columns you need.
+
+Gotchas:
+- **NEVER accumulate a large multi-chunk pull in memory with nothing persisted** (e.g. a
+  5+ minute `run_query` loop that only saves at the end). Long pulls get killed -- by
+  timeouts, by the user, by crashes -- and everything is lost. Order of preference:
+  (1) use the built-in DB-first functions (`get_options_data_snowflake`,
+  `cache_options_range`) -- every chunk autosaves to `t_historical_options_snaps`, so
+  persistence and resume come free; (2) if the built-ins' shape doesn't fit and you must
+  use `run_query`, propose a design to the user that will checkpoint each chunk to disk as
+  it lands and make the loop skip already-checkpointed chunks on restart. Require user
+  approval.
+- The `date` column is UTC. Convert with `CONVERT_TIMEZONE('UTC','America/New_York', date)`,
+  not a fixed offset, or an ET time filter shifts across the DST boundary. `snowflake_helpers`
+  already handles this on both the filter and the saved timestamp -- this applies to raw
+  `run_query` SQL you write yourself.
+- Snowflake NUMBER columns arrive as `Decimal` objects (`prtVolume`, `cumBidSize`,
+  `cumAskSize`); `run_query` casts them.
+- `prtVolume = -99` is a no-data sentinel, not a volume. Carried through unchanged from the
+  liberator path.
+- `OPTIONINTRADAYHIST_EQT` has 65 columns; `snowflake_helpers` maps the 31 that fit the DB
+  schema. Use `run_query` for the rest.
+- Only ONE table is currently visible to role PUBLIC. If a chat needs another SpiderRock
+  dataset, that is an entitlement question for SpiderRock support, not a bug.
+- Never name a local file `snowflake.py` -- it shadows the `snowflake` package.
+
+## CloudQuant (cq_helpers)
+
+`cq_helpers` (`from cq_helpers import *`, in `D:/PycharmProjects/utils/`) -- T+1 intraday historic prices via CloudQuant's liberator API. **History starts mid-2022** (subscription floor; empirically the first date with tick data is 2022-03-11) -- anything earlier returns empty, not an error. Key functions: `get_close_prices(symbols, start, end)` (official closes), `get_prices(symbol, datetime)` (trade price nearest a given intraday timestamp; backed by a local pickle cache at `D:/PycharmProjects/utils/intraday_prices.pkl`). Data sets are ICE XNYS trade quotes. Good for before 2pm EST / any-intraday-time prices where the VBAM snap tables have no coverage.
+
+### CRITICAL: CloudQuant vs SpiderRock `liberator` module conflict
+
+There are TWO different local files named `liberator.py` -- they are unrelated clients that share a module name, and there is no installed `liberator` pip package (resolution is purely sys.path order):
+
+- `D:/PycharmProjects/utils/liberator.py` -- **CloudQuant** client. Used by `cq_helpers`; pfx at `D:/PycharmProjects/utils/liberator.pfx`, creds passed per-query (plus `cq_liberator.json`).
+- `D:/PycharmProjects/spdr_liberator/liberator.py` -- **SpiderRock** Data Liberator client. pfx/json in `D:/PycharmProjects/spdr_liberator/`, url `https://getdata.spiderrock.net`, creds read from `LIBERATOR_USER`/`LIBERATOR_TOKEN` env vars at import time.
+
+Failure modes:
+- `import liberator` grabs whichever directory appears first on `sys.path` -- e.g. inserting `D:/PycharmProjects/utils/` (for calendar_utils/cq_helpers) and then importing liberator for SpiderRock work silently gets the CloudQuant client (or vice versa). Symptoms: `No user arg provided`, PFX errors, wrong endpoint, queries that return nothing.
+- Python caches the first import in `sys.modules`, and both usages configure module-level globals (`liberator.pfx`, `liberator.auth`, `liberator.url`) -- so even with correct path order, mixing CloudQuant and SpiderRock pulls in ONE Python session/kernel means the second consumer inherits or overwrites the first's config.
+
+Rules:
+- **Do not mix cq_helpers and SpiderRock liberator pulls in the same Python process/kernel.** Use separate processes.
+- When either client misbehaves, check `liberator.__file__` FIRST to confirm which file actually got imported.
+- Keep only the intended directory on sys.path before the import.
+
+## Trade logs
+
+- **`optionsResearch.algo_trade_log`** (VBAM dev) -- one row per 2-leg vertical spread attempt per algo from the prod EOD scripts (350PM/355PM etc.). Logs both credit and debit spreads (`direction` = "Sell" for spread sales, "Buy" for debit trades like hacker); the row shape assumes exactly one short leg + one long leg. Populated by `D:/PycharmProjects/scratch/algos/algo_trade_logger.py` (waits ~60s post-trade, looks up SR fills in `srtrade.msgsrmlegbrkrstate` by grouping_code, then UPSERTs). **PK:** `trade_date, script_name, algo_name, symbol, cp`. **Cols:** strikes/direction (`short_strike`, `long_strike`, `direction`), execution (`size_attempted`, `size_filled`, `price_attempted`, `avg_fill_price`, wave1/wave2 limit/qty/time), and the factor snapshot at trade time (`spx_price`, `vix`, `atm_vol`, `market_ratio`, `rsi`, `high_low_ratio`, `realized_3m_chg`, `imbal_340/350/355`, `qqq_imbal`, `paired_imbal`, edge targets).
+- **`D:/PycharmProjects/scratch/algos/logs/`** -- raw per-run stdout logs, one file per prod script per day: `<YYYY-MM-DD>_<script_name>.txt` (e.g. `2026-07-17_350pm_script.txt`, `..._355pm_script.txt`, `..._btic_and_imbal_script.txt`). Authoritative record of what a script actually did intraday (fills, retries, errors) -- match the script name suffix carefully; reading the wrong script's logfile has caused false conclusions before.
+- **SpiderRock execution archives (T+1 and older)** -- one database per trading day, table
+  `msgsrparentexecution` (accnt, secKey_xx, secKey_cp, orderSide, fillPrice, fillQuantity,
+  fillTransactDttm; timestamps are ET minus 1h, add 1 hour). The live `srtrade.msgsrparentexecution`
+  and `msgsrmlegbrkrstate` hold the CURRENT day only, so any fill from yesterday or earlier comes
+  from here. Ask the user if you are unsure whether to pull from V7 or V8, or if you are having trouble locating the correct table.
+    v7 accounts (EOD1-40, T.AGM*):       `srtrade_agm_<YYYY_MM_DD>` on 198.102.4.55:3307
+    v8 accounts (EOD41-99, T.AGMV8.01):  `srtrade_<YYYY_MM_DD>` on 192.81.231.66:3700 (same agm.zdietz creds)
+  GOTCHA (2026-09-08): the v8 archive grant is FLAKY -- the identical SELECT alternates between
+  1142/1044 "denied" and success. Retry the same query a few times on fresh connections before
+  concluding the grant or data is missing, and keep the rows the moment a call succeeds.
+  fill_price_review.py only knows the v7 host; for v8 accounts point get_sr_fills at the v8 host/db.
+
+## Live imbalance helper wrappers (prefer over raw SQL -- LIVE pulls only)
+
+`D:/PycharmProjects/scratch/algos/helpers.py`: `get_340_imbal`, `get_350_imbal`, `get_355_imbal`, `get_recreated_paired_imbal`, `get_qqq_net_imbal`, `get_fast_imbal`. All retry up to 7x with timeouts; return `NO_IMBAL_VAL` on failure; accept `is_test=True, test_imbal=<num>` for dry runs.
+
+**Scope: real-time / live-trading pulls of TODAY's imbalance only.** Do NOT use these for historical backtesting -- historical work pulls from the T+1 sources instead (`auctionResearch.t_report_consolidated_imbalances`, the pre-pulled `spy_imbalances_<date>.csv`, other local CSVs in [references/local_csvs.md](references/local_csvs.md)), etc.
+
+## Hosts + which schema lives where (READ THIS before querying VBAM)
+
+Connect via **`vbam_helpers`** (`D:/PycharmProjects/utils/`) -- it exposes connection strings to prod and dev databases explicitly:
+
+- **DEV** = `vbam_helpers.dev_connection_string` (also the legacy `vbam_helpers.connection_string`). User `options_research_user`. Schema: **`optionsResearch`** (`algo_trade_log`, `t_historical_options_snaps`, `t_opra_quotes`, `t_index_snaps*`).
+- **PROD** = `vbam_helpers.prod_connection_string`. Read-only user `VBAM_Read`, SELECT across the prod research schemas: **`auctionResearch`, `EODStrategies`, `compositions`, `imbalanceSnapshots`, `backtest_sandbox`**. Connection has **no default database**, so ALWAYS use fully-qualified `<schema>.<table>` names -- e.g. **`auctionResearch.t_report_consolidated_imbalances`** (historical SPX/NDX imbal, 2021 -> T+1).
+
+**Prod is the historical-imbalance / NAV path.** Historical imbal + NAV are NOT on dev.
+
+**Credentials gotchas (don't burn cycles):**
+- Dev user (`options_research_user`) is SELECT-denied on all prod research schemas -- a prod query on the dev connection fails `1142 denied` / `1146 doesn't exist`. Use `prod_connection_string`.
+- Always fully-qualify `<schema>.<table>` (both connections -- explicit + copy-paste-safe). Mandatory on prod: no schema default, so unqualified names (or a DB in the URL / `USE`) fail `1044`.
+
+**Nomenclature:** `spy_*` / `qqq_*` columns ARE the SPX / NDX imbalance -- see CLAUDE.md "Imbalance Universe Definitions".
+
+**Querying `t_report_consolidated_imbalances` (gotchas):** snap-time convention 3:40->`15:40:00`, 3:50->`15:50:01`, 3:55->`15:55:01`; `snap_time` is a TIME column but string literals compare fine; table is T+1 (max `business_date` = yesterday). To compare snaps within a day, pivot with `MAX(CASE WHEN snap_time=... )` grouped by `business_date`.
+
+Full table-by-table catalog with columns and latency (real-time vs T+1): [references/alpine_tables.md](references/alpine_tables.md).
+Local CSV catalog with schemas: [references/local_csvs.md](references/local_csvs.md).
+
+## Adding a new provider
+
+When a new data provider comes online, add a row to the routing table above and a section (or references entry) describing tables/latency/interface -- this skill stays the single source of truth for "where do I get X".

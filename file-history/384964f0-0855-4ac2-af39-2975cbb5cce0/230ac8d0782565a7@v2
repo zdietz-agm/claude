@@ -1,0 +1,151 @@
+"""
+Large index flows -- Excel export of the 0DTE strangle backtest for sanity checking.
+
+One row per event on the "Trades" sheet with everything needed to re-derive the
+numbers by hand: flow estimate inputs, spot / close, strike selection (OTM bps,
+push-out), per-leg entry quotes (median bid / ask / spread over the entry window,
+first quote, fill = bid + SPREAD_PAID x spread), intrinsic payoff, pnl, and the
+max bid per leg after entry. "Entry Quotes" holds the raw 1-sec quotes for the
+two traded legs in the entry window with the per-second fill, so the medians can
+be checked. "Notes" documents the methodology.
+
+Run from Git Bash (default entry 15:40, hold to expiry):
+    python /d/agent_projects/large_index_flows/export_backtest_excel.py
+    python /d/agent_projects/large_index_flows/export_backtest_excel.py --entry 15:00
+"""
+import argparse
+import datetime as dt
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from openpyxl.utils import get_column_letter
+from sqlalchemy import create_engine
+
+import backtest_strangle as bs
+
+EVENTS_CSV = os.path.join(bs.PROJ_DIR, 'large_flow_events.csv')
+DOLLAR_COLS = {'spot', 'close', 'call_bid_med', 'call_ask_med', 'call_spread_med', 'call_bid_first',
+               'call_ask_first', 'call_fill', 'put_bid_med', 'put_ask_med', 'put_spread_med', 'put_bid_first',
+               'put_ask_first', 'put_fill', 'total_cost', 'call_intrinsic', 'put_intrinsic', 'payoff',
+               'pnl_per_share', 'pnl_usd_per_10mm', 'call_max_bid', 'put_max_bid',
+               'bidPrc', 'askPrc', 'spread', 'fill'}
+BPS_COLS = {'move_bps', 'call_otm_bps', 'put_otm_bps', 'cost_bps', 'payoff_bps', 'pnl_bps'}
+
+
+def leg_quote_stats(q, strike, cp, spread_paid):
+    """Median bid / ask / spread, first quote, median fill and n quotes for one leg over the entry window."""
+    sub = q[(q.strike == strike) & (q.cp == cp) & (q.askPrc > 0) & (q.askPrc >= q.bidPrc)].sort_values('timestmp')
+    if sub.empty:
+        return dict(bid_med=np.nan, ask_med=np.nan, spread_med=np.nan, bid_first=np.nan, ask_first=np.nan,
+                    fill=np.nan, n_quotes=0)
+    fills = sub.bidPrc + spread_paid * (sub.askPrc - sub.bidPrc)
+    return dict(bid_med=sub.bidPrc.median(), ask_med=sub.askPrc.median(), spread_med=(sub.askPrc - sub.bidPrc).median(),
+                bid_first=sub.bidPrc.iloc[0], ask_first=sub.askPrc.iloc[0], fill=fills.median(), n_quotes=len(sub))
+
+
+def build_sheets(eng, entry_time, spread_paid=bs.SPREAD_PAID, otm_bps=bs.OTM_BPS, window_sec=bs.ENTRY_WINDOW_SEC):
+    """Return {'Trades': df, 'Entry Quotes': df, 'Notes': df} for the given entry time (hold to expiry)."""
+    spot_col = entry_time.strftime('%H:%M')
+    events = bs.load_events(spot_col=spot_col)
+    bt = bs.run_backtest(events, eng, entry_time=entry_time, otm_bps=otm_bps, spread_paid=spread_paid,
+                         window_sec=window_sec)
+    flows = pd.read_csv(EVENTS_CSV, parse_dates=['eff_date', 'annc_date'])
+    flows['eff_date'] = flows['eff_date'].dt.date
+    flows['annc_date'] = flows['annc_date'].dt.date
+    bt = bt.merge(flows[['eff_date', 'symbol', 'annc_date', 'event_type', 'mkt_cap_bn']], on=['eff_date', 'symbol'], how='left')
+
+    end = (dt.datetime.combine(dt.date.today(), entry_time) + dt.timedelta(seconds=window_sec)).time()
+    rows, quote_rows = [], []
+    for r in bt.itertuples(index=False):
+        q = bs.load_entry_quotes(eng, r.symbol, r.eff_date, entry_time, end)
+        c = leg_quote_stats(q, r.call_strike, 'Call', spread_paid)
+        p = leg_quote_stats(q, r.put_strike, 'Put', spread_paid)
+        total = c['fill'] + p['fill']
+        call_intr = max(r.close - r.call_strike, 0.0)
+        put_intr = max(r.put_strike - r.close, 0.0)
+        rows.append({
+            'eff_date': r.eff_date, 'symbol': r.symbol, 'pnl_bps': r.pnl_hold_bps,
+            'annc_date': r.annc_date, 'event_type': r.event_type, 'direction': r.direction,
+            'mkt_cap_bn_annc': r.mkt_cap_bn, 'est_flow_bn': r.est_flow_bn,
+            'entry_time': spot_col, 'spot': r.spot_1500, 'close': r.close, 'move_bps': r.move_bps,
+            'call_strike': r.call_strike, 'call_otm_bps': r.call_otm_bps,
+            'put_strike': r.put_strike, 'put_otm_bps': r.put_otm_bps, 'n_push': r.n_push,
+            'call_bid_med': c['bid_med'], 'call_ask_med': c['ask_med'], 'call_spread_med': c['spread_med'],
+            'call_bid_first': c['bid_first'], 'call_ask_first': c['ask_first'], 'call_fill': c['fill'],
+            'put_bid_med': p['bid_med'], 'put_ask_med': p['ask_med'], 'put_spread_med': p['spread_med'],
+            'put_bid_first': p['bid_first'], 'put_ask_first': p['ask_first'], 'put_fill': p['fill'],
+            'n_quotes': min(c['n_quotes'], p['n_quotes']), 'spread_paid_pct': spread_paid,
+            'total_cost': total, 'cost_bps': r.cost_bps,
+            'call_intrinsic': call_intr, 'put_intrinsic': put_intr, 'payoff': call_intr + put_intr,
+            'payoff_bps': r.payoff_bps, 'pnl_per_share': call_intr + put_intr - total,
+            'pnl_usd_per_10mm': r.pnl_hold_bps / 1e4 * bs.NOTIONAL_USD, 'winner': r.winner,
+            'call_max_bid': r.call_max_bid, 'call_max_bid_time': r.call_max_t,
+            'put_max_bid': r.put_max_bid, 'put_max_bid_time': r.put_max_t,
+        })
+        legs = q[((q.cp == 'Call') & (q.strike == r.call_strike)) | ((q.cp == 'Put') & (q.strike == r.put_strike))].copy()
+        legs.insert(0, 'symbol', r.symbol)
+        legs.insert(0, 'eff_date', r.eff_date)
+        legs['timestmp'] = legs['timestmp'].apply(bs._fmt_t)
+        legs['spread'] = legs.askPrc - legs.bidPrc
+        legs['fill'] = legs.bidPrc + spread_paid * legs.spread
+        legs['valid'] = (legs.askPrc > 0) & (legs.askPrc >= legs.bidPrc)
+        quote_rows.append(legs.sort_values(['cp', 'timestmp']))
+
+    trades = pd.DataFrame(rows).sort_values('est_flow_bn', ascending=False).reset_index(drop=True)
+    quotes = pd.concat(quote_rows, ignore_index=True)[
+        ['eff_date', 'symbol', 'cp', 'strike', 'timestmp', 'bidPrc', 'askPrc', 'spread', 'fill', 'valid']]
+    notes = pd.DataFrame({'note': [
+        f'Entry {spot_col}: spot = CloudQuant trade print nearest {spot_col}:00 (vbam_utilities.cloudquant, team cache).',
+        'Close = Bloomberg PX_LAST, unadjusted (adjust=-). move_bps = (close / spot - 1) x 1e4.',
+        f'Strikes: nearest 0DTE call >= spot x (1 + {otm_bps}/1e4) and put <= spot x (1 - {otm_bps}/1e4).',
+        f'If total cost > {bs.MAX_COST_BPS} bps of spot, both strikes pushed out one strike (max {bs.MAX_PUSHES}); n_push shows it.',
+        f'Quotes: ThetaData v3 1-sec NBBO bars cached in optionsResearch.t_opra_quotes (pull_0dte_quotes.py).',
+        f'Fill per second = bid + {spread_paid:.0%} x (ask - bid); leg fill = median over {spot_col}:00-{spot_col}:{window_sec:02d} (n_quotes rows).',
+        'Zero bid with positive ask is a real no-bid market (fill = spread_paid x ask); only ask <= 0 or crossed quotes are dropped.',
+        'total_cost = call_fill + put_fill; cost_bps = total_cost / spot x 1e4.',
+        'Hold to expiry: payoff = max(close - call_strike, 0) + max(put_strike - close, 0); pnl_per_share = payoff - total_cost.',
+        f'pnl_bps = pnl_per_share / spot x 1e4; pnl_usd_per_10mm = pnl_bps / 1e4 x {bs.NOTIONAL_USD:,} stock notional.',
+        'est_flow_bn = 12% x CUR_MKT_CAP (Bloomberg, full cap, annc date) for S&P adds; AVGO $16B / AAPL $30B entered by Zach.',
+        'call_max_bid / put_max_bid = highest 1-sec bid for that leg after the entry window through 16:00 (for limit-order variants).',
+        'Entry Quotes sheet = the raw quotes behind the medians for the two traded legs per event.',
+    ]})
+    return {'Trades': trades, 'Entry Quotes': quotes, 'Notes': notes}
+
+
+def export(sheets, base_name):
+    """Write the sheets to Downloads/<base_name>_YYYYMMDD_HHMM.xlsx with filter, frozen panes, formats."""
+    path = str(Path.home() / 'Downloads' / f"{base_name}_{dt.datetime.now():%Y%m%d_%H%M}.xlsx")
+    with pd.ExcelWriter(path, engine='openpyxl') as w:
+        for name, df in sheets.items():
+            df.to_excel(w, sheet_name=name, index=False)
+            ws = w.sheets[name]
+            ws.auto_filter.ref = ws.dimensions
+            ws.freeze_panes = 'C2'
+            for i, col in enumerate(df.columns, 1):
+                letter = get_column_letter(i)
+                width = max(len(str(col)), df[col].astype(str).str.len().max() if len(df) else 0)
+                ws.column_dimensions[letter].width = min(width + 2, 60 if name == 'Notes' else 18)
+                fmt = None
+                if col in DOLLAR_COLS:
+                    fmt = '_($* #,##0.00_);[Red]_($* (#,##0.00)'
+                elif col in BPS_COLS:
+                    fmt = '0.0;[Red]-0.0'
+                elif col == 'spread_paid_pct':
+                    fmt = '0%'
+                if fmt:
+                    for row in range(2, len(df) + 2):
+                        ws[f'{letter}{row}'].number_format = fmt
+    print(f'Saved: {path}')
+    return path
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--entry', default='15:40', help='entry time HH:MM (default 15:40)')
+    args = ap.parse_args()
+    entry = dt.datetime.strptime(args.entry, '%H:%M').time()
+    eng = create_engine(bs.vbam_helpers.dev_connection_string, pool_pre_ping=True)
+    sheets = build_sheets(eng, entry)
+    export(sheets, f"large_index_flows_strangle_{entry:%H%M}_hold")

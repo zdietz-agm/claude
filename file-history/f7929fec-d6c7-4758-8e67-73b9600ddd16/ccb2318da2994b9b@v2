@@ -1,0 +1,80 @@
+"""Day-before-Fed 1DTE SPXW ATM straddle (srPrc) from t_historical_options_snaps, in bps of SPX PX_LAST."""
+import datetime as dt
+import sys
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import vbam_helpers
+from calendar_utils import FEDS, HALF_DAYS, x_days_ago
+from bloomberg_helpers import my_bdh
+
+
+if __name__ == '__main__':
+    today = dt.date.today()
+    feds = sorted(d for d in FEDS if d < today)
+    pairs = [(f, x_days_ago(1, f)) for f in feds]
+
+    # SPX unadjusted closes for all trade dates
+    spx = my_bdh('SPX INDEX', 'PX_LAST', min(p[1] for p in pairs), max(p[1] for p in pairs), adjust='-')
+    spx = spx.droplevel(0, axis=1) if isinstance(spx.columns, pd.MultiIndex) else spx
+    spx.index = pd.to_datetime(spx.index).date
+    spx_close = spx.iloc[:, 0].to_dict()
+
+    eng = create_engine(vbam_helpers.dev_connection_string, pool_pre_ping=True)
+
+    SQL = text("""
+        SELECT TIMESTMP, strike, cp, srPrc, bidPrc, askPrc, uPrc, atmVol
+        FROM t_historical_options_snaps
+        WHERE symbol = 'SPXW' AND trade_date = :td AND exp = :exp
+          AND TIMESTMP >= :ts0 AND TIMESTMP < :ts1
+    """)
+
+
+    def fetch(td, exp):
+        """Snap rows for SPXW exp on td in the icons window [ts-1min, ts+4min); ts = 16:00 (13:00 half day)."""
+        base = dt.timedelta(hours=13) if td in HALF_DAYS else dt.timedelta(hours=16)
+        with eng.connect() as c:
+            r = c.execute(SQL, {'td': td, 'exp': exp, 'ts0': base - dt.timedelta(minutes=1), 'ts1': base + dt.timedelta(minutes=4)})
+            df = pd.DataFrame(r.fetchall(), columns=r.keys())
+        if len(df):
+            df['TIMESTMP'] = df['TIMESTMP'].apply(lambda x: (dt.datetime(2000, 1, 1) + x).time() if isinstance(x, dt.timedelta) else x)
+        return df
+
+
+    rows = []
+    for fed, td in pairs:
+        close = spx_close.get(td)
+        df = fetch(td, fed)
+        rec = {'fed_date': fed, 'trade_date': td, 'spx_close': close}
+        if df.empty or close is None or pd.isna(close):
+            rec['note'] = 'no snaps' if df.empty else 'no SPX close'
+            rows.append(rec)
+            continue
+        # use the single earliest timestamp in the window (one snapshot)
+        ts = df['TIMESTMP'].min()
+        df = df[df['TIMESTMP'] == ts]
+        strikes = df.groupby('strike').filter(lambda g: set(g['cp']) >= {'Call', 'Put'})['strike'].unique()
+        if len(strikes) == 0:
+            rec['note'] = 'no strike with both call+put'
+            rows.append(rec)
+            continue
+        k = min(strikes, key=lambda s: abs(s - close))
+        cd = df[(df.strike == k) & (df.cp == 'Call')].iloc[0]
+        pdd = df[(df.strike == k) & (df.cp == 'Put')].iloc[0]
+        straddle = cd.srPrc + pdd.srPrc
+        rec.update({'snap_ts': ts, 'strike': k, 'call_srPrc': cd.srPrc, 'put_srPrc': pdd.srPrc,
+                    'straddle': straddle, 'straddle_bps': straddle / close * 1e4,
+                    'strike_off_bps': (k - close) / close * 1e4, 'uPrc': cd.uPrc, 'atmVol': cd.atmVol,
+                    'n_strikes': len(strikes)})
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    pd.set_option('display.width', 250, 'display.max_columns', 30)
+    print(out.to_string(index=False))
+    ok = out.dropna(subset=['straddle_bps']) if 'straddle_bps' in out else out.iloc[0:0]
+    if len(ok):
+        print(f"\nN={len(ok)}  mean={ok.straddle_bps.mean():.1f} bps  median={ok.straddle_bps.median():.1f} bps  "
+              f"min={ok.straddle_bps.min():.1f}  max={ok.straddle_bps.max():.1f}")
+    out.to_csv(r'C:\Users\zdietz\AppData\Local\Temp\claude\D--agent-projects\f7929fec-d6c7-4758-8e67-73b9600ddd16\scratchpad\fed_1dte_straddle.csv', index=False)

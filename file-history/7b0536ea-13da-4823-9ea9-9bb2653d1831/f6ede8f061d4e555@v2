@@ -1,0 +1,37 @@
+import sys
+sys.path.insert(0, "D:/PycharmProjects/utils")
+
+
+def main():
+    import pandas as pd
+    import bloomberg_helpers as bbg
+
+    targets = ["SKHY", "SPXC", "BE"]
+    bench = ["SPY", "QQQ", "SMH"]
+    tickers = [f"{t} US Equity" for t in targets + bench]
+
+    end = pd.Timestamp("2026-09-15")
+    start = end - pd.Timedelta(days=260)
+    df = bbg.my_bdh(tickers, "PX_LAST", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+                    adjust="-", timeout=180)
+    df.columns = [c[0].replace(" US Equity", "") for c in df.columns]
+
+    rets = df.pct_change().dropna(how="any").tail(45)
+    print("window:", rets.index[0], "->", rets.index[-1], "n =", len(rets))
+
+    rows = {}
+    for t in targets:
+        row = {}
+        for b in bench:
+            corr = rets[t].corr(rets[b])
+            beta = rets[[t, b]].cov().iloc[0, 1] / rets[b].var()
+            row[(b, "corr")] = corr
+            row[(b, "beta")] = beta
+        rows[t] = row
+    out = pd.DataFrame(rows).T
+    out.columns = pd.MultiIndex.from_tuples(out.columns)
+    print(out.round(2).to_string())
+
+
+if __name__ == "__main__":
+    main()

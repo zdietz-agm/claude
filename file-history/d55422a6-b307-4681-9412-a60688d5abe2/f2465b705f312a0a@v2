@@ -1,0 +1,60 @@
+import ast
+import datetime as dt
+import re
+import sys
+
+import pandas as pd
+
+sys.path.insert(0, 'd:/PycharmProjects/utils/')
+from calendar_utils import FEDS, x_days_ago
+import bloomberg_helpers as bbg
+
+pd.set_option('display.width', 200)
+
+
+def main():
+    # Parse LISTED (expiry, QYLD strike) pairs straight from the analysis script
+    src = open('D:/agent_projects/qyld/qyld_analysis.py').read()
+    listed_src = re.search(r'LISTED = (\[.*?\])', src, re.DOTALL).group(1)
+    listed_src = re.sub(r'#.*', '', listed_src)
+    LISTED = ast.literal_eval(listed_src)
+    listed = [(dt.datetime.strptime(d, '%Y-%m-%d').date(), s) for d, s in LISTED]
+    print(f"Parsed {len(listed)} listed expiries: {listed[0][0]} .. {listed[-1][0]}")
+
+    # Expiry weeks (Mon-Fri of the expiry date) that contain a Fed day
+    feds = set(FEDS)
+    rows = []
+    for expiry, strike in listed:
+        monday = expiry - dt.timedelta(days=expiry.weekday())
+        week_days = {monday + dt.timedelta(days=i) for i in range(5)}
+        for fed in sorted(week_days & feds):
+            rows.append(dict(expiry=expiry, strike=strike, fed_day=fed,
+                             prior_day=x_days_ago(1, fed)))
+
+    fed_weeks = pd.DataFrame(rows)
+    print(f"\nExpiry weeks containing a Fed day: {len(fed_weeks)}")
+
+    # NDX unadjusted close on the day preceding each Fed day (cached my_bdh, raw)
+    start = min(fed_weeks['prior_day']) - dt.timedelta(days=3)
+    end = max(fed_weeks['prior_day']) + dt.timedelta(days=3)
+    ndx = bbg.my_bdh('NDX Index', 'PX_LAST', start, end, adjust='-', timeout=180, verbose=True)
+    ndx.columns = ['ndx_close']
+    ndx.index = pd.to_datetime(ndx.index).date
+
+    fed_weeks['ndx_close_prior'] = fed_weeks['prior_day'].map(ndx['ndx_close'])
+    fed_weeks['pct_vs_strike'] = fed_weeks['ndx_close_prior'] / fed_weeks['strike'] - 1
+    fed_weeks['within_2pct'] = fed_weeks['pct_vs_strike'].abs() <= 0.02
+    fed_weeks['pct_vs_strike_%'] = (fed_weeks['pct_vs_strike'] * 100).round(3)
+
+    print("\nAll Fed-in-expiry-week rows:")
+    print(fed_weeks[['expiry', 'strike', 'fed_day', 'prior_day', 'ndx_close_prior',
+                     'pct_vs_strike_%', 'within_2pct']].to_string(index=False))
+
+    hits = fed_weeks[fed_weeks['within_2pct']]
+    print(f"\n==== Within 2% of ATM on day before Fed day: {len(hits)} of {len(fed_weeks)} ====")
+    print(hits[['expiry', 'strike', 'fed_day', 'prior_day', 'ndx_close_prior',
+                'pct_vs_strike_%']].to_string(index=False))
+
+
+if __name__ == '__main__':
+    main()

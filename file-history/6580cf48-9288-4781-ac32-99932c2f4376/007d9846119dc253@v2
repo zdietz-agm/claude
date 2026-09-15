@@ -1,0 +1,112 @@
+"""Does SPY revert at least 0.1 std (of daily c2c returns) at any minute 09:31..10:00?
+
+Sample: regular days, open market type Up, 09:29:31 SPY imbalance < IMBAL_THR.
+Expectation on those days: lower. Reversion = (median px at minute m / raw open - 1)
+divided by rolling_std <= -REV_STD for any m in 09:31..10:00. Per-minute price is the
+median of trade prints in [m-22s, m+2s] (same window as the 09:40 definition).
+
+Baseline for context: the remaining Up days (imbal >= IMBAL_THR).
+
+Run:  python D:/agent_projects/sod_option_algos/adhoc/open_reversion_path.py
+"""
+import sys
+
+sys.path.insert(0, "D:/agent_projects/sod_option_algos/adhoc")
+sys.path.insert(0, "D:/vbam-data-oracle/src")
+sys.path.insert(0, "D:/PycharmProjects/utils")
+
+import datetime as dt
+
+import numpy as np
+import pandas as pd
+
+import calendar_utils as cu
+from vbam_utilities import vbam_db
+import open_imbal_vs_open_to_940 as base
+import open_market_type_vs_imbal as m
+
+pd.set_option("display.width", 250)
+pd.set_option("display.max_columns", 60)
+
+IMBAL_THR = 20e6
+REV_STD = 0.10
+MINUTES = [dt.time(9, mm) for mm in range(31, 60)] + [dt.time(10, 0)]
+WIN_BEFORE, WIN_AFTER = 22, 2  # seconds, matches 09:39:38..09:40:02
+
+
+def load_minute_medians(eng, dates):
+    """Median SPY trade print in [m-22s, m+2s] for each minute 09:31..10:00, wide (date x minute)."""
+    ds = ",".join(f"'{d}'" for d in dates)
+    df = pd.read_sql(
+        f"""SELECT business_date, snap_time, trade_price FROM auctionResearch.t_trade_price_snaps
+            WHERE ticker='SPY' AND business_date IN ({ds})
+              AND snap_time BETWEEN '09:30:38' AND '10:00:02' AND trade_price > 0""", eng)
+    df["sec"] = pd.to_timedelta(df["snap_time"]).dt.total_seconds().astype(int)
+    out = {}
+    for t in MINUTES:
+        c = t.hour * 3600 + t.minute * 60
+        sl = df[(df.sec >= c - WIN_BEFORE) & (df.sec <= c + WIN_AFTER)]
+        out[t.strftime("%H:%M")] = sl.groupby("business_date")["trade_price"].median()
+    w = pd.DataFrame(out)
+    w.index = pd.to_datetime(w.index).date
+    return w
+
+
+def reversion_table(sub, path_std):
+    """Per-day min/max std move over the window, first minute hitting -REV_STD."""
+    p = path_std.loc[sub.index]
+    hit = p.le(-REV_STD)
+    first = hit.idxmax(axis=1).where(hit.any(axis=1))
+    return pd.DataFrame({
+        "mkt_ratio": sub.market_ratio.round(2),
+        "imbal_092931_mm": (sub.imbal_092931 / 1e6).round(1),
+        "std_bps": (sub.rolling_std * 1e4).round(0),
+        "min_std": p.min(axis=1).round(2),
+        "max_std": p.max(axis=1).round(2),
+        "at_1000_std": p["10:00"].round(2),
+        "reverted": hit.any(axis=1),
+        "first_hit": first,
+    })
+
+
+if __name__ == "__main__":
+    base.SERIALS = set(pd.to_datetime(list(cu.SERIALS)).date)
+    base.FEDS = set(pd.to_datetime(list(cu.FEDS)).date)
+    eng = vbam_db.get_prod_engine()
+
+    d = base.load_imbal(eng).join(base.load_px_940(eng), how="inner")
+    d.index = pd.to_datetime(d.index).date
+    d = d.join(base.load_bbg_open(str(min(d.index)), str(max(d.index))), how="inner")
+    d = d[(d.bbg_open > 0) & (d.imbal_092802 != 0) & (d.imbal_092931 != 0)]
+    d["day_type"] = [base.day_type(x) for x in d.index]
+    mt = m.load_market_type(m.BBG_START, str(max(d.index)))
+    d = d.join(mt[["market_ratio", "rolling_std", "market_type"]], how="inner")
+    up = d[(d.day_type == "Regular") & (d.market_type == "Up")].copy()
+
+    px = load_minute_medians(eng, up.index)
+    path_std = (px.div(up.bbg_open, axis=0) - 1).div(up.rolling_std, axis=0)  # std units vs raw open
+
+    sig = up[up.imbal_092931 < IMBAL_THR]
+    rest = up[up.imbal_092931 >= IMBAL_THR]
+
+    print(f"Up days {len(up)} | signal (imbal_092931 < {IMBAL_THR/1e6:.0f}mm) {len(sig)} | baseline {len(rest)}")
+    tbl = reversion_table(sig, path_std).sort_values("imbal_092931_mm")
+    print("\n=== Signal days: path 09:31..10:00 in std units vs open ===")
+    print(tbl.to_string())
+    print(f"\nReverted >= {REV_STD} std at some minute: {tbl.reverted.sum()} of {len(tbl)} "
+          f"= {tbl.reverted.mean():.0%}")
+    print(f"Median min_std {tbl.min_std.median():+.2f} | median at 10:00 {tbl.at_1000_std.median():+.2f}")
+
+    b = reversion_table(rest, path_std)
+    print(f"\n=== Baseline (other Up days, n={len(b)}) ===")
+    print(f"Reverted >= {REV_STD} std at some minute: {b.reverted.sum()} of {len(b)} = {b.reverted.mean():.0%}")
+    print(f"Median min_std {b.min_std.median():+.2f} | median at 10:00 {b.at_1000_std.median():+.2f} | "
+          f"median max_std {b.max_std.median():+.2f}")
+
+    print("\n=== Reversion rate by threshold, signal vs baseline ===")
+    rows = []
+    for thr in [0.05, 0.10, 0.15, 0.20, 0.30]:
+        rows.append({"thr_std": thr,
+                     "signal": path_std.loc[sig.index].le(-thr).any(axis=1).mean(),
+                     "baseline": path_std.loc[rest.index].le(-thr).any(axis=1).mean()})
+    print(pd.DataFrame(rows).set_index("thr_std").round(2).to_string())

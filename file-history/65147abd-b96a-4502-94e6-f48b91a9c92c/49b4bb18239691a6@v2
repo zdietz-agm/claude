@@ -1,0 +1,386 @@
+import datetime as dt
+import time
+import asyncio
+import pandas as pd
+import numpy as np
+
+import os
+import sys
+sys.path.insert(1, "D:/PycharmProjects/utils")
+
+# --- SpiderRock v8 migration toggle (per-script) --------------------------------------------
+# USE_V8=True -> DATA reads on v8 (SPY/VXX prices via srlive.msgstockprint; the ATM-vol chain
+# pull via the rebuilt get_closest_calls_sql -> msgliveimpliedquoteadj). SEND_V8=True -> stock
+# orders + fills on v8 too. use_v8() below must run BEFORE the
+# `from spdr_rock_order_functions import get_closest_calls_sql` line: that import copies the SQL
+# string BY VALUE, so flipping after it would keep the stale v7 table name. When USE_V8, the
+# v7-only .56 host pin below is SKIPPED. USE_V8=False -> v7, byte-for-byte.
+USE_V8  = True
+SEND_V8 = True
+if USE_V8:
+	from spdr_rock_order_functions import use_v8 as _use_v8
+	_use_v8(True, send=SEND_V8)
+
+# ==================== SR host routing (v7 ONLY): run this script's queries against 198.102.4.56 ====================
+# Rationale: 2026-07-13 saw a 4s stall on 350PM chain refresh due to SR-side queue buildup on .63
+# when multiple stock/ss/fast scripts hit the same host during 3:50-3:55. See
+# D:/agent_projects/eod_option_algos/sr_host_routing_findings.md for the incident + repro test.
+# TEMPORARY until SR SRSE DB ships next month.
+# Skipped under USE_V8 -- v8 is a single host reached via use_v8's routing, so the .56 pin is moot there.
+#
+# Two patches: (1) module-level hostname attr, caught at call time by helpers that reference
+# `hostname` in their body (getVols, etc.). (2) run_query's __defaults__ tuple, since its default
+# arg was frozen at def time and won't pick up the module-attr change alone.
+#
+# Pin only in PROD: test runs stay on the default .63 so they never queue behind slow intraday
+# loop queries in testing. Temporary fix that will be removed in Sept.
+_TEST_MODE = "--test" in sys.argv
+if not USE_V8 and not _TEST_MODE:
+	import spdr_rock_functions as _srf
+	_srf.hostname = "198.102.4.56"
+	_srf.HOSTNAME = "198.102.4.56"
+	_defaults = list(_srf.run_query.__defaults__)
+	assert len(_defaults) == 7, f"run_query.__defaults__ has {len(_defaults)} elements; expected 7 (signature changed?)."
+	_defaults[2] = "198.102.4.56"   # position: (database, fetch, hostname, pool, verbose, t_await, tag)
+	_srf.run_query.__defaults__ = tuple(_defaults)
+	del _srf, _defaults
+# =========================================================================================================
+
+from google_chat_webhook import send_message, my_chat, aa
+from calendar_utils import getNowEst, SERIALS
+from spdr_rock_functions import run_query, getLivePrices
+today = dt.date.today()
+
+from helpers import get_350_imbal, get_340_imbal, NO_IMBAL_VAL, getFirstTick, checkForIconStrikes, load_configs_from_directory_for_stock, get_market_measurements, get_rsi, get_vix, get_change_in_realized, get_recreated_paired_imbal, get_qqq_net_imbal, likely_stale_calendars, TEST_ACCOUNTS, is_month_end, is_fed_day, LAST_HOUR, TIME_FORMAT, pretty_time, warm_up_bloomberg_connection
+from helpers_stock import *
+from spdr_rock_order_functions import get_closest_calls_sql, run_query
+# Fill-watch plumbing (7/30/2026). Module imported by name too so IS_TEST can override the
+# FILL_POLL_* knobs in place -- rebinding star-imported copies would not affect the poller.
+import spdr_rock_stock_order_functions
+from spdr_rock_stock_order_functions import (register_fill_watch, wait_for_first_probes,
+                                            fill_warning_banner, _send_alert)
+seed = int(dt.datetime.now().strftime("%f")) % 10000
+counter = create_counter(seed)
+
+# --- Test-mode CLI (fed by test_run_algos.sh) ------------------------------------------------
+# Prod runs with NO arguments and behaves exactly as before. Passing ANY argument without
+# --test is a hard error, so a prod launch can never be silently overridden.
+import argparse as _argparse
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument("--test", action="store_true")
+_p.add_argument("--trigger-all", action="store_true")
+_p.add_argument("--send-trades", type=lambda s: s.strip().lower() == "true", default=None)
+_p.add_argument("--test-imbal", type=float, default=None)            # 3:50 SPX imbal
+_p.add_argument("--test-340pm-imbal", type=float, default=None)      # 3:40 SPX imbal
+_p.add_argument("--test-paired-imbal", type=float, default=None)
+_p.add_argument("--test-ndx-imbal", type=float, default=None)
+_p.add_argument("--test-first-tick-bps", type=float, default=None)
+_a = _p.parse_args()
+if len(sys.argv) > 1 and not _a.test:
+	raise AssertionError(f"CLI args are only allowed in test mode. Got {sys.argv[1:]}. Pass --test.")
+
+IS_TEST = False or _a.test
+TRIGGER_ALL = False or _a.trigger_all
+SEND_TRADES = True if _a.send_trades is None else _a.send_trades
+TEST_IMBAL = None if _a.test_imbal is None else _a.test_imbal
+TEST_340PM_IMBAL = -.6e9 if _a.test_340pm_imbal is None else _a.test_340pm_imbal
+TEST_PAIRED_IMBAL = 35e9 if _a.test_paired_imbal is None else _a.test_paired_imbal
+TEST_NDX_IMBAL = 1.2e9 if _a.test_ndx_imbal is None else _a.test_ndx_imbal
+# First tick normally comes from spy_data.csv, written by save_spy_prices.py. That script is
+# NOT part of the test fleet, so test runs must inject the value directly. None = read the CSV.
+TEST_FIRST_TICK_BPS = None if _a.test_first_tick_bps is None else _a.test_first_tick_bps
+
+# Testing only: force every fill probe to report 0 so the retry -> deadline -> escalation path can
+# be exercised end to end. False = off (the only valid prod value). Two independent safeties: the
+# assert below refuses to run with IS_TEST False, and _await_fill raises if the account is not a
+# "T." test account -- so it cannot be left on by mistake.
+SIMULATE_ZERO_FILL = False
+spdr_rock_stock_order_functions.SIMULATE_ZERO_FILL = SIMULATE_ZERO_FILL
+
+if __name__ == "__main__":
+	warm_up_bloomberg_connection()   # pay blpapi Session.start() now, not at the 3:49:50 realized-vol pull (see helpers)
+	# _____________________________________________________________Preparation Logic_____________________________________________________________
+	# if is_month_end():
+	# 	send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")} Not running 350pm script because it is month end.", my_chat)
+	# 	exit()
+
+	if TRIGGER_ALL and not IS_TEST:
+		raise AssertionError("TRIGGER_ALL is set to True but IS_TEST is False. This is not allowed.")
+
+	if not SEND_TRADES and not IS_TEST:
+		raise AssertionError("SEND_TRADES is set to False but IS_TEST is False. This is not allowed.")
+
+	if SIMULATE_ZERO_FILL and not IS_TEST:
+		raise AssertionError("SIMULATE_ZERO_FILL is set to True but IS_TEST is False. This is not allowed.")
+
+	# load all config dictionaries
+	month_end = is_month_end()
+	fed_day = is_fed_day()
+	serial = today in SERIALS
+	configs = load_configs_from_directory_for_stock("./configs_stock", time="350PM", is_month_end=month_end, is_fed_day=fed_day, is_serial=serial)
+	print(f"Loaded configs (is_month_end={month_end}, is_fed_day={fed_day}, is_serial={serial}):")
+	for cfg in configs:
+		print(cfg["name"])
+
+	if IS_TEST:
+		for config in configs:
+			config["account"] = TEST_ACCOUNTS[config["account"]]
+			# Sending test orders to v8 -> route to the v8 test account (T.AGM* only exists on v7).
+			if SEND_V8 and str(config["account"]).startswith("T.AGM"):
+				config["account"] = "T.AGMV8.01"
+			config["end_time"] = (dt.datetime.now() + dt.timedelta(seconds=60)).time()
+
+	print(f"{pretty_time()} -- Starting checkForIconStrikes")
+	icon_strikes, extra_magnets = checkForIconStrikes()
+	print(f"{pretty_time()} -- Finished checkForIconStrikes")
+	magnets = []
+	if icon_strikes:
+		magnets += [icon_strikes[1], icon_strikes[2]]  # only get the dealer long strikes
+	if extra_magnets:
+		magnets += extra_magnets
+
+	if not IS_TEST:
+		print(f"{pretty_time()} -- Building start message")
+		start_msg = f"{getNowEst().time().strftime("%I:%M:%S %p")} Starting 350pm stock algo script."
+		if magnets:
+			start_msg += f"\nSPX magnets today: {magnets}"
+		stale_warning = likely_stale_calendars()
+		if stale_warning:
+			start_msg += f"\n{stale_warning}"
+		print(f"{pretty_time()} -- Sending start message")
+		send_message(start_msg, my_chat)
+		print(f"{pretty_time()} -- Finished sending start message")
+	summary = f"{dt.date.today().strftime('%m/%d/%Y')} {'3:50 PM Stock Algo' if not IS_TEST else 'TEST'} RECAP:\n\n"
+	if magnets:
+		summary += f"\nSPX magnets today: {magnets}\n"
+
+	while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 48, 1): # 3:48 PM
+		time.sleep(30)  # wait 30 seconds
+	while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 49, 50): # 3:49:50 PM
+		time.sleep(.5)  # wait .5 second
+
+	# Get SPY price early (3:49:50) since it's only used for sizing and doesn't need to be exactly at 3:50:03
+	print(f"{pretty_time()} -- Starting getLivePrices()")
+	prices = getLivePrices(symbols=["SPY", "VXX"])
+	price_dict = {
+		"SPY": prices["SPY"].values[0], #Note: these are pulled ahead of 350PM since they are used for sizing and don't need to be exactly at 3:50:03
+		"VXX": prices["VXX"].values[0],
+	}
+	print(f"{pretty_time()} -- Finished getLivePrices()")
+
+	# Get 340pm imbalance for VXX buy rules
+	print(f"{pretty_time()} -- Starting get_340_imbal()")
+	imbal_340pm = get_340_imbal(is_test=IS_TEST, test_imbal=TEST_340PM_IMBAL)
+	print(f"{pretty_time()} -- Finished get_340_imbal()")
+
+	# Get 3-month change in realized volatility for VXX buy rule 1
+	print(f"{pretty_time()} -- Starting get_change_in_realized()")
+	change_in_realized = get_change_in_realized()
+	print(f"{pretty_time()} -- Finished get_change_in_realized()")
+
+	while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 50, 3): # 3:50 PM
+		time.sleep(.1)  # wait .1 second
+
+	# _____________________________________________________________Capturing 350pm Data_____________________________________________________________
+
+	print(f"{pretty_time()} -- Starting get_350_imbal()")
+	imbal = get_350_imbal(is_test=IS_TEST, test_imbal=TEST_IMBAL)
+	print(f"{pretty_time()} -- Finished get_350_imbal()")
+	
+
+
+	factor_dict = {}
+
+	if imbal == NO_IMBAL_VAL:
+		imbal = "*Not Found*"
+
+	if isinstance(imbal, str):
+		summary += "No 3:50pm imbalance found. Exited.\n"
+		send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")}\n" + summary, my_chat)
+		exit()
+
+	# Get SPX paired imbalance and NDX net imbalance (1s timeout each)
+	print(f"{pretty_time()} -- Starting get_recreated_paired_imbal()")
+	paired_imbal = get_recreated_paired_imbal(is_test=IS_TEST) if not IS_TEST else TEST_PAIRED_IMBAL
+	print(f"{pretty_time()} -- Finished get_recreated_paired_imbal(): {paired_imbal}")
+
+	print(f"{pretty_time()} -- Starting get_qqq_net_imbal()")
+	ndx_imbal = get_qqq_net_imbal(is_test=IS_TEST) if not IS_TEST else TEST_NDX_IMBAL
+	print(f"{pretty_time()} -- Finished get_qqq_net_imbal(): {ndx_imbal}")
+
+	while getNowEst().time() <= dt.time(8 if IS_TEST else LAST_HOUR, 50, 5, 200000):  # 3:50:05.2
+		time.sleep(.01)
+	print(f"{pretty_time()} -- Starting getFirstTick()")
+	firstTickBps = getFirstTick(IS_TEST, retries=10, test_tick_bps=TEST_FIRST_TICK_BPS) * 100 * 100
+	print(f"{pretty_time()} -- Finished getFirstTick(): {firstTickBps:.2f} bps")
+
+	# CURSOR WROTE THIS:
+	# Get RSI3 (3-day RSI)
+	print(f"{pretty_time()} -- Starting get_market_measurements()")
+	market, today_move, std = get_market_measurements()
+	print(f"{pretty_time()} -- Finished get_market_measurements()")
+	print(f"{pretty_time()} -- Starting get_rsi()")
+	rsi3 = get_rsi(today_move)
+	print(f"{pretty_time()} -- Finished get_rsi()")
+	
+	# Get ATM vol from 0DTE SPXW options
+	print(f"{pretty_time()} -- Starting run_query(get_closest_calls_sql)")
+	calls = run_query(get_closest_calls_sql)
+	print(f"{pretty_time()} -- Finished run_query(get_closest_calls_sql)")
+	atm_vol = calls.satm.iloc[0]
+	
+	# Get VIX for VXX sell rules
+	print(f"{pretty_time()} -- Starting get_vix()")
+	vix = get_vix()
+	print(f"{pretty_time()} -- Finished get_vix()")
+
+	# Calculate imbal_change for VXX rules
+	imbal_change = imbal - imbal_340pm
+	# market_ratio is the today_move from get_market_measurements()
+	market_ratio = today_move # these are the same variable. "market_ratio" matches variable name in backtest analysis
+
+	# create factors
+	print(f"{pretty_time()} -- Starting factor_dict construction")
+	factor_dict["factor_imbal_sign"] = 1 if imbal > 0 else -1 if imbal < 0 else 0
+	factor_dict["factor_first_tick_sign"] = 1 if firstTickBps > 0 else -1 if firstTickBps < 0 else 0
+	# Buy trigger factors
+	factor_dict["factor_first_tick_gte_0bps"] = 1 if firstTickBps >= 0 else 0
+	factor_dict["factor_350_imbal_gte_neg1_5B"] = 1 if imbal >= -1.5e9 else 0
+	# Sell trigger factors
+	factor_dict["factor_first_tick_lte_2bps"] = 1 if firstTickBps <= 2 else 0
+	factor_dict["factor_first_tick_lte_neg5bps"] = 1 if firstTickBps <= -5 else 0
+	factor_dict["factor_350_imbal_lte_neg1_5B"] = 1 if imbal <= -1.5e9 else 0
+	# CURSOR WROTE THIS:
+	factor_dict["factor_rsi3"] = rsi3
+	factor_dict["factor_atm_vol"] = atm_vol
+	
+	# VXX Buy Rule Factors -- updated from bump hunting in vxx_eod_backtest.py
+	# Buy Rule 1: rsi3 <= 5.21 AND 3m_change > 0.0005
+	factor_dict["factor_vxx_rule1"] = 1 if ((rsi3 <= 5.2100) and (change_in_realized > 0.0005)) else 0
+	# Buy Rule 2: 350pm_imbal <= -4B
+	factor_dict["factor_vxx_rule2"] = 1 if (imbal <= -4e9) else 0
+	# Buy Rule 3: 350pm_imbal > 1.7B AND first_tick <= 2 bps AND market_ratio <= 0.8
+	factor_dict["factor_vxx_rule3"] = 1 if ((imbal > 1.7e9) and (firstTickBps <= 2) and (market_ratio <= 0.8)) else 0
+	# Buy Rule 4: rsi3 <= 5 AND first_tick <= 1 bps AND 350pm_imbal <= 0.3B
+	factor_dict["factor_vxx_rule4"] = 1 if ((rsi3 <= 5) and (firstTickBps <= 1) and (imbal <= 0.3e9)) else 0
+	# Buy Rule 5: 350pm_imbal > 2B AND first_tick < 3.5 bps
+	factor_dict["factor_vxx_rule5"] = 1 if ((imbal > 2e9) and (firstTickBps < 3.5)) else 0
+	
+	# VXX Sell Rule Factors -- these are the selling rules from the backtest analysis in vxx_eod_backtest.py
+	# Sell Rule 1: market_ratio <= -0.1494 AND rsi3 > 4.4250 AND imbal_change > 0
+	factor_dict["factor_vxx_sell_rule1"] = 1 if ((market_ratio <= -0.1494) and (rsi3 > 4.4250) and (imbal_change > 0)) else 0
+	# Sell Rule 2: market_ratio <= -0.1494 AND first_tick > 3.44 bps AND imbal_change > 0.8B
+	factor_dict["factor_vxx_sell_rule2"] = 1 if ((market_ratio <= -0.1494) and (firstTickBps > 3.4409) and (imbal_change > 0.8e9)) else 0
+	# Sell Rule 3: first_tick > 3.44 bps AND atmVol <= 15.63% AND imbal_change <= 2.5B
+	factor_dict["factor_vxx_sell_rule3"] = 1 if ((firstTickBps > 3.4409) and (atm_vol <= 0.1563) and (imbal_change <= 2.5e9)) else 0
+	# Sell Rule 4: first_tick > 3.44 bps AND market_ratio <= -1
+	factor_dict["factor_vxx_sell_rule4"] = 1 if ((firstTickBps > 3.4409) and (market_ratio <= -1)) else 0
+	# Sell Rule 5: market_ratio <= -1 AND 350pm_imbal > 0.5B
+	factor_dict["factor_vxx_sell_rule5"] = 1 if ((market_ratio <= -1) and (imbal > 0.5e9)) else 0
+	# Sell Rule 6: market_ratio <= -1 AND vix > 22 AND atmVol > 20%
+	factor_dict["factor_vxx_sell_rule6"] = 1 if ((market_ratio <= -1) and (vix > 22) and (atm_vol > 0.2)) else 0
+
+	# Paired imbalance factors
+	factor_dict["factor_paired_gt_23B"] = 1 if (paired_imbal is not None and paired_imbal > 23e9) else 0
+	factor_dict["factor_paired_gt_24B"] = 1 if (paired_imbal is not None and paired_imbal > 24e9) else 0
+	# NDX imbalance factors
+	factor_dict["factor_ndx_imbal_gt_1_5B"] = 1 if (ndx_imbal is not None and ndx_imbal > 1.5e9) else 0
+	factor_dict["factor_ndx_imbal_lt_neg1_5B"] = 1 if (ndx_imbal is not None and ndx_imbal < -1.5e9) else 0
+	# MEGA factors: large-imbalance triggers, asymmetric thresholds from 8/7/26 backtest sweep
+	factor_dict["factor_350_imbal_gt_4_5B"] = 1 if imbal > 4.5e9 else 0
+	factor_dict["factor_350_imbal_lt_neg3_5B"] = 1 if imbal < -3.5e9 else 0
+
+	print(f"{pretty_time()} -- Finished factor_dict construction")
+
+	# _____________________________________________________________Prep Trades_____________________________________________________________
+
+	print(f"{pretty_time()} -- Starting prep_trades()")
+	trade_dict = prep_trades(
+		configs=configs,
+		factor_dict=factor_dict,
+		price_dict=price_dict,
+		trigger_all=TRIGGER_ALL,
+		magnets=magnets,
+		poll_interval=0.1, # 1/10th a second
+		debug=True,#IS_TEST
+		is_test=IS_TEST
+		)
+	print(f"{pretty_time()} -- Finished prep_trades()")
+
+
+	# _____________________________________________________________Summary_____________________________________________________________
+
+	summary += f"SPY: {price_dict['SPY']:,.2f}. VXX: {price_dict['VXX']:,.2f}. Imbal: {imbal if isinstance(imbal, str) else f'{imbal:,.0f}'}. First Tick: {firstTickBps:.1f} bps.\n"
+	summary += f"340pm Imbal: {imbal_340pm if isinstance(imbal_340pm, str) else f'{imbal_340pm:,.0f}'}. Imbal Change: {imbal_change if isinstance(imbal, str) else f'{imbal_change:,.0f}'}.\n"
+	summary += f"RSI3: {rsi3:.2f}. ATM Vol: {atm_vol:.2%}. Market Ratio: {market_ratio:.2f}. VIX: {vix:.2f}. 3m Realized Chg: {change_in_realized:.4f}.\n"
+	summary += f"SPX Paired Imbal: {f'{paired_imbal:,.0f}' if paired_imbal is not None else 'N/A'}. NDX Imbal: {f'{ndx_imbal:,.0f}' if ndx_imbal is not None else 'N/A'}.\n"
+
+	summary += "\n*Explanations:*"
+	for algo_name, explanations in trade_dict["explanations"]:
+		summary += f"""\n{algo_name}:\n"""
+		summary += explanations
+	if len(trade_dict["explanations"]) == 0:
+		summary += "\nNo trades triggerred."
+
+	if np.isnan(firstTickBps):
+		summary = "WARNING: first tick was NaN. No trades fired due to missing SPY data.\n\n" + summary
+
+	# Register a fill watch per fired trade so the recap can report fill status. trades[] and
+	# explanations[] are appended in lockstep in prep_trades, so index i lines up.
+	# Pair each trade coroutine with its algo name. trades[] and explanations[] are appended in
+	# lockstep in prep_trades so index i lines up, but pair defensively: build one name per TRADE so
+	# a mismatch can never drop a coroutine (a dropped trade sends nothing and says nothing), and
+	# alert instead of raising -- a naming problem must not stop trades that are otherwise fine.
+	explanation_names = [algo_name for algo_name, _ in trade_dict["explanations"]]
+	fired_names = [explanation_names[i] if i < len(explanation_names) else f"UNKNOWN_ALGO_{i}"
+	               for i in range(len(trade_dict["trades"]))]
+	if len(explanation_names) != len(trade_dict["trades"]):
+		_send_alert(f"{'!' * 10} prep_trades returned {len(trade_dict['trades'])} trades but "
+		            f"{len(explanation_names)} explanations. Trades ARE still firing; fill-watch "
+		            f"names may be wrong for some. {'!' * 10}")
+	fill_events = [register_fill_watch(n) for n in fired_names]
+
+	if IS_TEST:
+		# Test end_time is now+60s, which would collide with the 60s live poll deadline.
+		spdr_rock_stock_order_functions.FILL_POLL_DEADLINE = 20.0
+		spdr_rock_stock_order_functions.FILL_POLL_INTERVAL = 5.0
+
+	async def send_summary():
+		# Bounded wait on probe 1 only (FIRST_WAIT + GATE_MARGIN) -- never on the 60s poll loop.
+		# Moves the recap from ~15:50:06 to ~15:50:08 and lets it flag unfilled opens.
+		await wait_for_first_probes(fill_events)
+		body = fill_warning_banner() + summary
+		print(body)
+		send_message(f"{getNowEst().time().strftime("%I:%M:%S %p")}\n" + body, my_chat)
+
+	async def _safe_send(coro, trade_name):
+		"""Wrap a trade coroutine so one failure does not kill the other algos or the recap."""
+		try:
+			return await coro
+		except Exception as e:
+			_send_alert(f"{'!' * 10} {trade_name} TRADE FAILED: {type(e).__name__}: {e} {'!' * 10}\n"
+			            f"Check whether an opening order filled and needs manual flattening.")
+			return None
+
+
+	# _____________________________________________________________Send Trades_____________________________________________________________
+	print(f"{pretty_time()} -- Starting asyncio.run(send_trades())")
+	if SEND_TRADES:
+		async def send_trades():
+			await asyncio.gather(
+				*([_safe_send(c, n) for c, n in zip(trade_dict["trades"], fired_names)]
+				  + [send_summary()]),
+				return_exceptions=True
+			)
+
+		asyncio.run(send_trades())
+	print(f"{pretty_time()} -- Finished asyncio.run(send_trades())")
+
+
+
+
+
+
+
+
+

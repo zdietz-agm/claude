@@ -7,6 +7,7 @@
     ],
     "defaultMode": "default"
   },
+  "theme": "light-daltonized",
   "autoApprove": true,
-  "theme": "light-daltonized"
+  "agentPushNotifEnabled": true
 }

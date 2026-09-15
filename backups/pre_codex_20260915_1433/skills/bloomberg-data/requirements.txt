@@ -1,0 +1,8 @@
+# Pinned to versions installed on this machine as of 2026-07-21.
+# Install manually: pip install -r requirements.txt
+xbbg==0.7.10
+
+# blpapi is NOT on PyPI -- do not add it above. Install separately from
+# Bloomberg's index (version installed here: 3.26.5.1):
+#   pip install --index-url=https://blpapi.bloomberg.com/repository/releases/python/simple blpapi
+# A running Bloomberg Terminal is required at runtime.

@@ -1,0 +1,249 @@
+"""
+Large index flows -- step 2b: 0DTE strangle backtest on the effective date.
+
+Trade (Zach 9/10/26, refined 9/14/26): at 15:00 buy the 0DTE call and put that are
+each OTM by at least OTM_BPS (120 bps) vs the 15:00 spot. If the strangle costs more
+than MAX_COST_BPS (120 bps of spot), push both strikes out one strike (MAX_PUSHES).
+Two exits are reported:
+  * hold  -- expire at intrinsic vs the Bloomberg PX_LAST close
+  * limit -- resting sell limit on EACH leg at LIMIT_MULT (1x) the total strangle
+             cost (pay $1 + $1 -> rest $2 offers in both the call and the put); a
+             leg is filled if its max bid after entry reaches the limit
+             (filled at the limit, not the max), unfilled legs expire at intrinsic.
+Max bid / time per leg over entry..close comes from the cached 1-sec bars.
+
+Pricing:
+  * fill = bid + SPREAD_PAID (70%) x (ask - bid), per 1-sec quote
+  * entry price = median fill over ENTRY_START..ENTRY_END (15:00:00-15:00:10)
+  * cost / payoff / pnl reported per share and in bps of the 15:00 spot
+
+Data: intraday_prices.csv (15:00 spot + PX_LAST) and the 0DTE quotes cached in
+optionsResearch.t_opra_quotes by pull_0dte_quotes.py.
+
+Run from Git Bash:  python /d/agent_projects/large_index_flows/backtest_strangle.py
+"""
+import datetime as dt
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+sys.path.insert(0, 'D:/PycharmProjects/utils/')
+import vbam_helpers
+
+PROJ_DIR = 'D:/agent_projects/large_index_flows'
+PRICES_CSV = os.path.join(PROJ_DIR, 'intraday_prices.csv')
+TABLE = 't_opra_quotes'
+
+MIN_FLOW_BN = 7.0
+OTM_BPS = 120                    # each leg OTM by at least this vs the 15:00 spot
+SPREAD_PAID = 0.70               # pay 70% of the bid-ask spread when buying
+ENTRY_TIME = dt.time(15, 0, 0)   # spot reference + first entry quote
+ENTRY_WINDOW_SEC = 10            # median fill over [ENTRY_TIME, ENTRY_TIME + 10s]
+NOTIONAL_USD = 10_000_000        # $ of stock notional per event for the $ pnl column
+MAX_COST_BPS = 120               # if the strangle costs more than this, push both strikes out one strike
+MAX_PUSHES = 1                   # how many one-strike push-outs are allowed (Zach 9/14/26: one)
+LIMIT_MULT = 1.0                 # resting sell limit on EACH leg = LIMIT_MULT x total strangle cost (Zach 9/14/26: 1x, was 2x)
+
+pd.set_option('display.width', 250)
+pd.set_option('display.max_columns', 40)
+
+
+def load_events(min_flow_bn=MIN_FLOW_BN, spot_col='15:00', symbols=None):
+    """Events with est_flow_bn >= min_flow_bn: eff_date, symbol, direction, spot, close (PX_LAST).
+    spot_col: intraday_prices.csv snap column used as the entry spot (kept as spot_1500 for the
+    downstream code); symbols: optional list to restrict to."""
+    ev = pd.read_csv(PRICES_CSV, parse_dates=['eff_date'])
+    ev = ev[ev['est_flow_bn'] >= min_flow_bn].copy()
+    if symbols is not None:
+        ev = ev[ev['symbol'].isin(symbols)]
+    ev['eff_date'] = ev['eff_date'].dt.date
+    ev = ev.rename(columns={spot_col: 'spot_1500', 'PX_LAST': 'close'})
+    return ev[['eff_date', 'symbol', 'direction', 'est_flow_bn', 'spot_1500', 'close']].reset_index(drop=True)
+
+
+def sweep_entry_times(eng, times, symbols=None, min_flow_bn=MIN_FLOW_BN, **kw):
+    """Run the backtest at several entry times (spot = CloudQuant snap at that time, quotes from the
+    cache). Returns (per-trade frame with an entry column, summary frame indexed by entry)."""
+    frames = []
+    for t in times:
+        ev = load_events(min_flow_bn, spot_col=t.strftime('%H:%M'), symbols=symbols)
+        bt = run_backtest(ev, eng, entry_time=t, **kw)
+        bt.insert(0, 'entry', t.strftime('%H:%M'))
+        frames.append(bt)
+    allbt = pd.concat(frames, ignore_index=True)
+    summ = pd.DataFrame({e: summarize(g) for e, g in allbt.groupby('entry', sort=False)})
+    return allbt, summ
+
+
+def load_entry_quotes(eng, symbol, date, start, end):
+    """0DTE quotes for (symbol, date) with timestmp in [start, end]: strike, cp, timestmp, bidPrc, askPrc."""
+    q = pd.read_sql(text(f"""
+        SELECT strike, cp, timestmp, bidPrc, askPrc FROM {TABLE}
+        WHERE symbol = :s AND trade_date = :d AND exp = :d AND timestmp BETWEEN :t0 AND :t1"""),
+        eng, params={'s': symbol, 'd': date, 't0': start, 't1': end})
+    q['strike'] = q['strike'].astype(float)
+    q[['bidPrc', 'askPrc']] = q[['bidPrc', 'askPrc']].astype(float)
+    return q
+
+
+def round_up_cent(x):
+    """Round an option price UP to the next penny (Zach 9/14/26: fills round up, not to nearest)."""
+    return float(np.ceil(round(x * 100, 6)) / 100) if pd.notna(x) else x
+
+
+def median_fill(q, strike, cp, spread_paid=SPREAD_PAID):
+    """Median buy fill (bid + spread_paid x spread) over the window for one contract, rounded UP to the
+    penny; NaN if no valid quotes. A zero bid is a real no-bid market (fill = spread_paid x ask); only
+    zero/crossed asks are dropped."""
+    sub = q[(q.strike == strike) & (q.cp == cp) & (q.askPrc > 0) & (q.askPrc >= q.bidPrc)]
+    if sub.empty:
+        return np.nan, 0
+    fills = sub.bidPrc + spread_paid * (sub.askPrc - sub.bidPrc)
+    return round_up_cent(fills.median()), len(sub)
+
+
+def pick_strikes(strikes, spot, otm_bps=OTM_BPS):
+    """(call_strike, put_strike): nearest strikes at least otm_bps OTM vs spot; NaN if none."""
+    strikes = np.sort(np.unique(strikes))
+    calls = strikes[strikes >= spot * (1 + otm_bps / 1e4)]
+    puts = strikes[strikes <= spot * (1 - otm_bps / 1e4)]
+    return (calls[0] if len(calls) else np.nan), (puts[-1] if len(puts) else np.nan)
+
+
+def push_out(strikes, k_call, k_put):
+    """Next strike further OTM on each side (NaN if none listed)."""
+    strikes = np.sort(np.unique(strikes))
+    up = strikes[strikes > k_call]
+    dn = strikes[strikes < k_put]
+    return (up[0] if len(up) else np.nan), (dn[-1] if len(dn) else np.nan)
+
+
+def load_max_bids(eng, symbol, date, k_call, k_put, after):
+    """Max bid (and its first time) per leg from `after` to the close, from the cached 1-sec bars.
+    Returns {('Call'|'Put'): (max_bid, time)}."""
+    q = pd.read_sql(text(f"""
+        SELECT cp, timestmp, bidPrc FROM {TABLE}
+        WHERE symbol = :s AND trade_date = :d AND exp = :d AND timestmp > :t
+          AND ((cp = 'Call' AND strike = :kc) OR (cp = 'Put' AND strike = :kp))"""),
+        eng, params={'s': symbol, 'd': date, 't': after, 'kc': float(k_call), 'kp': float(k_put)})
+    q['bidPrc'] = q['bidPrc'].astype(float)
+    out = {}
+    for cp, g in q.groupby('cp'):
+        i = g['bidPrc'].idxmax()
+        out[cp] = (float(g.at[i, 'bidPrc']), g.at[i, 'timestmp'])
+    return out
+
+
+def _fmt_t(t):
+    """HH:MM:SS from a datetime.time or pandas Timedelta (MySQL TIME comes back as Timedelta)."""
+    if isinstance(t, pd.Timedelta):
+        return (dt.datetime.min + t).time().strftime('%H:%M:%S')
+    return t.strftime('%H:%M:%S') if t is not None else ''
+
+
+def run_backtest(events, eng, otm_bps=OTM_BPS, spread_paid=SPREAD_PAID, entry_time=ENTRY_TIME,
+                 window_sec=ENTRY_WINDOW_SEC, max_cost_bps=MAX_COST_BPS, max_pushes=MAX_PUSHES,
+                 limit_mult=LIMIT_MULT):
+    """One row per event: strikes (after any push-out), entry fills, hold-to-close pnl, max bid per leg
+    after entry, and the limit-order exit pnl. Args -- events: from load_events(); eng: dev engine;
+    otm_bps: min OTM per leg; spread_paid: fraction of spread paid on entry; entry_time: entry snap;
+    window_sec: seconds after entry_time for the median fill; max_cost_bps: push strikes out if the
+    strangle costs more than this; max_pushes: how many one-strike push-outs allowed; limit_mult: sell
+    limit per leg = limit_mult x total cost (unfilled legs expire at intrinsic)."""
+    end = (dt.datetime.combine(dt.date.today(), entry_time) + dt.timedelta(seconds=window_sec)).time()
+    rows = []
+    for ev in events.itertuples(index=False):
+        q = load_entry_quotes(eng, ev.symbol, ev.eff_date, entry_time, end)
+        if q.empty:
+            print(f"  {ev.eff_date} {ev.symbol}: no quotes in entry window", flush=True)
+            continue
+        k_call, k_put = pick_strikes(q.strike.values, ev.spot_1500, otm_bps)
+        n_push = 0
+        while True:
+            call_px, n_c = median_fill(q, k_call, 'Call', spread_paid) if not np.isnan(k_call) else (np.nan, 0)
+            put_px, n_p = median_fill(q, k_put, 'Put', spread_paid) if not np.isnan(k_put) else (np.nan, 0)
+            cost = call_px + put_px
+            if cost / ev.spot_1500 * 1e4 <= max_cost_bps or n_push >= max_pushes:
+                break
+            nk_call, nk_put = push_out(q.strike.values, k_call, k_put)
+            if np.isnan(nk_call) or np.isnan(nk_put):
+                break
+            k_call, k_put, n_push = nk_call, nk_put, n_push + 1
+
+        call_pay = max(ev.close - k_call, 0.0)
+        put_pay = max(k_put - ev.close, 0.0)
+        payoff = call_pay + put_pay
+
+        mx = load_max_bids(eng, ev.symbol, ev.eff_date, k_call, k_put, end)
+        call_max, call_max_t = mx.get('Call', (np.nan, None))
+        put_max, put_max_t = mx.get('Put', (np.nan, None))
+        limit = limit_mult * cost                       # per-leg sell limit, in option $/share
+        call_fill = call_max >= limit
+        put_fill = put_max >= limit
+        exit_val = (limit if call_fill else call_pay) + (limit if put_fill else put_pay)
+
+        s = ev.spot_1500
+        rows.append({
+            'eff_date': ev.eff_date, 'symbol': ev.symbol, 'direction': ev.direction,
+            'est_flow_bn': ev.est_flow_bn, 'spot_1500': s, 'close': ev.close,
+            'move_bps': (ev.close / s - 1) * 1e4,
+            'call_strike': k_call, 'put_strike': k_put, 'n_push': n_push,
+            'call_otm_bps': (k_call / s - 1) * 1e4, 'put_otm_bps': (1 - k_put / s) * 1e4,
+            'call_px': call_px, 'put_px': put_px, 'n_quotes': min(n_c, n_p),
+            'cost_bps': cost / s * 1e4,
+            'payoff_bps': payoff / s * 1e4,
+            'pnl_hold_bps': (payoff - cost) / s * 1e4,
+            'call_max_bid': call_max, 'call_max_t': _fmt_t(call_max_t),
+            'put_max_bid': put_max, 'put_max_t': _fmt_t(put_max_t),
+            'max_bid_mult': (call_max + put_max) / cost,          # upper bound: sell each leg at its max bid
+            'call_x': call_max / cost, 'put_x': put_max / cost,   # each leg's max bid as a multiple of total cost
+            'limit_px': limit,
+            'call_fill': call_fill, 'put_fill': put_fill,
+            'pnl_limit_bps': (exit_val - cost) / s * 1e4,
+            'winner': 'call' if call_pay > 0 else ('put' if put_pay > 0 else 'none'),
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize(bt):
+    """Summary stats over events (bps of spot): cost, hold-to-close pnl, limit-exit pnl, fill rates,
+    Sharpe = raw mean/std."""
+    hold, lim = bt['pnl_hold_bps'], bt['pnl_limit_bps']
+    return pd.Series({
+        'n_events': len(bt),
+        'n_pushed': int(bt['n_push'].gt(0).sum()),
+        'mean_cost_bps': bt['cost_bps'].mean(), 'median_cost_bps': bt['cost_bps'].median(),
+        'hold_mean_pnl_bps': hold.mean(), 'hold_win_rate': (hold > 0).mean(),
+        'hold_sharpe_raw': hold.mean() / hold.std() if hold.std() else np.nan,
+        'hold_payoff_to_cost': bt['payoff_bps'].sum() / bt['cost_bps'].sum(),
+        'limit_mean_pnl_bps': lim.mean(), 'limit_median_pnl_bps': lim.median(),
+        'limit_total_pnl_bps': lim.sum(),
+        'limit_win_rate': (lim > 0).mean(),
+        'limit_sharpe_raw': lim.mean() / lim.std() if lim.std() else np.nan,
+        'any_leg_filled': (bt['call_fill'] | bt['put_fill']).mean(),
+        'both_legs_filled': (bt['call_fill'] & bt['put_fill']).mean(),
+        'mean_max_bid_mult': bt['max_bid_mult'].mean(), 'median_max_bid_mult': bt['max_bid_mult'].median(),
+        'limit_total_pnl_usd_per_10mm': (lim / 1e4 * NOTIONAL_USD).sum(),
+    })
+
+
+if __name__ == '__main__':
+    eng = create_engine(vbam_helpers.dev_connection_string, pool_pre_ping=True)
+    events = load_events()
+    print(f"{len(events)} events | buy call+put >= {OTM_BPS} bps OTM at {ENTRY_TIME}, median fill over "
+          f"{ENTRY_WINDOW_SEC}s, pay {SPREAD_PAID:.0%} of spread; push out {MAX_PUSHES} strike if cost > "
+          f"{MAX_COST_BPS} bps; sell limit per leg = {LIMIT_MULT:g}x total cost, else expire", flush=True)
+    bt = run_backtest(events, eng)
+    cols = ['eff_date', 'symbol', 'est_flow_bn', 'spot_1500', 'close', 'move_bps', 'call_strike', 'put_strike',
+            'n_push', 'call_px', 'put_px', 'cost_bps', 'call_max_bid', 'call_max_t', 'put_max_bid', 'put_max_t',
+            'max_bid_mult', 'limit_px', 'call_fill', 'put_fill', 'pnl_hold_bps', 'pnl_limit_bps']
+    print(bt[cols].to_string(index=False, float_format=lambda x: f'{x:,.2f}'))
+    print("\nSummary:")
+    print(summarize(bt).to_string(float_format=lambda x: f'{x:,.2f}'))
+    print("\nBy flow bucket:")
+    bt['bucket'] = np.where(bt['est_flow_bn'] >= 10, '>= $10B', '$7-10B')
+    by_bucket = pd.DataFrame({b: summarize(g) for b, g in bt.groupby('bucket')})
+    print(by_bucket.to_string(float_format=lambda x: f'{x:,.2f}'))

@@ -1,0 +1,46 @@
+import glob, re, os
+import pandas as pd
+
+# prod bumped trigger lines from both log folders
+pat = re.compile(r"\[bumped_spread\] (ALGO_42_350PM_SPREAD_SALES_SPX_(\w+?)) (Put|Call): parent short=([\d.]+) -> bumped ([\d.]+)/([\d.]+) size=(\d+) fair=(-?[\d.]+)")
+rows = []
+for folder in ["logs", "logs_old"]:
+    for p in glob.glob(f"D:/PycharmProjects/scratch/algos/{folder}/*_350pm_script*.txt"):
+        fn = os.path.basename(p)
+        date = fn[:10]
+        script = fn[11:-4]
+        for line in open(p, encoding="utf-8", errors="ignore"):
+            m = pat.search(line)
+            if m:
+                rows.append(dict(trade_date=date, script=script, strat=m.group(2), cp=m.group(3),
+                                 parent_short=float(m.group(4)), prod_short=float(m.group(5)),
+                                 prod_long=float(m.group(6)), size=int(m.group(7)), fair=float(m.group(8))))
+prod = pd.DataFrame(rows).sort_values(["trade_date", "strat", "cp", "script"])
+print("PROD bumped triggers in logs:")
+print(prod.to_string(index=False))
+
+# backtest strikes from the 9/10 xlsx
+x = pd.ExcelFile("C:/Users/zdietz/Downloads/bumped_spread_backtest_20260910_0817.xlsx")
+bt = []
+for s in x.sheet_names:
+    if "BUMP" not in s:
+        continue
+    df = pd.read_excel(x, s)
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
+    strat = s.replace(" BUMP", "")
+    for _, r in df.iterrows():
+        if r.get("put_size", 0) > 0:
+            bt.append(dict(trade_date=r.trade_date, strat=strat, cp="Put", bt_short=r.sh_strike, bt_long=r.lg_strike, bt_price=r.put_price))
+        if r.get("call_size", 0) > 0:
+            bt.append(dict(trade_date=r.trade_date, strat=strat, cp="Call", bt_short=r.sh_strike_2, bt_long=r.lg_strike_2, bt_price=r.call_price))
+bt = pd.DataFrame(bt)
+print("\nBacktest sheets:", [s for s in x.sheet_names if "BUMP" in s])
+print("Backtest bumped legs since 2026-07-16:")
+print(bt[bt.trade_date >= "2026-07-16"].sort_values(["trade_date", "strat"]).to_string(index=False))
+
+# join (dedupe prod across v7/v8 scripts)
+p1 = prod.drop_duplicates(["trade_date", "strat", "cp"])[["trade_date", "strat", "cp", "parent_short", "prod_short", "prod_long", "fair"]]
+j = p1.merge(bt, on=["trade_date", "strat", "cp"], how="outer", indicator=True)
+j["match"] = (j.prod_short == j.bt_short) & (j.prod_long == j.bt_long)
+print("\nJOIN prod vs backtest:")
+print(j.sort_values(["trade_date", "strat"]).to_string(index=False))

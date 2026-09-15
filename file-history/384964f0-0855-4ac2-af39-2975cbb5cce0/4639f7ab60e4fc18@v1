@@ -1,0 +1,787 @@
+"""Helpers for pulling data from ThetaData.
+
+Two generations of access are wrapped side by side:
+
+v2 (legacy) -- local ThetaTerminal HTTP API. Pre-req: terminal on 127.0.0.1:25510:
+    java -jar ThetaTerminal.jar <user> <password>
+  Endpoints wrapped:
+    /v2/system/status          -- terminal health
+    /v2/list/expirations       -- listed expirations for a root (cached)
+    /v2/list/strikes           -- listed strikes for (root, exp)
+    /v2/bulk_hist/option/quote -- bulk chain enumeration for (root, exp, date)
+    /v2/hist/option/quote      -- per-contract bid/ask bars
+    /v2/hist/index/price       -- index price ticks (e.g. SPX, NDX)
+
+v3 (preferred) -- official `thetadata` pip library (gRPC direct to Theta servers).
+  NO local terminal needed. Credentials: THETADATA_API_KEY env var or
+  thetadata_creds.json next to this file. Functions carry a _v3 suffix:
+    check_v3_connection, list_expirations_v3, list_strikes_v3,
+    get_bulk_chain_v3, get_option_quotes_v3, get_index_price_v3
+
+All quote-returning helpers (both generations) emit a DataFrame with the canonical
+optionsResearch.t_opra_quotes schema:
+    symbol, trade_date, exp, strike, cp, timestmp, bidPrc, askPrc, bidSize, askSize
+"""
+import datetime as dt
+import json
+import os
+from functools import lru_cache
+from urllib.parse import quote_plus
+
+import pandas as pd
+import requests
+from sqlalchemy import create_engine, text
+
+
+BASE_URL = "http://127.0.0.1:25510"
+DEFAULT_TIMEOUT = 60
+NO_DATA_STATUS = 472  # ThetaData's "no data available" response code
+
+# Canonical column order matching optionsResearch.t_opra_quotes
+QUOTE_COLS = ['symbol', 'trade_date', 'exp', 'strike', 'cp',
+              'timestmp', 'bidPrc', 'askPrc', 'bidSize', 'askSize']
+
+_QUOTE_RENAME = {"bid_size": "bidSize", "ask_size": "askSize",
+                 "bid": "bidPrc", "ask": "askPrc", "date": "trade_date"}
+
+
+# ---------- small utilities ----------
+
+def ms_to_et_time(ms):
+    """Convert ThetaData ms_of_day (int) to a datetime.time (ET)."""
+    seconds, msec = divmod(int(ms), 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return dt.time(hour=hours, minute=minutes, second=seconds, microsecond=msec * 1000)
+
+
+def _parse_yyyymmdd(yyyymmdd):
+    """Parse a ThetaData YYYYMMDD int/str into a datetime.date."""
+    s = str(int(yyyymmdd))
+    return dt.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+
+
+def _fmt_date(d):
+    """Format a datetime.date (or YYYYMMDD-like value) as ThetaData YYYYMMDD."""
+    if isinstance(d, (dt.date, dt.datetime)):
+        return d.strftime('%Y%m%d')
+    return str(int(d))
+
+
+def _fmt_hms_to_ms(t):
+    """Convert a datetime.time or 'HH:MM:SS' string into ms-of-day int used by ThetaData."""
+    if isinstance(t, str):
+        parts = [int(x) for x in t.split(':')]
+        while len(parts) < 3:
+            parts.append(0)
+        h, m, s = parts[0], parts[1], parts[2]
+    else:
+        h, m, s = t.hour, t.minute, t.second
+    return (h * 3600 + m * 60 + s) * 1000
+
+
+# ===========================================================================
+# !!! WARNING -- LEGACY v2 (local ThetaTerminal) FUNCTIONS BELOW MAY BE DEAD !!!
+# ===========================================================================
+# ThetaData is deprecating the old ThetaTerminal.jar v2 HTTP API (127.0.0.1:25510).
+# The local terminal may no longer connect / return data. We are actively migrating
+# every caller to the v3 `thetadata` pip library (see the v3 section further down),
+# which talks straight to Theta's servers over HTTPS/gRPC -- NO local terminal needed.
+#
+# DO NOT build new code on the v2 functions below. When you hit a v2 call anywhere
+# in the codebase, switch it to the _v3 equivalent:
+#
+#     check_terminal_status()            ->  check_v3_connection()
+#     list_expirations(root)             ->  list_expirations_v3(root)
+#     list_strikes(root, exp)            ->  list_strikes_v3(root, exp)
+#     get_bulk_chain(root, exp, date)    ->  get_bulk_chain_v3(root, exp, date)
+#     get_index_price(root, sd, ed, ...) ->  get_index_price_v3(root, date, ...)  # v3 is single-day
+#
+#     # v2 (old): dates as start_date/end_date, strike in 1/1000$, right 'C'/'P', ivl_ms=1000
+#     df = get_option_quotes(root, strike, cp, exp, exp, exp,
+#                            start_time="15:29:00", ivl_ms=1000)
+#     # v3 (new): single trade_date, strike in $, cp 'Call'/'Put', interval='1s'
+#     df = get_option_quotes_v3(root, strike, cp, exp, exp, start_time="15:29:00")
+#
+# Both generations return the SAME canonical QUOTE_COLS schema, so the swap is
+# usually just the function name + collapsing start_date/end_date into one date.
+# Migration tracking note lives in eod_option_algos/README.md ("ThetaData v3 migration").
+# ===========================================================================
+
+# ---------- endpoint wrappers (LEGACY v2 -- see warning above) ----------
+
+def check_terminal_status(timeout=5):
+    """Return True if ThetaTerminal is reachable on BASE_URL, else False.
+    Any HTTP response back (even non-200) counts as reachable; only a
+    connection failure means the terminal isn't running."""
+    try:
+        requests.get(f"{BASE_URL}/v2/system/status", timeout=timeout)
+        return True
+    except requests.RequestException:
+        return False
+
+
+@lru_cache(maxsize=None)
+def list_expirations(root):
+    """Sorted list of LISTED expirations (datetime.date) for a root, cached per root."""
+    r = requests.get(f"{BASE_URL}/v2/list/expirations?root={root}", timeout=DEFAULT_TIMEOUT)
+    r.raise_for_status()
+    exps = r.json().get('response', [])
+    return sorted(_parse_yyyymmdd(e) for e in exps)
+
+
+def list_strikes(root, exp):
+    """Sorted list of LISTED strikes (in dollars) for (root, exp).
+       root -- ThetaData option root (e.g. 'SPXW', 'NDXP', 'NVDA')
+       exp  -- contract expiration as datetime.date"""
+    r = requests.get(
+        f"{BASE_URL}/v2/list/strikes?root={root}&exp={_fmt_date(exp)}",
+        timeout=DEFAULT_TIMEOUT)
+    r.raise_for_status()
+    # ThetaData returns strikes in 1/1000 dollars (same scale used in the quote URL)
+    return sorted(s / 1000.0 for s in r.json().get('response', []))
+
+
+def get_bulk_chain(root, exp, trade_date):
+    """Enumerate available strikes/rights for (root, exp) on trade_date via the bulk endpoint.
+       root       -- ThetaData option root
+       exp        -- contract expiration as datetime.date
+       trade_date -- date we sample chain availability on
+       Returns DataFrame with columns [symbol, strike, cp, exp]. Empty on HTTP 472
+       (no data), which callers use as a cheap 'no chain listed' pre-check."""
+    url = (f"{BASE_URL}/v2/bulk_hist/option/quote?"
+           f"root={root}&exp={_fmt_date(exp)}"
+           f"&start_date={_fmt_date(trade_date)}&end_date={_fmt_date(trade_date)}"
+           f"&ivl=900000")
+    r = requests.get(url, timeout=DEFAULT_TIMEOUT)
+    empty = pd.DataFrame(columns=["symbol", "strike", "cp", "exp"])
+    if r.status_code == NO_DATA_STATUS:
+        return empty
+    if r.status_code != 200:
+        raise RuntimeError(f"get_bulk_chain {root} exp={exp} date={trade_date}: "
+                           f"HTTP {r.status_code} - {r.text[:300]}")
+    data = r.json()
+    if data.get("next_page") not in (None, "null"):
+        print(f"  WARNING: get_bulk_chain {root} {trade_date} has next_page; chain may be truncated")
+    resp = pd.DataFrame(data.get("response", []))
+    if resp.empty:
+        return empty
+    resp["symbol"] = resp.contract.apply(lambda x: x["root"])
+    resp["strike"] = resp.contract.apply(lambda x: x["strike"] / 1000)
+    resp["cp"] = resp.contract.apply(lambda x: "Call" if x["right"] == "C" else "Put")
+    resp["exp"] = resp.contract.apply(lambda x: _parse_yyyymmdd(x["expiration"]))
+    return resp[["symbol", "strike", "cp", "exp"]]
+
+
+def get_option_quotes(root, strike, cp, exp, start_date, end_date,
+                     start_time=None, end_time=None, ivl_ms=1000, timeout=DEFAULT_TIMEOUT):
+    """Bid/ask bars for one option contract over a date/time window.
+       root       -- ThetaData option root (e.g. 'SPXW', 'NVDA')
+       strike     -- strike in dollars (float)
+       cp         -- 'Call' or 'Put' (URL right = cp[0])
+       exp        -- contract expiration as datetime.date
+       start_date -- first trading date to pull (datetime.date)
+       end_date   -- last trading date to pull (datetime.date)
+       start_time -- optional intraday start time (datetime.time or 'HH:MM:SS')
+       end_time   -- optional intraday end time (datetime.time or 'HH:MM:SS')
+       ivl_ms     -- bar interval in milliseconds (1000 = 1s, 5000 = 5s)
+       timeout    -- per-request HTTP timeout in seconds
+       Returns DataFrame with QUOTE_COLS; empty on HTTP 472 or empty response."""
+    url = (f"{BASE_URL}/v2/hist/option/quote?"
+           f"root={root}&exp={_fmt_date(exp)}&strike={int(strike * 1000)}&right={cp[0]}"
+           f"&start_date={_fmt_date(start_date)}&end_date={_fmt_date(end_date)}"
+           f"&ivl={ivl_ms}")
+    if start_time is not None:
+        url += f"&start_time={_fmt_hms_to_ms(start_time)}"
+    if end_time is not None:
+        url += f"&end_time={_fmt_hms_to_ms(end_time)}"
+
+    r = requests.get(url, timeout=timeout)
+    if r.status_code == NO_DATA_STATUS:
+        return pd.DataFrame(columns=QUOTE_COLS)
+    if r.status_code != 200:
+        raise RuntimeError(f"get_option_quotes {root} {strike} {cp} {exp}: "
+                           f"HTTP {r.status_code} - {r.text[:300]}")
+    data = r.json()
+    df = pd.DataFrame(data["response"], columns=data["header"]["format"])
+    if df.empty:
+        return pd.DataFrame(columns=QUOTE_COLS)
+    df["timestmp"] = df.ms_of_day.apply(ms_to_et_time)
+    df["symbol"] = root
+    df["strike"] = strike
+    df["cp"] = cp
+    df["exp"] = exp
+    df = df.rename(columns=_QUOTE_RENAME)
+    if "trade_date" in df.columns:
+        df["trade_date"] = df["trade_date"].apply(_parse_yyyymmdd)
+    return df[QUOTE_COLS]
+
+
+def get_index_price(root, start_date, end_date,
+                    ivl_ms=0, start_time=None, end_time=None,
+                    rth=None, timeout=DEFAULT_TIMEOUT):
+    """Historical index price ticks (or bars) for a root over a date/time window.
+       root       -- index symbol (e.g. 'SPX', 'NDX', 'VIX')
+       start_date -- first date to pull (datetime.date or YYYYMMDD)
+       end_date   -- last date to pull inclusive (datetime.date or YYYYMMDD)
+       ivl_ms     -- interval in ms; 0 (default) = tick-level (one row per price change)
+       start_time -- optional intraday start (datetime.time or 'HH:MM:SS')
+       end_time   -- optional intraday end (datetime.time or 'HH:MM:SS')
+       rth        -- restrict to regular hours; ignored when ivl_ms=0 (forced False server-side)
+       timeout    -- HTTP timeout in seconds
+       Returns DataFrame with columns [symbol, trade_date, timestmp, price]; empty on 472."""
+    url = (f"{BASE_URL}/v2/hist/index/price?"
+           f"root={root}"
+           f"&start_date={_fmt_date(start_date)}&end_date={_fmt_date(end_date)}"
+           f"&ivl={ivl_ms}")
+    if start_time is not None:
+        url += f"&start_time={_fmt_hms_to_ms(start_time)}"
+    if end_time is not None:
+        url += f"&end_time={_fmt_hms_to_ms(end_time)}"
+    if rth is not None and ivl_ms != 0:
+        url += f"&rth={'true' if rth else 'false'}"
+
+    r = requests.get(url, timeout=timeout)
+    cols = ['symbol', 'trade_date', 'timestmp', 'price']
+    if r.status_code == NO_DATA_STATUS:
+        return pd.DataFrame(columns=cols)
+    if r.status_code != 200:
+        raise RuntimeError(f"get_index_price {root} {start_date}-{end_date}: "
+                           f"HTTP {r.status_code} - {r.text[:300]}")
+    data = r.json()
+    df = pd.DataFrame(data["response"], columns=data["header"]["format"])
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df["timestmp"] = df.ms_of_day.apply(ms_to_et_time)
+    df["trade_date"] = df.date.apply(_parse_yyyymmdd)
+    df["symbol"] = root
+    return df[cols]
+
+
+# ---------- DB-backed cache (t_index_snaps_td on VBAM dev) ----------
+
+_CACHE_HOST = 'alpine-vbam-dev.c7wvpkbyvjzb.us-east-1.rds.amazonaws.com'
+_CACHE_PORT = 3306
+_CACHE_DB = 'optionsResearch'
+_CACHE_USER = 'options_research_user'
+_CACHE_PASSWORD = 'P@9xZt5#Lq'
+_CACHE_CONN_STR = (f'mysql+pymysql://{_CACHE_USER}:{quote_plus(_CACHE_PASSWORD)}'
+                   f'@{_CACHE_HOST}:{_CACHE_PORT}/{_CACHE_DB}')
+INDEX_SNAPS_TABLE = 't_index_snaps_td'
+INDEX_SNAPS_COLS = ['symbol', 'trade_date', 'timestmp', 'price']
+
+_cache_engine = None
+
+
+def _get_cache_engine():
+    """Lazy singleton SQLAlchemy engine for the cache DB."""
+    global _cache_engine
+    if _cache_engine is None:
+        _cache_engine = create_engine(_CACHE_CONN_STR, pool_pre_ping=True)
+    return _cache_engine
+
+
+def _fmt_time_for_sql(t):
+    """Format a datetime.time or 'HH:MM:SS' string for MySQL TIME comparison."""
+    if isinstance(t, str):
+        return t
+    return t.strftime('%H:%M:%S')
+
+
+def _timedelta_to_time(td):
+    """MySQL TIME columns come back as pandas.Timedelta -- coerce to datetime.time."""
+    if pd.isna(td):
+        return None
+    total_seconds = int(td.total_seconds())
+    h, rem = divmod(total_seconds, 3600)
+    m, s = divmod(rem, 60)
+    return dt.time(h, m, s)
+
+
+def _is_date_cached(engine, root, date):
+    """Fast PK-prefix lookup: does any row exist for (symbol, date)?"""
+    with engine.connect() as conn:
+        r = conn.execute(text(
+            f'SELECT 1 FROM {INDEX_SNAPS_TABLE} WHERE symbol=:s AND trade_date=:d LIMIT 1'),
+            {'s': root, 'd': date.strftime('%Y-%m-%d')}).fetchone()
+    return r is not None
+
+
+def _read_cached(engine, root, date, start_time, end_time):
+    """Read cached rows for (symbol, date), SQL-filtered by [start_time, end_time] when provided."""
+    sql = (f'SELECT symbol, trade_date, timestmp, price FROM {INDEX_SNAPS_TABLE} '
+           f'WHERE symbol=:s AND trade_date=:d')
+    params = {'s': root, 'd': date.strftime('%Y-%m-%d')}
+    if start_time is not None:
+        sql += ' AND timestmp >= :st'
+        params['st'] = _fmt_time_for_sql(start_time)
+    if end_time is not None:
+        sql += ' AND timestmp <= :et'
+        params['et'] = _fmt_time_for_sql(end_time)
+    sql += ' ORDER BY timestmp'
+    df = pd.read_sql(text(sql), engine, params=params)
+    if not df.empty:
+        df['trade_date'] = pd.to_datetime(df['trade_date']).dt.date
+        df['timestmp'] = df['timestmp'].apply(_timedelta_to_time)
+    return df
+
+
+def _write_day_to_cache(engine, root, date, df):
+    """Atomic DELETE+INSERT for (root, date). Rollback on any error leaves cache clean.
+    Dedupes to one row per second (last tick wins) since the MySQL TIME column stores
+    second-level precision -- ThetaData occasionally emits multiple sub-second ticks."""
+    if df.empty:
+        to_insert = df
+    else:
+        to_insert = df[INDEX_SNAPS_COLS].copy()
+        to_insert['timestmp'] = to_insert['timestmp'].apply(
+            lambda t: t.replace(microsecond=0) if t is not None else t)
+        to_insert = to_insert.drop_duplicates(
+            subset=['symbol', 'trade_date', 'timestmp'], keep='last')
+
+    with engine.begin() as conn:
+        conn.execute(text(f'DELETE FROM {INDEX_SNAPS_TABLE} WHERE symbol=:s AND trade_date=:d'),
+                     {'s': root, 'd': date.strftime('%Y-%m-%d')})
+        if not to_insert.empty:
+            to_insert.to_sql(INDEX_SNAPS_TABLE, con=conn, if_exists='append', index=False)
+
+
+def get_index_price_cached(root, start_date, end_date,
+                           start_time=None, end_time=None, force_refresh=False,
+                           use_v3=True):
+    """Cache-backed wrapper around get_index_price / get_index_price_v3. Same return schema.
+       root          -- index symbol (e.g. 'SPX', 'NDX', 'VIX')
+       start_date    -- first date inclusive (datetime.date or YYYYMMDD)
+       end_date      -- last date inclusive (datetime.date or YYYYMMDD); must be < today
+       start_time    -- optional intraday start (datetime.time or 'HH:MM:SS'); filtered in SQL
+       end_time      -- optional intraday end (datetime.time or 'HH:MM:SS'); filtered in SQL
+       force_refresh -- if True, re-pull from ThetaData even for dates already cached
+       use_v3        -- if True (default), cache misses pull via the v3 library (no local
+                        terminal); if False, use the v2 local ThetaTerminal HTTP API
+       Non-trading days are skipped via calendar_utils. Raises AssertionError if end_date >= today."""
+    from calendar_utils import trading_range
+
+    if not isinstance(start_date, dt.date):
+        start_date = _parse_yyyymmdd(start_date)
+    if not isinstance(end_date, dt.date):
+        end_date = _parse_yyyymmdd(end_date)
+    today = dt.date.today()
+    assert end_date < today, (
+        f"end_date {end_date} must be before today ({today}); "
+        f"ThetaData has no data for today or future dates")
+
+    engine = _get_cache_engine()
+    dates = list(trading_range(start_date, end_date))
+    out_frames = []
+    for d in dates:
+        if force_refresh or not _is_date_cached(engine, root, d):
+            # full day, no time filter
+            df_day = get_index_price_v3(root, d) if use_v3 else get_index_price(root, d, d)
+            _write_day_to_cache(engine, root, d, df_day)
+        out_frames.append(_read_cached(engine, root, d, start_time, end_time))
+    if not out_frames:
+        return pd.DataFrame(columns=INDEX_SNAPS_COLS)
+    return pd.concat(out_frames, ignore_index=True)
+
+
+def cache_index_price_data(symbol, start_date, end_date=None, use_v3=True):
+    """Pre-cache every trading day in [start_date, end_date] for an index (skips
+    dates already in t_index_snaps_td). end_date defaults to x_days_ago(1).
+    use_v3=True (default) pulls via the v3 library (no local terminal)."""
+    from calendar_utils import trading_range, x_days_ago
+
+    if end_date is None:
+        end_date = x_days_ago(1)
+    if not isinstance(start_date, dt.date):
+        start_date = _parse_yyyymmdd(start_date)
+    if not isinstance(end_date, dt.date):
+        end_date = _parse_yyyymmdd(end_date)
+
+    today = dt.date.today()
+    assert end_date < today, (
+        f"end_date {end_date} must be before today ({today}); "
+        f"ThetaData has no data for today or future dates")
+
+    engine = _get_cache_engine()
+    dates = list(trading_range(start_date, end_date))
+    n_total = len(dates)
+    n_pulled = n_skipped = n_empty = 0
+
+    print(f"cache_index_price_data({symbol}): {n_total} trading days "
+          f"from {start_date} to {end_date}")
+    for i, d in enumerate(dates, 1):
+        if _is_date_cached(engine, symbol, d):
+            n_skipped += 1
+            continue
+        df_day = get_index_price_v3(symbol, d) if use_v3 else get_index_price(symbol, d, d)
+        _write_day_to_cache(engine, symbol, d, df_day)
+        if df_day.empty:
+            n_empty += 1
+            print(f"  [{i}/{n_total}] {d}: pulled 0 rows (empty response)")
+        else:
+            n_pulled += 1
+            print(f"  [{i}/{n_total}] {d}: pulled {len(df_day):,} rows")
+
+    print(f"Done. Pulled {n_pulled}, already-cached {n_skipped}, empty {n_empty}.")
+    return {'total': n_total, 'pulled': n_pulled,
+            'skipped': n_skipped, 'empty': n_empty}
+
+
+# ---------- ThetaData v3 (official python library -- no local terminal needed) ----------
+#
+# The v3 `thetadata` pip library authenticates over HTTPS and pulls data via gRPC
+# directly from Theta's servers. ThetaTerminal.jar is NOT required for any _v3 function.
+#
+# Credentials, in priority order:
+#   1. THETADATA_API_KEY env var
+#   2. thetadata_creds.json next to this file:
+#        {"api_key": "..."}  OR  {"email": "...", "password": "..."}
+#
+# All _v3 quote helpers return the same canonical QUOTE_COLS schema as their
+# v2 counterparts, so downstream t_opra_quotes writers work unchanged.
+
+V3_CREDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'thetadata_creds.json')
+V3_API_KEY = 'td1_prod_c725397f2b2b4c9e96fcd5df3c074a85'  # fallback if env var / creds file absent
+
+_v3_client = None
+
+
+def _get_v3_client(force_new=False):
+    """Lazy singleton ThetaClient (pandas mode). Auth: THETADATA_API_KEY env var,
+    then thetadata_creds.json (api_key or email/password). Raises RuntimeError
+    with setup instructions if no credentials are found."""
+    global _v3_client
+    if _v3_client is not None and not force_new:
+        return _v3_client
+
+    from thetadata import ThetaClient  # lazy import so v2-only users don't need the lib
+
+    api_key = os.getenv('THETADATA_API_KEY')
+    email = password = None
+    if not api_key and os.path.exists(V3_CREDS_FILE):
+        with open(V3_CREDS_FILE) as f:
+            creds = json.load(f)
+        api_key = creds.get('api_key')
+        email, password = creds.get('email'), creds.get('password')
+    if not api_key and not (email and password):
+        api_key = V3_API_KEY
+
+    if api_key:
+        _v3_client = ThetaClient(api_key=api_key, dataframe_type='pandas')
+    elif email and password:
+        _v3_client = ThetaClient(email=email, password=password, dataframe_type='pandas')
+    else:
+        raise RuntimeError(
+            f"No ThetaData v3 credentials. Set THETADATA_API_KEY env var or create "
+            f"{V3_CREDS_FILE} with {{'api_key': ...}} or {{'email': ..., 'password': ...}}")
+    return _v3_client
+
+
+def check_v3_connection():
+    """Return True if a v3 client can authenticate against ThetaData servers, else False."""
+    try:
+        _get_v3_client()
+        return True
+    except Exception as e:
+        print(f"ThetaData v3 connection failed: {e}")
+        return False
+
+
+def _v3_empty_or_raise(e):
+    """Return True if the exception is ThetaData's 'no data found' error, else re-raise."""
+    from thetadata.errors import NoDataFoundError
+    if isinstance(e, NoDataFoundError):
+        return True
+    raise e
+
+
+def _v3_norm_cols(df):
+    """Lowercase and strip v3 response column names for defensive matching."""
+    return df.rename(columns={c: str(c).strip().lower() for c in df.columns})
+
+
+def _v3_fix_strike(s):
+    """v3 returns strikes in dollars, but guard against 1/1000-dollar encoding."""
+    s = pd.to_numeric(s, errors='coerce')
+    if s.notna().any() and s.dropna().median() > 50000:
+        s = s / 1000.0
+    return s
+
+
+def _v3_cp(right_series):
+    """Map v3 right values ('call'/'put'/'C'/'P') to canonical 'Call'/'Put'."""
+    return right_series.astype(str).str[0].str.upper().map({'C': 'Call', 'P': 'Put'})
+
+
+def _v3_split_timestamp(df):
+    """Split a v3 tz-aware NY timestamp column into (trade_date, timestmp) columns."""
+    ts = pd.to_datetime(df['timestamp'])
+    if getattr(ts.dt, 'tz', None) is not None:
+        ts = ts.dt.tz_localize(None)  # drop tz, keep NY wall time
+    df['trade_date'] = ts.dt.date
+    df['timestmp'] = ts.dt.time
+    return df
+
+
+def _v3_parse_exp(exp_series):
+    """Parse v3 expiration column (str 'YYYY-MM-DD'/'YYYYMMDD' or date) to datetime.date."""
+    return pd.to_datetime(exp_series).dt.date
+
+
+def _v3_quotes_to_canonical(df):
+    """Convert a v3 option quote DataFrame to the canonical QUOTE_COLS schema."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=QUOTE_COLS)
+    df = _v3_norm_cols(df.copy())
+    df = _v3_split_timestamp(df)
+    df['strike'] = _v3_fix_strike(df['strike'])
+    df['cp'] = _v3_cp(df['right'])
+    df['exp'] = _v3_parse_exp(df['expiration'])
+    df = df.rename(columns={'bid': 'bidPrc', 'ask': 'askPrc',
+                            'bid_size': 'bidSize', 'ask_size': 'askSize'})
+    return df[QUOTE_COLS]
+
+
+def _fmt_strike_v3(strike):
+    """Format a dollar strike for a v3 request string (trailing zeros trimmed)."""
+    return f"{float(strike):g}"
+
+
+def list_expirations_v3(root):
+    """v3 version of list_expirations: sorted list of expirations (datetime.date) for a root."""
+    client = _get_v3_client()
+    try:
+        df = client.option_list_expirations(symbol=root)
+    except Exception as e:
+        if _v3_empty_or_raise(e):
+            return []
+    df = _v3_norm_cols(df)
+    col = 'expiration' if 'expiration' in df.columns else df.columns[-1]
+    return sorted(_v3_parse_exp(df[col]).unique())
+
+
+def list_strikes_v3(root, exp):
+    """v3 version of list_strikes: sorted list of strikes (dollars) for (root, exp).
+       root -- ThetaData option root (e.g. 'SPXW', 'NDXP', 'NVDA')
+       exp  -- contract expiration as datetime.date"""
+    client = _get_v3_client()
+    try:
+        df = client.option_list_strikes(symbol=root, expiration=exp)
+    except Exception as e:
+        if _v3_empty_or_raise(e):
+            return []
+    df = _v3_norm_cols(df)
+    col = 'strike' if 'strike' in df.columns else df.columns[-1]
+    return sorted(_v3_fix_strike(df[col]).dropna().unique())
+
+
+def get_bulk_chain_v3(root, exp, trade_date):
+    """v3 version of get_bulk_chain: enumerate strikes/rights quoted on trade_date.
+       root       -- ThetaData option root
+       exp        -- contract expiration as datetime.date
+       trade_date -- date we sample chain availability on
+       Returns DataFrame with columns [symbol, strike, cp, exp]; empty if no data."""
+    client = _get_v3_client()
+    empty = pd.DataFrame(columns=['symbol', 'strike', 'cp', 'exp'])
+    try:
+        df = client.option_list_contracts(request_type='quote', date=trade_date, symbol=root)
+    except Exception as e:
+        if _v3_empty_or_raise(e):
+            return empty
+    if df is None or len(df) == 0:
+        return empty
+    df = _v3_norm_cols(df)
+    df['exp'] = _v3_parse_exp(df['expiration'])
+    df = df[df['exp'] == exp].copy()
+    if df.empty:
+        return empty
+    df['symbol'] = root
+    df['strike'] = _v3_fix_strike(df['strike'])
+    df['cp'] = _v3_cp(df['right'])
+    return df[['symbol', 'strike', 'cp', 'exp']].drop_duplicates().reset_index(drop=True)
+
+
+def get_option_quotes_v3(root, strike, cp, exp, trade_date,
+                         start_time=None, end_time=None, interval='1s'):
+    """v3 version of get_option_quotes: bid/ask bars for one contract on one date.
+       root       -- ThetaData option root (e.g. 'SPXW', 'NVDA')
+       strike     -- strike in dollars (float), or None/'*' for the whole chain
+       cp         -- 'Call', 'Put', or None/'both' for both rights
+       exp        -- contract expiration as datetime.date
+       trade_date -- trading date to pull (datetime.date); v3 history is single-day
+       start_time -- optional intraday start (datetime.time or 'HH:MM:SS')
+       end_time   -- optional intraday end (datetime.time or 'HH:MM:SS')
+       interval   -- v3 interval string ('1s', '5s', '1m', ...)
+       Returns DataFrame with QUOTE_COLS; empty when ThetaData has no data."""
+    client = _get_v3_client()
+    right = 'both' if cp in (None, 'both') else {'C': 'call', 'P': 'put'}[cp[0].upper()]
+    kwargs = dict(symbol=root, expiration=exp, date=trade_date, interval=interval,
+                  strike='*' if strike in (None, '*') else _fmt_strike_v3(strike),
+                  right=right)
+    if start_time is not None:
+        kwargs['start_time'] = _fmt_time_for_sql(start_time)
+    if end_time is not None:
+        kwargs['end_time'] = _fmt_time_for_sql(end_time)
+    try:
+        df = client.option_history_quote(**kwargs)
+    except Exception as e:
+        if _v3_empty_or_raise(e):
+            return pd.DataFrame(columns=QUOTE_COLS)
+    return _v3_quotes_to_canonical(df)
+
+
+def get_index_price_v3(root, trade_date, start_time=None, end_time=None, interval='1s'):
+    """v3 version of get_index_price: index price bars for one date.
+       root       -- index symbol (e.g. 'SPX', 'NDX', 'VIX')
+       trade_date -- trading date to pull (datetime.date); v3 history is single-day
+       start_time -- optional intraday start (datetime.time or 'HH:MM:SS')
+       end_time   -- optional intraday end (datetime.time or 'HH:MM:SS')
+       interval   -- v3 interval string; '1s' default (v2 tick-level is not exposed here)
+       Returns DataFrame with columns [symbol, trade_date, timestmp, price]; empty if no data."""
+    client = _get_v3_client()
+    cols = ['symbol', 'trade_date', 'timestmp', 'price']
+    kwargs = dict(symbol=root, date=trade_date, interval=interval)
+    if start_time is not None:
+        kwargs['start_time'] = _fmt_time_for_sql(start_time)
+    if end_time is not None:
+        kwargs['end_time'] = _fmt_time_for_sql(end_time)
+    try:
+        df = client.index_history_price(**kwargs)
+    except Exception as e:
+        if _v3_empty_or_raise(e):
+            return pd.DataFrame(columns=cols)
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=cols)
+    df = _v3_norm_cols(df.copy())
+    df = _v3_split_timestamp(df)
+    df['symbol'] = root
+    return df[cols]
+
+
+# ---------- self-test ----------
+
+if __name__ == "__main__":
+    print(f"Testing thetadata_helpers against {BASE_URL}")
+    print("-" * 70)
+
+    print("[1] check_terminal_status()")
+    up = check_terminal_status()
+    print(f"    Terminal reachable: {up}")
+    if not up:
+        print("    ThetaTerminal is not running -- skipping v2 tests.")
+
+    today = dt.date.today()
+    test_exp = None
+    if up:
+        print("\n[2] list_expirations('SPXW')")
+        exps = list_expirations("SPXW")
+        print(f"    {len(exps)} expirations listed | first 3: {exps[:3]} | last 3: {exps[-3:]}")
+
+        # Pick a recent expiry in the past to make sure we have data
+        past_exps = [e for e in exps if e < today]
+        if not past_exps:
+            print("    No past expirations -- cannot run v2 quote tests.")
+            up = False
+    if up:
+        test_exp = past_exps[-1]
+
+        print(f"\n[3] list_strikes('SPXW', {test_exp})")
+        strikes = list_strikes("SPXW", test_exp)
+        print(f"    {len(strikes)} strikes listed | range {strikes[0]}-{strikes[-1]}")
+
+        print(f"\n[4] get_bulk_chain('SPXW', {test_exp}, {test_exp})")
+        chain = get_bulk_chain("SPXW", test_exp, test_exp)
+        print(f"    Chain rows: {len(chain)}")
+        if not chain.empty:
+            print(f"    Sample:\n{chain.head(3).to_string(index=False)}")
+
+            # Pull a single contract near the middle of the chain to exercise get_option_quotes
+            mid_row = chain.iloc[len(chain) // 2]
+            print(f"\n[5] get_option_quotes({mid_row['symbol']}, {mid_row['strike']}, "
+                  f"{mid_row['cp']}, {mid_row['exp']}, start_time=15:55, end_time=16:00, ivl=1000)")
+            q = get_option_quotes(mid_row["symbol"], mid_row["strike"], mid_row["cp"],
+                                  mid_row["exp"], mid_row["exp"], mid_row["exp"],
+                                  start_time="15:55:00", end_time="16:00:00", ivl_ms=1000)
+            print(f"    Quote rows: {len(q)}")
+            if not q.empty:
+                print(f"    Columns: {list(q.columns)}")
+                print(f"    Head:\n{q.head(3).to_string(index=False)}")
+                print(f"    Tail:\n{q.tail(3).to_string(index=False)}")
+
+        print(f"\n[6] get_index_price('SPX', {test_exp}, {test_exp}, "
+              f"start_time=15:55, end_time=16:00, ivl_ms=0)")
+        ix = get_index_price("SPX", test_exp, test_exp,
+                             start_time="15:55:00", end_time="16:00:00", ivl_ms=0)
+        print(f"    Index ticks: {len(ix)}")
+        if not ix.empty:
+            print(f"    Columns: {list(ix.columns)}")
+            print(f"    Head:\n{ix.head(3).to_string(index=False)}")
+            print(f"    Tail:\n{ix.tail(3).to_string(index=False)}")
+
+        import time as _t
+        print(f"\n[7] get_index_price_cached('SPX', {test_exp}, {test_exp}, "
+              f"start_time=15:59, end_time=16:00)")
+        t0 = _t.perf_counter()
+        ix_c1 = get_index_price_cached("SPX", test_exp, test_exp,
+                                       start_time="15:59:00", end_time="16:00:00", use_v3=False)
+        dur1 = _t.perf_counter() - t0
+        print(f"    First call:  {len(ix_c1):>5} rows in {dur1:.2f}s (pull+write on cache miss)")
+
+        t0 = _t.perf_counter()
+        ix_c2 = get_index_price_cached("SPX", test_exp, test_exp,
+                                       start_time="15:59:00", end_time="16:00:00", use_v3=False)
+        dur2 = _t.perf_counter() - t0
+        print(f"    Second call: {len(ix_c2):>5} rows in {dur2:.2f}s (cache hit -- should be faster)")
+        if not ix_c2.empty:
+            print(f"    Head:\n{ix_c2.head(3).to_string(index=False)}")
+            print(f"    Tail:\n{ix_c2.tail(3).to_string(index=False)}")
+
+    print("\n" + "=" * 70)
+    print("v3 tests (official thetadata library -- no local terminal)")
+    print("-" * 70)
+
+    print("[8] check_v3_connection()")
+    v3_up = check_v3_connection()
+    print(f"    v3 authenticated: {v3_up}")
+    if not v3_up:
+        print("    Set THETADATA_API_KEY or create thetadata_creds.json -- skipping v3 tests.")
+    else:
+        print(f"\n[9] list_expirations_v3('SPXW')")
+        exps3 = list_expirations_v3("SPXW")
+        print(f"    {len(exps3)} expirations | first 3: {exps3[:3]} | last 3: {exps3[-3:]}")
+
+        if test_exp is None:  # v2 terminal was down -- derive a test expiry from v3
+            past_exps3 = [e for e in exps3 if e < today]
+            test_exp = past_exps3[-1] if past_exps3 else None
+        assert test_exp is not None, "No past expirations available from v3 either."
+
+        print(f"\n[10] list_strikes_v3('SPXW', {test_exp})")
+        strikes3 = list_strikes_v3("SPXW", test_exp)
+        print(f"    {len(strikes3)} strikes | range {strikes3[0]}-{strikes3[-1]}")
+
+        print(f"\n[11] get_bulk_chain_v3('SPXW', {test_exp}, {test_exp})")
+        chain3 = get_bulk_chain_v3("SPXW", test_exp, test_exp)
+        print(f"    Chain rows: {len(chain3)}")
+        if not chain3.empty:
+            print(f"    Sample:\n{chain3.head(3).to_string(index=False)}")
+
+            mid3 = chain3.iloc[len(chain3) // 2]
+            print(f"\n[12] get_option_quotes_v3({mid3['symbol']}, {mid3['strike']}, "
+                  f"{mid3['cp']}, {mid3['exp']}, start_time=15:55, end_time=16:00)")
+            q3 = get_option_quotes_v3(mid3["symbol"], mid3["strike"], mid3["cp"],
+                                      mid3["exp"], mid3["exp"],
+                                      start_time="15:55:00", end_time="16:00:00")
+            print(f"    Quote rows: {len(q3)}")
+            if not q3.empty:
+                print(f"    Head:\n{q3.head(3).to_string(index=False)}")
+                print(f"    Tail:\n{q3.tail(3).to_string(index=False)}")
+
+        print(f"\n[13] get_index_price_v3('SPX', {test_exp}, start_time=15:55, end_time=16:00)")
+        ix3 = get_index_price_v3("SPX", test_exp,
+                                 start_time="15:55:00", end_time="16:00:00")
+        print(f"    Index rows: {len(ix3)}")
+        if not ix3.empty:
+            print(f"    Head:\n{ix3.head(3).to_string(index=False)}")
+            print(f"    Tail:\n{ix3.tail(3).to_string(index=False)}")
+
+    print("\nAll tests complete.")

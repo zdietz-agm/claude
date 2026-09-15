@@ -1,0 +1,737 @@
+"""Hacker Protocol for 355PM.
+
+Fires DEBIT-SPREAD hackers at half the parent's filled size to partially unwind
+350PM positions when the 3:55 SPX imbalance is adversarial to that fill. Targets
+(TARGET_NAMES): every 350PM SPX credit-spread-sale strategy WIDER than $10 -- the
+10 parents (all prod SPREAD_SALES_SPX configs except the $10-wide BASE and LOW_VIX),
+the 2 CLOSER variants ($5-wide, kept deliberately), and the 3 BUMPED strategies.
+NDX strategies are EXPLICITLY excluded (different underlying; the adversarial gate
+is the SPX 355 imbal). Parents added 2026-08-31; bumped added 2026-08-20.
+
+Three entry points, imported by 355pm_script.py:
+
+  query_closer_fills(today, is_test, test_hack_rows, log_fn)
+      Called at 3:54:50. Queries optionsResearch.algo_trade_log for today's
+      TARGET_NAMES fills and returns a list of raw fill dicts. In test mode with
+      TEST_HACK non-empty, bypasses the DB and uses the caller's rows.
+
+  fire_hackers(trade_dict, hacker_fills, factor_..., factor_..., puts, calls,
+               today, is_test, log_fn, delay_start_seconds=0.10)
+      Called concurrently with orchestrate_batched_send via asyncio.gather. Sleeps
+      delay_start_seconds so orchestrator's wave-1 hits SR first, then filters
+      adversarial fills and fires all surviving hackers concurrently via
+      send_complex_two_waves (then wave-3 rest, see below). Appends fired hacker
+      trades (with grouping_codes) to trade_dict so the main-script log_trades
+      call picks them up naturally.
+
+  refresh_hacker_fills(trade_dict, factors, script_name)
+      Called after the main log_trades pass. If any hacker carries a wave-3
+      resting order (which can fill any time up to 16:00, after the main 60s fill
+      snapshot), sleeps until ~16:00:30 ET and re-UPSERTs just the hacker rows in
+      algo_trade_log so their fills are final. No-op on non-hack days.
+
+Adversarial gate:
+  Put  fill -> requires factor_355_imbal_less_than_neg_950m == 1
+  Call fill -> requires factor_355_imbal_greater_than_950m  == 1
+  (950M gate since 8/21/26: 1B research threshold minus a live-vs-T+1 jitter buffer;
+  the hacking backtest stays at 1B.)
+
+Debit-spread leg mapping (buy back the parent's short leg, sell back the long):
+  hacker.long_legs  = leg at parent's short_strike  (BUY)
+  hacker.short_legs = leg at parent's long_strike   (SELL)
+
+Price cap + wave-3 rest: min_price = -HACK_MAX_PRICE clamps every wave's limit, so we
+pay at most HACK_MAX_PRICE per spread (natural cheaper -> we pay the cheaper price).
+After the standard two waves (~6s), any unfilled remainder is re-sent as a WAVE-3
+resting order at exactly -HACK_MAX_PRICE with orderDuration = seconds to 16:00:00,
+so the bid stays working server-side at SR until the close (backtest 8/31/26: most
+of the hack edge above the cap comes back to us later in the 15:55-16:00 window).
+"""
+
+import asyncio
+import sys
+from decimal import Decimal, ROUND_HALF_UP
+
+import pandas as pd
+import sqlalchemy
+
+sys.path.insert(1, "D:/PycharmProjects/utils")
+from spdr_rock_functions import run_query
+import vbam_helpers   # optionsResearch on alpine-vbam-dev (algo_trade_log lives here)
+
+
+def _round_half_up(x, ndigits=2):
+	"""Round half AWAY from zero to ndigits (0.125 -> 0.13), unlike Python's round() which is
+	round-half-to-even. Used for hacker edge blends."""
+	q = Decimal(1).scaleb(-ndigits)   # e.g. Decimal('0.01') for ndigits=2
+	return float(Decimal(str(x)).quantize(q, rounding=ROUND_HALF_UP))
+
+
+# ==================== Config ====================
+# Strategies whose 350PM fills are hack candidates (expanded 2026-08-31 from 5 to 15):
+#   - The 10 SPX parents: every prod 350PM_SPREAD_SALES_SPX* config WIDER than $10
+#     (excludes the $10-wide BASE ALGO_42_350PM_SPREAD_SALES_SPX and _LOW_VIX).
+#   - The 2 CLOSER variants ($5-wide -- kept deliberately despite the width rule).
+#   - The 3 BUMPED strategies (added 2026-08-20).
+# NDX strategies (e.g. ALGO_42_350PM_SPREAD_SALES_NDX_IMBAL_VS_MARKET) are EXPLICITLY
+# EXCLUDED: different underlying, and the adversarial gate is the SPX 355 imbal.
+# Same half-size unwind for all (hack_size = size_filled // 2, so 1-lot fills skip;
+# CLOSER-day parent residuals are min_size 1-lot -> parents never double-hack).
+TARGET_NAMES = (
+	# parents (> $10 wide)
+	"ALGO_42_350PM_SPREAD_SALES_SPX_DUAL_IMBAL",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_HIGH_PAIRED",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_EXTRA_CALLS",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_EXTRA_PUTS",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_SML",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_SML2",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_SHRINKS",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MOVE_NO_MKT",
+	# closers
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET_CLOSER",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_CLOSER",
+	# bumped
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS_BUMPED",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET_BUMPED",
+	"ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_SHRINKS_BUMPED",
+)
+
+# --- v8 parallel-run hooks (defaults = v7 behavior, byte-identical) --------------------------
+# Set by 355pm_script_v8.py, process-local; the v7 355pm_script.py never touches them.
+SCRIPT_NAME_FILTER = "350PM"    # algo_trade_log script_name whose CLOSER fills we hack.
+                                # v8 sets "350PM_V8" -> hacks the v8 book's own (ratio-sized) fills.
+ACCOUNT_MAP = None              # v7->v8 account remap applied AFTER _lookup_parent_account (which
+                                # returns v7 closer accounts EOD31/32 from CLOSER_PARENT_CONFIGS).
+                                # None = no remap (v7). FAIL-CLOSED: a resolved account missing
+                                # from a set map SKIPS that hacker rather than send to v7.
+TEST_ACCOUNT_OVERRIDE = None    # is_test account. None = TEST_ACCOUNTS lookup (v7 T.AGM*);
+                                # v8 sets "T.AGMV8.01" (T.AGM* only exists on v7).
+
+# Debit price cap: we pay at most this much per spread. Above this, every wave's
+# limit_price is clamped to -HACK_MAX_PRICE, and wave 3 rests at exactly that limit
+# until the close (1.70 chosen 2026-08-31 off the resting-limit backtest sweep;
+# optimum plateau 1.40-1.60, 1.70 adds fill cushion).
+HACK_MAX_PRICE = 1.70
+
+# Debit spread edge constants -- the STATIC BASELINE / floor for hacker edges.
+# NOTE (2026-08-31): these are set DELIBERATELY OVER-AGGRESSIVE to maximize the odds
+# wave 1/2 actually fill (prod history: wave 1 filled 0 in all 4 attempts to date).
+# After several prod days with real hacker fills, re-evaluate whether to soften them.
+HACK_EDGE_TARGET_1 = 0.060
+HACK_MAX_EDGE_1    = 0.120
+HACK_EDGE_TARGET_2 = 0.080
+HACK_MAX_EDGE_2    = 0.160
+
+# Hacker edges are a floored blend between the static baseline above and the 355-regime-aware value
+# (compute_trade_edges with the intentionally-low ABS_CHG_IMBAL_STATS_355PM -- same methodology the
+# 355PM CLOSER uses). Per edge: max(static, static + w*(dynamic - static)), so on quiet days it
+# stays at the static baseline and on fast/adversarial days it leans toward the dynamic value.
+# w=0 -> pure static (today's behavior); w=1 -> pure dynamic.
+HACK_DYNAMIC_BLEND_WEIGHT = 0.5
+
+
+def _hacker_edges(srprc, vix, atm_vol_0dte, abs_imbal, abs_chg_imbal, log_fn, label):
+	"""Return (et1, me1, et2, me2) for a hacker debit spread: a floored 355-methodology blend of the
+	static HACK_* baseline. Per edge: round(max(static, static + w*(dynamic - static)), 2). Falls
+	back to the static baseline if any regime input is missing or anything errors (never raises --
+	hackers must not crash the run)."""
+	static = (HACK_EDGE_TARGET_1, HACK_MAX_EDGE_1, HACK_EDGE_TARGET_2, HACK_MAX_EDGE_2)
+	if srprc is None or srprc <= 0 or None in (vix, atm_vol_0dte, abs_imbal, abs_chg_imbal):
+		return static
+	try:
+		from helpers import compute_trade_edges, ABS_CHG_IMBAL_STATS_355PM
+		dyn = compute_trade_edges(vix, atm_vol_0dte, abs_imbal, srprc,
+		                          abs_chg_imbal=abs_chg_imbal, abs_chg_stats=ABS_CHG_IMBAL_STATS_355PM)
+		w = HACK_DYNAMIC_BLEND_WEIGHT
+		blended = tuple(_round_half_up(max(s, s + w * (d - s)), 2) for s, d in zip(static, dyn))
+		log_fn(f"{label} edges: static={static} dynamic={tuple(round(x, 3) for x in dyn)} "
+		       f"-> blend(w={w})={blended}")
+		return blended
+	except Exception as e:
+		log_fn(f"{label} edge blend failed ({e}); using static baseline {static}")
+		return static
+
+
+# ==================== Helpers ====================
+
+def _lookup_parent_account(parent_full_name, log_fn):
+	"""Look up the hacked strategy's account from its own config module at call time (dynamic --
+	picks up mid-day edits). _CLOSER names -> CLOSER_PARENT_CONFIGS; _BUMPED names ->
+	BUMPED_PARENT_CONFIGS (both keyed by the parent-base name, suffix stripped); anything
+	else is a plain parent -> its own configs/<name>.py 'account' field.
+	Fail-soft: log + return None on any miss."""
+	if parent_full_name.endswith("_BUMPED"):
+		try:
+			from configs_bumped_spreads.bumped_spread_config import BUMPED_PARENT_CONFIGS
+		except Exception as e:
+			log_fn(f"account lookup: could not import BUMPED_PARENT_CONFIGS ({e})")
+			return None
+		parent_base = parent_full_name[:-len("_BUMPED")]
+		cfg = BUMPED_PARENT_CONFIGS.get(parent_base)
+		if cfg is None:
+			log_fn(f"account lookup: no entry for '{parent_base}' in BUMPED_PARENT_CONFIGS")
+			return None
+		return cfg.get("account")
+	if parent_full_name.endswith("_CLOSER"):
+		try:
+			from configs_closer_strikes.closer_strike_config import CLOSER_PARENT_CONFIGS
+		except Exception as e:
+			log_fn(f"account lookup: could not import CLOSER_PARENT_CONFIGS ({e})")
+			return None
+		parent_base = parent_full_name[:-len("_CLOSER")]
+		cfg = CLOSER_PARENT_CONFIGS.get(parent_base)
+		if cfg is None:
+			log_fn(f"account lookup: no entry for '{parent_base}' in CLOSER_PARENT_CONFIGS")
+			return None
+		return cfg.get("account")
+	# Plain parent: read 'account' from configs/<name>.py (same file-path load pattern as
+	# helpers.load_configs_from_directory, so mid-day config edits are picked up).
+	try:
+		import os
+		import importlib.util
+		cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs",
+		                        f"{parent_full_name}.py")
+		spec = importlib.util.spec_from_file_location("hacker_cfg_lookup", cfg_path)
+		module = importlib.util.module_from_spec(spec)
+		spec.loader.exec_module(module)
+		account = module.config.get("account")
+		if not account:
+			log_fn(f"account lookup: configs/{parent_full_name}.py has no 'account' field")
+			return None
+		return account
+	except Exception as e:
+		log_fn(f"account lookup: could not load configs/{parent_full_name}.py ({e})")
+		return None
+
+
+# NOTE (2026-09-04): replaced at runtime in 355pm_script_v8.py by helpers_v8._fetch_legs_v8 (signature-checked) -- port edits there too.
+async def _fetch_legs(needed_keys, today, log_fn):
+	"""Batch-query sranalytics.msgoptionimpliedquote for the specific strikes we need.
+	needed_keys is an iterable of (okey_xx: float, okey_cp: str) tuples.
+	Returns dict keyed by (okey_xx, okey_cp) -> pandas Series row (or {} on failure/empty).
+
+	This avoids relying on the caller's puts/calls chain DataFrame, which may not include
+	strikes the parent traded at 3:50pm (chain window is spot-centered and may have shifted
+	by 3:55pm if SPX moved). We look up EXACT strikes we need from SR directly."""
+	needed_set = set((float(xx), str(cp)) for xx, cp in needed_keys)
+	if not needed_set:
+		return {}
+	tuples_sql = ",".join(
+		f"('SPXW',{xx},'{cp}',{today.year},{today.month},{today.day})"
+		for xx, cp in needed_set
+	)
+	# Quote table read AT CALL TIME from spdr_rock_order_functions.IMPLIED_QUOTE_TABLE: v7 default
+	# is sranalytics.msgoptionimpliedquote (SQL byte-identical); after use_v8() it is the v8
+	# msgliveimpliedquoteadj (the v7 name does not exist on the v8 host).
+	import spdr_rock_order_functions as _srof
+	sql = f"""SELECT okey_at, okey_ts, okey_tk, okey_yr, okey_mn, okey_dy, okey_xx, okey_cp, sprc, obid, oask
+	          FROM {_srof.IMPLIED_QUOTE_TABLE}
+	          WHERE (okey_tk, okey_xx, okey_cp, okey_yr, okey_mn, okey_dy) IN ({tuples_sql})"""
+	try:
+		df = await asyncio.to_thread(
+			run_query, sql, database="sranalytics",
+			verbose=True, tag="hacker_leg_fetch",
+		)
+	except Exception as e:
+		log_fn(f"sranalytics leg fetch FAILED ({e}); cannot build hackers")
+		return {}
+	if df is None or df.empty:
+		log_fn(f"sranalytics leg fetch returned no rows for {len(needed_set)} needed strike(s)")
+		return {}
+	log_fn(f"sranalytics leg fetch returned {len(df)} row(s) for {len(needed_set)} needed strike(s)")
+	return {(float(row.okey_xx), str(row.okey_cp)): row for _, row in df.iterrows()}
+
+
+# ==================== Public API ====================
+
+def query_closer_fills(today, is_test=False, test_hack_rows=None, log_fn=None):
+	"""Called at ~3:54:50. Returns list of raw fill dicts (one per non-zero CLOSER fill):
+	    {parent_algo_name, cp, short_strike, long_strike, size_filled}
+
+	In test mode with a non-empty test_hack_rows, bypasses the DB and returns rows
+	built from tuples of (parent_algo_name, size_filled, cp, short_strike, long_strike).
+
+	Never raises. On DB error returns [] and logs."""
+	if log_fn is None:
+		log_fn = lambda msg: None
+
+	if is_test and test_hack_rows:
+		log_fn(f"TEST mode: using {len(test_hack_rows)} TEST_HACK row(s) instead of algo_trade_log")
+		return [
+			{"parent_algo_name": r[0], "size_filled": int(r[1]), "cp": r[2],
+			 "short_strike": float(r[3]), "long_strike": float(r[4])}
+			for r in test_hack_rows
+		]
+
+	names_csv = ",".join(f"'{n}'" for n in TARGET_NAMES)
+	sql = f"""
+		SELECT algo_name, cp, short_strike, long_strike, size_filled
+		FROM optionsResearch.algo_trade_log
+		WHERE trade_date = '{today.strftime('%Y-%m-%d')}'
+		  AND script_name = '{SCRIPT_NAME_FILTER}'
+		  AND algo_name IN ({names_csv})
+		  AND size_filled > 0
+	"""
+	# algo_trade_log lives in optionsResearch on alpine-vbam-dev (NOT the SR box, so
+	# spdr_rock_functions.run_query lacks perms here). Use a dedicated engine with bounded
+	# timeouts instead of vbam_helpers.run_query: this runs at 3:54:50, and a hung dev db
+	# must fail fast (no hackers today) rather than stall the script past its 3:55 fire
+	# time (vbam_helpers.run_query sets no read timeout -- pymysql default is infinite).
+	try:
+		engine = sqlalchemy.create_engine(
+			vbam_helpers.connection_string,
+			connect_args={"connect_timeout": 3, "read_timeout": 5})
+		with engine.connect() as conn:
+			df = pd.DataFrame(conn.execute(sqlalchemy.text(sql)).fetchall())
+	except Exception as e:
+		log_fn(f"algo_trade_log query FAILED ({e}); no hackers today")
+		return []
+	if df is None or df.empty:
+		log_fn(f"no target CLOSER fills in algo_trade_log for {today}; no hackers today")
+		return []
+	log_fn(f"algo_trade_log returned {len(df)} candidate row(s)")
+	return [
+		{"parent_algo_name": str(r.algo_name), "size_filled": int(r.size_filled),
+		 "cp": str(r.cp), "short_strike": float(r.short_strike),
+		 "long_strike": float(r.long_strike)}
+		for _, r in df.iterrows()
+	]
+
+
+# Waves 3/4 (redesigned 9/11/26, chat "Hacker script max spread price" follow-up): both are
+# NBBO-priced Simple/Activetaker orders -- orderPrcLimit IS the working price, ss-script
+# style -- never a Seeker quoting at the surface, and never a bare -HACK_MAX_PRICE limit
+# (LmtCollar reject risk). Limit = -(live cross + offset), floored at -HACK_MAX_PRICE.
+# W3 works HACK_W3_WORK_S, then W4 re-prices off a refreshed NBBO and rests to the close.
+HACK_W3_NBBO_OFFSET = 0.07    # $ through the live cross for wave 3
+HACK_W4_NBBO_OFFSET = 0.15    # $ through the refreshed cross for wave 4
+HACK_W3_WORK_S = 10.0         # seconds wave 3 works before the wave-4 check
+HACK_NBBO_RETRIES = 3         # quote-refresh attempts before sending on the best we hold
+HACK_NBBO_RETRY_WAIT_S = 1.0  # pause between quote-refresh attempts
+HACK_NBBO_MAX_AGE_S = 5.0     # quote row older than this (SR CT clock) counts as stale
+# Wave-4 orderDuration ceiling (seconds). Prod reaches wave 4 ~15:55:18 so seconds-to-close
+# is ~280; the cap only matters for test-harness runs earlier in the day (avoid an
+# hours-long T.* order).
+WAVE_REST_MAX_DURATION_S = 310
+
+
+def _nbbo_table():
+	"""Quote table for the W3/W4 NBBO refresh. v7: msgoptionimpliedquote (the
+	IMPLIED_QUOTE_TABLE default). v8: msgliveimpliedquote -- the F4 table, deliberately NOT
+	the msgliveimpliedquoteadj proxy the v8 IMPLIED_QUOTE_TABLE toggle points at."""
+	import spdr_rock_functions as _srf
+	if _srf.SEND_V8:
+		from helpers_v8 import V8_QUOTE_TABLE
+		return V8_QUOTE_TABLE
+	import spdr_rock_order_functions as _srof
+	return _srof.IMPLIED_QUOTE_TABLE
+
+
+def _legs_cross(long_rows, short_rows):
+	"""Buy-back cross for the hack spread: sum(oask of legs we BUY) - sum(obid of legs we
+	SELL). Positive debit. Raises on missing/zero ask so callers fall through to retry."""
+	cross = 0.0
+	for r in long_rows:
+		oask = float(r.oask)
+		if not oask > 0:
+			raise ValueError(f"buy leg {r.okey_xx}{r.okey_cp} oask={oask}")
+		cross += oask
+	for r in short_rows:
+		cross -= max(0.0, float(r.obid))
+	return cross
+
+
+async def _fresh_hack_nbbo(trade, log_fn):
+	"""Live buy-back cross for one hack, from the per-book quote table (_nbbo_table).
+	Retries up to HACK_NBBO_RETRIES times, HACK_NBBO_RETRY_WAIT_S apart, when the query
+	fails, a leg is missing, an ask is not positive, or the row is older than
+	HACK_NBBO_MAX_AGE_S. After the retries it returns the freshest usable quote it saw --
+	fire-time leg rows as the last resort -- so the caller ALWAYS sends (Zach 9/11/26: no
+	silent no-order). Returns (cross, note) where note says which quote priced the order."""
+	exp = trade["exp"]
+	legs = list(trade["long_legs"]) + list(trade["short_legs"])
+	tuples_sql = ",".join(
+		f"('SPXW',{float(r.okey_xx)},'{r.okey_cp}',{exp.year},{exp.month},{exp.day})" for r in legs)
+	sql = (f"SELECT okey_xx, okey_cp, obid, oask, timestamp FROM {_nbbo_table()} "
+	       f"WHERE (okey_tk, okey_xx, okey_cp, okey_yr, okey_mn, okey_dy) IN ({tuples_sql})")
+	best = None   # (cross, note) from a query that returned sane rows but failed freshness
+	for attempt in range(1, HACK_NBBO_RETRIES + 1):
+		if attempt > 1:
+			await asyncio.sleep(HACK_NBBO_RETRY_WAIT_S)
+		try:
+			df = await asyncio.to_thread(run_query, sql, database="sranalytics",
+			                             verbose=True, tag="hacker_nbbo_refresh")
+			rows = {(float(r.okey_xx), str(r.okey_cp)): r for _, r in df.iterrows()}
+			longs = [rows[(float(r.okey_xx), str(r.okey_cp))] for r in trade["long_legs"]]
+			shorts = [rows[(float(r.okey_xx), str(r.okey_cp))] for r in trade["short_legs"]]
+			cross = _legs_cross(longs, shorts)
+			# Age vs the SR CT clock; an unparseable timestamp counts as stale but usable.
+			try:
+				import datetime as _dt
+				from calendar_utils import getNowEst
+				ts = pd.to_datetime(longs[0].timestamp)
+				age = ((getNowEst().replace(tzinfo=None) - _dt.timedelta(hours=1)) - ts).total_seconds()
+			except Exception:
+				age = None
+			if age is not None and 0 <= age <= HACK_NBBO_MAX_AGE_S:
+				return cross, f"fresh quote, age {age:.1f}s, attempt {attempt}"
+			best = (cross, f"stale quote (age {'unknown' if age is None else f'{age:.1f}s'}), "
+			               f"attempt {attempt}")
+			log_fn(f"{trade['name']} nbbo refresh attempt {attempt}: quote stale "
+			       f"(age {'unknown' if age is None else f'{age:.1f}s'}); retrying")
+		except Exception as e:
+			log_fn(f"{trade['name']} nbbo refresh attempt {attempt} failed: {e}")
+	if best is not None:
+		return best
+	# Last resort: the fire-time leg rows from _fetch_legs (~15:55:01). Still send.
+	cross = _legs_cross(trade["long_legs"], trade["short_legs"])
+	return cross, f"FIRE-TIME quote (all {HACK_NBBO_RETRIES} refreshes failed)"
+
+
+async def _fire_one(trade, orderDuration=30, log_fn=None):
+	"""Fire one hacker via send_complex_two_waves, then WAVE 3: cancel any still-working
+	remnant and re-send the unfilled remainder as an NBBO-priced Simple/Activetaker order at
+	-(live cross + HACK_W3_NBBO_OFFSET), floored at -HACK_MAX_PRICE, working HACK_W3_WORK_S.
+	WAVE 4: any W3 remainder re-prices off a refreshed NBBO at -(cross + HACK_W4_NBBO_OFFSET)
+	and rests to 16:00:00 (lives server-side at SR; self-expires at the close, so no cancel
+	path is needed). Returns list of ALL grouping_codes (waves 1-4).
+	The wave-3/4 block never raises -- a failure there must not lose the wave-1/2 codes, and
+	a wave-4 failure must not lose wave 3's.
+	log_fn: timestamped logger from fire_hackers; falls back to bare print."""
+	if log_fn is None:
+		log_fn = print
+	from spdr_rock_order_functions import (
+		send_complex_two_waves, trade_complex, batched_fill_check_and_cancel,
+		WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE,
+	)
+	trade["_wave_capture"] = {}
+	all_codes = await send_complex_two_waves(
+		trade["symbol"], trade["size"],
+		trade["short_legs"], trade["long_legs"],
+		trade["exp"], trade["account"],
+		edge_target1=trade["edge_target1"], max_edge1=trade["max_edge1"],
+		edge_target2=trade["edge_target2"], max_edge2=trade["max_edge2"],
+		is_sale=trade["is_sale"], userData=trade["name"],
+		orderDuration=orderDuration, min_price=trade["min_price"],
+		capture=trade["_wave_capture"],
+	)
+	try:
+		if not all_codes:
+			return all_codes
+		# Give wave 2 the standard working window, then settle fills:
+		#   wave-1 codes: ALWAYS already settled (cancelled or naturally done) inside
+		#     send_complex_two_waves at the wave-1->2 transition, and terminal by now (+3s) --
+		#     just read their final fill quantities. Never re-cancel them: a cancelled v7 order
+		#     shows spdrOrderStatus=Closed/spdrCloseReason=UserCxl but KEEPS parentNumber, so
+		#     any pn-based liveness check re-cancels it -> SR 1105 duplicate row, which is
+		#     exactly what aborted wave 3 live on 2026-09-01.
+		#   wave-2 codes: the only possibly-live orders -> settle via the status-gated
+		#     batched_fill_check_and_cancel (terminal = spdrOrderStatus in {Closed, Rejected,
+		#     SendReject}; cancels only live parents, deduped by parentNumber for chunked
+		#     orders, then polls each cancel to terminal before trusting its fill qty) -- so
+		#     wave 3 can never double-fill against a live remnant.
+		# Announced so the daily review's log parser classifies this pause as a designed
+		# wait (it runs concurrently with the orchestrator, so the line before the silence
+		# belongs to the other task).
+		log_fn(f"{trade['name']} sleeping {WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE}s for SR "
+		       f"to work wave-2")
+		await asyncio.sleep(WAIT_TIME_BETWEEN_COMPLEX_ORDER_UPDATE)
+		import spdr_rock_functions as _srf   # SEND_V8 flag lives here (utils module)
+		total_filled = 0
+		w1_codes = (trade.get("_wave_capture") or {}).get("wave1_codes") or []
+		w2_codes = (trade.get("_wave_capture") or {}).get("wave2_codes") or []
+		if not w1_codes and not w2_codes:
+			# Capture missing despite codes existing (unexpected): fills unverifiable -> no wave 3.
+			print(f"{trade['name']}: wave capture empty but {len(all_codes)} code(s) exist -- "
+			      f"cannot verify fills; SKIPPING wave-3 rest (overfill risk)")
+			return all_codes
+		if w1_codes:
+			_qty_col = "cumSquareQty" if _srf.SEND_V8 else "fillQuan1"
+			_csv = ",".join(f"'{gc}'" for gc in w1_codes)
+			_sql = f"SELECT groupingcode, {_qty_col} FROM srtrade.msgsrmlegbrkrstate WHERE groupingcode IN ({_csv})"
+			_df = await asyncio.to_thread(run_query, _sql, "srtrade")
+			if _df is not None and not _df.empty:
+				total_filled += int(_df[_qty_col].fillna(0).sum())
+		if w2_codes:
+			account_by_gc = {gc: trade["account"] for gc in w2_codes}
+			filled_map, unconfirmed = await batched_fill_check_and_cancel(w2_codes, account_by_gc)
+			if unconfirmed:
+				print(f"{trade['name']}: {len(unconfirmed)} wave-2 order(s) NOT terminal after cancel poll "
+				      f"({sorted(unconfirmed)}) -- could still fill; SKIPPING wave-3 rest (overfill risk)")
+				return all_codes
+			total_filled += sum(filled_map.values())
+		remainder = trade["size"] - total_filled
+		if remainder < 1:
+			print(f"{trade['name']}: filled {total_filled}/{trade['size']} after 2 waves; no wave-3 rest needed")
+			return all_codes
+		from calendar_utils import getNowEst
+		now = getNowEst()
+		secs_to_close = int((now.replace(hour=16, minute=0, second=0, microsecond=0) - now).total_seconds())
+		if secs_to_close <= 5:
+			print(f"{trade['name']}: only {secs_to_close}s to close -- skipping wave-3 rest")
+			return all_codes
+		# ---- WAVE 3: NBBO-priced Simple/Activetaker, works HACK_W3_WORK_S ----
+		cross3, note3 = await _fresh_hack_nbbo(trade, log_fn)
+		w3_limit = round(-(cross3 + HACK_W3_NBBO_OFFSET), 2)
+		if trade["min_price"] is not None and w3_limit < trade["min_price"]:
+			w3_limit = trade["min_price"]
+		log_fn(f"{trade['name']} WAVE-3 Simple/Activetaker {remainder}/{trade['size']} at "
+		       f"limit {w3_limit} (nbbo cross {cross3:.2f} + {HACK_W3_NBBO_OFFSET:.2f} offset, "
+		       f"cap {trade['min_price']}; {note3})")
+		wave3_codes = await asyncio.to_thread(
+			trade_complex,
+			symbol=trade["symbol"], size=remainder,
+			short_legs=trade["short_legs"], long_legs=trade["long_legs"],
+			exp=trade["exp"], account=trade["account"],
+			edge_target=trade["edge_target2"], is_sale=trade["is_sale"],
+			userData=trade["name"], orderDuration=int(HACK_W3_WORK_S) + 20,
+			min_price=trade["min_price"],
+			limit_class="Simple", parent_handling="Activetaker", explicit_limit=w3_limit,
+		)
+		trade["wave3_grouping_codes"] = list(wave3_codes)
+		all_codes.extend(wave3_codes)
+
+		# ---- WAVE 4: refreshed NBBO, rests to the close. Nested guard: a wave-4 failure
+		# must not lose wave 3's codes. ----
+		try:
+			log_fn(f"{trade['name']} sleeping {int(HACK_W3_WORK_S)}s for WAVE-3 to work")
+			await asyncio.sleep(HACK_W3_WORK_S)
+			account_by_gc3 = {gc: trade["account"] for gc in wave3_codes}
+			filled3, unconfirmed3 = await batched_fill_check_and_cancel(wave3_codes, account_by_gc3)
+			if unconfirmed3:
+				log_fn(f"{trade['name']}: {len(unconfirmed3)} WAVE-3 order(s) NOT terminal after "
+				       f"cancel poll ({sorted(unconfirmed3)}) -- could still fill; SKIPPING "
+				       f"wave-4 (overfill risk)")
+				return all_codes
+			w3_filled = sum(filled3.values())
+			remainder4 = remainder - w3_filled
+			if remainder4 < 1:
+				log_fn(f"{trade['name']}: WAVE-3 filled {w3_filled}/{remainder}; no wave-4 needed")
+				return all_codes
+			now = getNowEst()
+			secs_to_close = int((now.replace(hour=16, minute=0, second=0, microsecond=0)
+			                     - now).total_seconds())
+			if secs_to_close <= 5:
+				log_fn(f"{trade['name']}: only {secs_to_close}s to close -- skipping wave-4 rest")
+				return all_codes
+			secs_to_close = min(secs_to_close, WAVE_REST_MAX_DURATION_S)
+			cross4, note4 = await _fresh_hack_nbbo(trade, log_fn)
+			w4_limit = round(-(cross4 + HACK_W4_NBBO_OFFSET), 2)
+			if trade["min_price"] is not None and w4_limit < trade["min_price"]:
+				w4_limit = trade["min_price"]
+			log_fn(f"{trade['name']} WAVE-4 Simple/Activetaker resting {remainder4}/{trade['size']} "
+			       f"at limit {w4_limit} (nbbo cross {cross4:.2f} + {HACK_W4_NBBO_OFFSET:.2f} "
+			       f"offset, cap {trade['min_price']}; {note4}) for {secs_to_close}s "
+			       f"(self-expires at the close)")
+			wave4_codes = await asyncio.to_thread(
+				trade_complex,
+				symbol=trade["symbol"], size=remainder4,
+				short_legs=trade["short_legs"], long_legs=trade["long_legs"],
+				exp=trade["exp"], account=trade["account"],
+				edge_target=trade["edge_target2"], is_sale=trade["is_sale"],
+				userData=trade["name"], orderDuration=secs_to_close,
+				min_price=trade["min_price"],
+				limit_class="Simple", parent_handling="Activetaker", explicit_limit=w4_limit,
+			)
+			trade["wave4_grouping_codes"] = list(wave4_codes)
+			all_codes.extend(wave4_codes)
+		except Exception as e:
+			log_fn(f"{trade['name']}: WAVE-4 FAILED (non-fatal, wave-3 code intact): {e}")
+	except Exception as e:
+		print(f"{trade['name']}: WAVE-3/4 FAILED (non-fatal, wave-1/2 codes intact): {e}")
+	return all_codes
+
+
+async def fire_hackers(trade_dict, hacker_fills,
+                       factor_355_imbal_less_than_neg_950m, factor_355_imbal_greater_than_950m,
+                       today, is_test=False, log_fn=None,
+                       delay_start_seconds=0.05,
+                       vix=None, atm_vol_0dte=None, abs_imbal=None, abs_chg_imbal=None):
+	"""Run concurrently with orchestrate_batched_send inside a single asyncio.gather.
+	Sleeps delay_start_seconds so orchestrator's wave-1 fires first, then:
+
+	  1. Applies adversarial gate to each fill (Put + neg-950m factor, Call + pos-950m factor)
+	     and computes hack_size, account, etc.
+	  2. Batch-queries sranalytics.msgoptionimpliedquote for the EXACT strikes needed
+	     (avoids reliance on caller's chain DataFrame which may not include parent's
+	     strikes if the 3:55 chain window shifted since 3:50).
+	  3. Builds one debit-spread trade dict per surviving fill and fires them all
+	     concurrently via send_complex_two_waves.
+	  4. Appends fired hackers (with grouping_codes) to trade_dict so main-script
+	     log_trades picks them up on its normal 60s-wait DB write path.
+
+	Never raises."""
+	if log_fn is None:
+		log_fn = lambda msg: None
+
+	if not hacker_fills:
+		log_fn("no hacker fills queried; nothing to fire")
+		return
+
+	if delay_start_seconds > 0:
+		log_fn(f"waiting {delay_start_seconds*1000:.0f}ms so orchestrator wave-1 fires first")
+		await asyncio.sleep(delay_start_seconds)
+
+	try:
+		from helpers import TEST_ACCOUNTS
+	except Exception:
+		TEST_ACCOUNTS = {}
+
+	# ---- Step 1: adversarial gate + collect metadata for survivors ----
+	surviving = []   # list of (fill, hack_size, account) for hackers that pass the gate
+	needed_legs = set()   # set of (okey_xx, okey_cp) we need to fetch from SR
+	for fill in hacker_fills:
+		parent = fill["parent_algo_name"]
+		cp     = fill["cp"]
+		if cp == "Put"  and factor_355_imbal_less_than_neg_950m != 1:
+			log_fn(f"{parent}: Put fill but factor_355_imbal_less_than_neg_950m != 1 -- skipping")
+			continue
+		if cp == "Call" and factor_355_imbal_greater_than_950m  != 1:
+			log_fn(f"{parent}: Call fill but factor_355_imbal_greater_than_950m != 1 -- skipping")
+			continue
+		hack_size = fill["size_filled"] // 2
+		if hack_size < 1:
+			log_fn(f"{parent}: size_filled={fill['size_filled']}, hack_size<1 -- skipping")
+			continue
+		account = _lookup_parent_account(parent, log_fn)
+		if account is None:
+			continue
+		# v8 remap (ACCOUNT_MAP set by 355pm_script_v8): _lookup_parent_account returns v7 closer
+		# accounts -- map them, FAIL-CLOSED on a miss (never send a v8-book hacker to a v7 account).
+		if ACCOUNT_MAP is not None:
+			if account not in ACCOUNT_MAP:
+				log_fn(f"{'!' * 10} {parent}: account '{account}' NOT in ACCOUNT_MAP -- SKIPPING "
+				       f"hacker (fail-closed; add it to the v8 script's map) {'!' * 10}")
+				continue
+			account = ACCOUNT_MAP[account]
+		if is_test:
+			account = TEST_ACCOUNT_OVERRIDE if TEST_ACCOUNT_OVERRIDE is not None else TEST_ACCOUNTS.get(account, account)
+		surviving.append((fill, hack_size, account))
+		needed_legs.add((float(fill["short_strike"]), cp))
+		needed_legs.add((float(fill["long_strike"]),  cp))
+
+	if not surviving:
+		log_fn("no adversarial hackers survived gate -- nothing to fire")
+		return
+
+	# ---- Step 2: batch-fetch leg data from sranalytics ----
+	legs_by_key = await _fetch_legs(needed_legs, today, log_fn)
+	if not legs_by_key:
+		log_fn("no leg data returned from sranalytics -- cannot build hackers")
+		return
+
+	# ---- Step 3: build trade dicts + kick off send_complex_two_waves concurrently ----
+	built_trades = []
+	fire_tasks = []
+	for fill, hack_size, account in surviving:
+		parent = fill["parent_algo_name"]
+		cp     = fill["cp"]
+		long_key  = (float(fill["short_strike"]), cp)   # hacker BUYS parent's short strike
+		short_key = (float(fill["long_strike"]),  cp)   # hacker SELLS parent's long strike
+		long_leg  = legs_by_key.get(long_key)
+		short_leg = legs_by_key.get(short_key)
+		if long_leg is None or short_leg is None:
+			log_fn(f"HACK_{parent}: missing leg data (long_key={long_key} short_key={short_key}) -- skipping")
+			continue
+
+		price = -(long_leg.sprc - short_leg.sprc)   # negative for a debit
+		# Floored 355-methodology blend of the static baseline (srprc = the spread's sprc magnitude).
+		_et1, _me1, _et2, _me2 = _hacker_edges(
+			abs(price), vix, atm_vol_0dte, abs_imbal, abs_chg_imbal, log_fn, f"HACK_{parent}")
+
+		trade = {
+			"name":         f"HACK_{parent}",
+			"structure":    "Put Debit" if cp == "Put" else "Call Debit",
+			"symbol":       "SPXW",
+			"exp":          today,
+			"account":      account,
+			"short_legs":   [short_leg],
+			"long_legs":    [long_leg],
+			"direction":    "Buy",
+			"is_sale":      False,
+			"size":         hack_size,
+			"min_size":     1,
+			"max_size":     hack_size,
+			"dollar_target": None,
+			"price":        round(price, 2),   # 2dp for recap display + logged price_attempted (raw `price` kept for srprc/edge calc above)
+			"edge_target1": _et1,
+			"max_edge1":    _me1,
+			"edge_target2": _et2,
+			"max_edge2":    _me2,
+			# Cap max debit at HACK_MAX_PRICE via min_price (existing send_complex_two_waves
+			# semantic: limit_price clamped to at least min_price -- for debits limit_price is
+			# negative, so min_price=-HACK_MAX_PRICE caps the debit we pay at HACK_MAX_PRICE).
+			"min_price":    -HACK_MAX_PRICE,
+			"grouping_codes": None,
+		}
+
+		log_fn(f"HACK_{parent} ADVERSARIAL -- firing size={hack_size} price={price:.3f} "
+		       f"long_strike={fill['short_strike']} short_strike={fill['long_strike']} account={account}")
+
+		built_trades.append(trade)
+		fire_tasks.append(_fire_one(trade, log_fn=log_fn))
+
+	if not fire_tasks:
+		log_fn("no hackers had usable leg data -- nothing to fire")
+		return
+
+	log_fn(f"firing {len(fire_tasks)} hacker(s) concurrently via asyncio.gather")
+	results = await asyncio.gather(*fire_tasks, return_exceptions=True)
+
+	# Attach grouping_codes and append to trade_dict for main-script log_trades to pick up.
+	for trade, result in zip(built_trades, results):
+		# Per-wave limits + gc split captured by send_complex_two_waves (empty dict if the send
+		# raised before capture was filled -> wave fields stay None).
+		_cap = trade.get("_wave_capture") or {}
+		trade["wave1_limit"] = _cap.get("wave1_limit")
+		trade["wave2_limit"] = _cap.get("wave2_limit")
+		trade["wave1_grouping_codes"] = _cap.get("wave1_codes")
+		trade["wave2_grouping_codes"] = _cap.get("wave2_codes")
+		trade["cross_price1"] = _cap.get("cross_price1")
+		trade["srprc1"] = _cap.get("srprc1")
+		trade["cross_price2"] = _cap.get("cross_price2")
+		trade["srprc2"] = _cap.get("srprc2")
+		if isinstance(result, Exception):
+			log_fn(f"{trade['name']} SEND FAILED: {result}")
+			trade["grouping_codes"] = []
+		elif isinstance(result, list):
+			trade["grouping_codes"] = result
+			log_fn(f"{trade['name']} sent; grouping_codes={result}")
+		else:
+			log_fn(f"{trade['name']} sent; unexpected result type {type(result).__name__}: {result}")
+			trade["grouping_codes"] = []
+		trade_dict["trades"].append(trade)
+		trade_dict["trade_types"].append("complex")
+
+
+def refresh_hacker_fills(trade_dict, factors, script_name, log_fn=None):
+	"""Second algo_trade_log pass for hackers with a WAVE-3 resting order, which can fill any
+	time up to 16:00 -- after the main log_trades 60s fill snapshot. Sleeps until ~16:00:30 ET,
+	then re-runs log_trades on JUST those hacker trades: the ON DUPLICATE KEY UPDATE upsert
+	refreshes size_filled / avg_fill_price / wave fills on the existing rows in place.
+	Fast no-op (no sleep) when no hacker carries wave-3 codes, so non-hack days exit on time.
+	Never raises."""
+	if log_fn is None:
+		log_fn = lambda msg: print(f"refresh_hacker_fills: {msg}")
+	try:
+		hack_trades = [
+			t for t, tt in zip(trade_dict["trades"], trade_dict["trade_types"])
+			if tt == "complex" and str(t.get("name", "")).startswith("HACK_")
+			and t.get("wave3_grouping_codes")
+		]
+		if not hack_trades:
+			log_fn("no wave-3 hackers today; skipping second logging pass")
+			return
+		from calendar_utils import getNowEst
+		now = getNowEst()
+		target = now.replace(hour=16, minute=0, second=30, microsecond=0)
+		wait_s = max(0, min(int((target - now).total_seconds()), 600))
+		log_fn(f"{len(hack_trades)} wave-3 hacker(s); re-logging fills in {wait_s}s (~16:00:30 ET)")
+		sub_dict = {"trades": hack_trades, "trade_types": ["complex"] * len(hack_trades)}
+		from algo_trade_logger import log_trades
+		log_trades(sub_dict, factors, wait_seconds=wait_s, script_name=script_name)
+		log_fn("second logging pass complete")
+	except Exception as e:
+		log_fn(f"ERROR (non-fatal): {e}")

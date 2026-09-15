@@ -1,0 +1,99 @@
+"""Gateway acceptance test for the hacker W3/W4 order type (9/11/26 change).
+
+Sends ONE lot, Simple/Activetaker with an explicit NBBO-derived limit, through the exact
+trade_complex path the new hacker waves 3/4 use -- selling the SPXW 0DTE 7670/7665 put
+spread (short 7670P / long 7665P) -- then settles it with the status-gated
+batched_fill_check_and_cancel (which also cancels any live remainder, so nothing rests).
+
+TEST ACCOUNTS ONLY: refuses to run unless the account starts with "T.".
+
+Usage (scratch/.venv python, per the algos venv rule):
+  v7: .../python.exe test_hacker_w34_gateway.py --book v7 --send
+  v8: .../python.exe test_hacker_w34_gateway.py --book v8 --send
+Without --send it prints the quote pull and the limit it WOULD send, and exits.
+"""
+import argparse
+import asyncio
+import datetime as dt
+import sys
+
+sys.path.insert(0, "D:/PycharmProjects/scratch/algos/")
+sys.path.insert(0, "D:/PycharmProjects/utils/")
+
+ACCOUNTS = {"v7": "T.AGM", "v8": "T.AGMV8.01"}
+SHORT_STRIKE, LONG_STRIKE = 7670.0, 7665.0   # sell 7670P, buy 7665P (credit)
+SALE_OFFSET = 0.05    # credit asked = sell-cross - this (aggressive, mirrors W3's buy logic)
+MIN_CREDIT = 0.05
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--book", choices=["v7", "v8"], required=True)
+    ap.add_argument("--send", action="store_true", help="actually send; default is dry-run")
+    ap.add_argument("--handling", default="Seeker", choices=["Seeker", "Activetaker"],
+                    help="parentOrderHandling. Activetaker was REJECTED BadOrdType on mleg "
+                         "(v7, gc 5524, 9/11/26); Seeker+Simple works the plain limit.")
+    args = ap.parse_args()
+
+    account = ACCOUNTS[args.book]
+    assert account.startswith("T."), f"refusing: {account} is not a T.* test account"
+
+    import spdr_rock_order_functions as srof
+    from spdr_rock_functions import run_query
+    if args.book == "v8":
+        srof.use_v8(True)
+
+    # Per-book NBBO table via the same helper the hacker W3/W4 uses.
+    import hacker_trades as ht
+    table = ht._nbbo_table()
+    today = dt.date.today()
+    sql = (f"SELECT okey_xx, okey_cp, sprc, obid, oask, timestamp FROM {table} "
+           f"WHERE (okey_tk, okey_xx, okey_cp, okey_yr, okey_mn, okey_dy) IN ("
+           f"('SPXW',{SHORT_STRIKE},'Put',{today.year},{today.month},{today.day}),"
+           f"('SPXW',{LONG_STRIKE},'Put',{today.year},{today.month},{today.day}))")
+    df = run_query(sql, database="sranalytics", verbose=True, tag="w34_gateway_test")
+    assert df is not None and len(df) == 2, f"quote pull returned {0 if df is None else len(df)} rows"
+    rows = {float(r.okey_xx): r for _, r in df.iterrows()}
+    s, l = rows[SHORT_STRIKE], rows[LONG_STRIKE]
+    print(f"[{args.book}] {table}")
+    print(f"  short 7670P nbbo {float(s.obid):.2f}/{float(s.oask):.2f} sprc {float(s.sprc):.3f} ts {s.timestamp}")
+    print(f"  long  7665P nbbo {float(l.obid):.2f}/{float(l.oask):.2f} sprc {float(l.sprc):.3f} ts {l.timestamp}")
+
+    # Sell-side cross = short bid - long ask; ask just under it so the order is marketable.
+    cross = float(s.obid) - float(l.oask)
+    limit = round(max(MIN_CREDIT, cross - SALE_OFFSET), 2)
+    print(f"  sell cross {cross:.2f} -> explicit_limit {limit} "
+          f"(Simple/{args.handling}, 1 lot, 30s)")
+
+    if not args.send:
+        print("DRY RUN -- no order sent. Re-run with --send.")
+        return
+
+    codes = srof.trade_complex(
+        symbol="SPXW", size=1, short_legs=[s], long_legs=[l], exp=today, account=account,
+        edge_target=0.02, is_sale=True, userData=f"W34_GATEWAY_TEST_{args.book.upper()}",
+        orderDuration=30, min_price=None,
+        limit_class="Simple", parent_handling=args.handling, explicit_limit=limit,
+    )
+    print(f"  sent, grouping_codes={codes}")
+
+    async def settle():
+        await asyncio.sleep(5)
+        return await srof.batched_fill_check_and_cancel(codes, {gc: account for gc in codes})
+
+    filled_map, unconfirmed = asyncio.run(settle())
+    print(f"  after 5s: filled_map={filled_map} unconfirmed={sorted(unconfirmed) if unconfirmed else 'none'}")
+    # Honest verdict: read the actual status + reject reason (terminal also means Rejected).
+    codes_csv = ",".join(f"'{gc}'" for gc in codes)
+    st = run_query("SELECT groupingcode, spdrOrderStatus, spdrCloseReason, spdrRejectReason, "
+                   f"fillQuan1 FROM srtrade.msgsrmlegbrkrstate WHERE groupingcode IN ({codes_csv})",
+                   "srtrade")
+    print(st.to_string(index=False) if st is not None and not st.empty else "  no state row found")
+    if st is not None and not st.empty:
+        rejected = st.spdrOrderStatus.isin(["Rejected", "SendReject"]).any()
+        print("  GATEWAY " + ("REJECTED -- reason above" if rejected
+                              else "ACCEPTED -- worked/closed without a reject"))
+
+
+if __name__ == "__main__":
+    main()

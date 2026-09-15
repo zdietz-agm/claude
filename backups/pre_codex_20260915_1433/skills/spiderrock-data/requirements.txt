@@ -1,0 +1,7 @@
+# Pinned to versions installed on this machine as of 2026-07-21.
+# Install manually: pip install -r requirements.txt
+pandas==2.3.3
+
+# NOTE: the `liberator` module itself is NOT on PyPI. It is distributed by
+# SpiderRock and lives in D:/PycharmProjects/spdr_liberator/ along with the
+# per-user credentials (liberator.json / liberator.pfx). See SKILL.md.

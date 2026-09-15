@@ -1,0 +1,59 @@
+# Diagnose why blpapi Session.start() takes ~16s. Usage:
+#   python blp_session_start_diag.py dns              # getaddrinfo order + raw TCP connect timing per address
+#   python blp_session_start_diag.py start <host>     # time Session.start() against <host> (localhost / 127.0.0.1)
+#   python blp_session_start_diag.py trace            # Session.start() against localhost with blpapi TRACE logging
+import socket
+import sys
+import time
+
+import blpapi
+
+
+def dns():
+    infos = socket.getaddrinfo("localhost", 8194, 0, socket.SOCK_STREAM)
+    for fam, _, _, _, addr in infos:
+        t0 = time.perf_counter()
+        try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
+            s.settimeout(30)
+            s.connect(addr)
+            res = "connected"
+            s.close()
+        except Exception as e:
+            res = f"FAILED {type(e).__name__}: {e}"
+        print(f"  {fam.name:<8} {addr[0]:<12} -> {res} ({(time.perf_counter()-t0)*1000:.0f}ms)")
+    t0 = time.perf_counter()
+    s = socket.create_connection(("localhost", 8194), timeout=30)
+    s.close()
+    print(f"  create_connection('localhost') -> {(time.perf_counter()-t0)*1000:.0f}ms")
+
+
+def start(host, trace=False):
+    if trace:
+        def cb(ts, lvl, tid, fname, msg):
+            print(f"  [{time.perf_counter()-t0:7.3f}s] {msg}")
+        blpapi.Logger.registerCallback(cb, blpapi.Logger.SEVERITY_TRACE)
+    opts = blpapi.SessionOptions()
+    opts.setServerHost(host)
+    opts.setServerPort(8194)
+    print(f"  numStartAttempts={opts.numStartAttempts()} connectTimeout={opts.connectTimeout()}ms "
+          f"serverAddresses={[opts.getServerAddress(i) for i in range(opts.numServerAddresses())]}")
+    sess = blpapi.Session(opts)
+    t0 = time.perf_counter()
+    ok = sess.start()
+    print(f"  Session.start(host={host!r}) ok={ok} took {(time.perf_counter()-t0)*1000:.0f}ms")
+    t1 = time.perf_counter()
+    sess.openService("//blp/refdata")
+    print(f"  openService took {(time.perf_counter()-t1)*1000:.0f}ms")
+    sess.stop()
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1]
+    if mode == "dns":
+        dns()
+    elif mode == "start":
+        start(sys.argv[2])
+    elif mode == "trace":
+        t0 = time.perf_counter()
+        start("localhost", trace=True)

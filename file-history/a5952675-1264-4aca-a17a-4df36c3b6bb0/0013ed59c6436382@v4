@@ -1,0 +1,38 @@
+"""Configuration for bumped spread strategy (sell $5-wide spreads on 1-lot days)."""
+
+from algo_globals import *
+
+# Per-strategy config: account, dollar_target, max_size
+# 2026-09-11: all three sized down 25% after fixing the backtest's double-bump strike-selection
+# bug (backtest sold 2 strikes closer than prod on ~25% of legs); fixed backtests are materially
+# less attractive. See D:/agent_projects/eod_option_algos/prod_change_logs/9_11_2026.md.
+# 2026-09-11: values below are LITERAL (no scaled() / SIZE_KNOB). Pre-9/11 base amounts were
+# multiplied by SIZE_KNOB=2.6 at import; these are 75% of those effective sizes.
+# NOTE: v7+v8 together run 1.2x these numbers (v8 at V8_SIZE_RATIO 0.20). When v7 retires, scale
+# these up ~20% to hold total exposure constant. See migration_to_v8.txt.
+BUMPED_PARENT_CONFIGS = {
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_GROWS": {
+        "account": "EOD20_C42",
+        "dollar_target": 42900,  # -25% on 2026-09-11 (was scaled(22000) = 57200); +10% on 2026-05-27 (was 20000 base)
+        "max_size": 86,          # -25% on 2026-09-11 (was scaled(44) = 114, 85.5 rounded up); +10% on 2026-05-27 (was 40 base)
+    },
+    # Re-added 2026-05-06 at quarter-size ($2.5k/5) in new account EOD28_C42 after retiring
+    # on 2026-04-23. Earlier bumped sizing ($10k/20) earned ~all PnL on overlap days with
+    # IMBAL_GROWS; this smaller standalone fire is a low-capital probe of standalone PnL.
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_VS_MARKET": {
+        "account": "EOD28_C42",
+        "dollar_target": 10725,  # -25% on 2026-09-11 (was scaled(5500) = 14300); +10% on 2026-05-27 (was 5000 base)
+        "max_size": 25,          # -25% on 2026-09-11 (was scaled(13) = 33, 24.75 rounded up); +10% on 2026-05-27 (was 10 base) # 11 to 13 on 6/4
+    },
+    # IMBAL_SHRINKS added to bumped layer on 2026-04-23. 2-way overlap with IMBAL_GROWS:
+    # only 1 shared (date, side) out of 127, nearly orthogonal additive book.
+    "ALGO_42_350PM_SPREAD_SALES_SPX_IMBAL_SHRINKS": {
+        "account": "EOD25_C42",
+        "dollar_target": 32175,  # -25% on 2026-09-11 (was scaled(16500) = 42900); +10% on 2026-05-27 (was 15000 base)
+        "max_size": 64,          # -25% on 2026-09-11 (was scaled(33) = 85, 63.75 rounded up); +10% on 2026-05-27 (was 30 base)
+    },
+}
+
+BUMP_STEP = 5          # how far to bump the short strike toward ATM ($5 = 1 SPXW index)
+SPREAD_WIDTH = 15      # distance between short and long legs
+MAX_ATM_VOL = 0.14     # only trade when atmVol < this

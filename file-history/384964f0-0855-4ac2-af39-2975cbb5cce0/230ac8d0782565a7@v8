@@ -1,0 +1,178 @@
+"""
+Large index flows -- Excel export of the 0DTE strangle backtest (hold to expiry).
+
+One tab per entry time (15_00, 15_10, 15_20, 15_30, 15_40), one row per event sorted
+by index-flow size, columns per Zach's 9/14/26 spec, plus a Settings tab with every
+parameter and formula so the workbook is recreatable.
+
+Run from Git Bash:
+    python /d/agent_projects/large_index_flows/export_backtest_excel.py
+"""
+import datetime as dt
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from openpyxl.utils import get_column_letter
+from sqlalchemy import create_engine
+
+import backtest_strangle as bs
+import baseline_richness as br
+import realized_vol_richness as rv
+
+EVENTS_CSV = os.path.join(bs.PROJ_DIR, 'large_flow_events.csv')
+ENTRY_TIMES = [dt.time(15, 0), dt.time(15, 10), dt.time(15, 20), dt.time(15, 30), dt.time(15, 40)]
+DOLLAR_COLS = {'px_trade_time', 'close', 'call_bid', 'call_ask', 'call_px', 'put_bid', 'put_ask', 'put_px',
+               'total_cost', 'call_max_bid', 'put_max_bid'}
+BPS_COLS = {'pnl_bps', 'move_bps', 'total_cost_bps', 'base1_bps', 'base2_bps', 'base3_bps', 'base4_bps', 'base_mean_bps',
+            'one_day_move_bps'}
+TAIL_COLS = ['base1_date', 'base1_bps', 'base2_date', 'base2_bps', 'base3_date', 'base3_bps', 'base4_date', 'base4_bps',
+             'base_mean_bps', 'richness_baseline', 'sigma_30d', 'one_day_move_bps', 'richness_realized']
+EVENT_TYPE = {('sp500_add', 'buy'): 'ADD', ('other_index_event', 'buy'): 'UPWGT', ('other_index_event', 'sell'): 'DOWNWGT'}
+COLUMNS = ['eff_date', 'symbol', 'pnl_bps', 'payout', 'event_type', 'est_flow_bn', 'px_trade_time', 'close', 'move_bps',
+           'call_strike', 'put_strike', 'call_bid', 'call_ask', 'call_px', 'put_bid', 'put_ask', 'put_px',
+           'total_cost', 'total_cost_bps', 'winner',
+           'call_max_bid', 'call_max_bid_time', 'put_max_bid', 'put_max_bid_time', 'entry_time']
+
+
+def leg_quote_stats(q, strike, cp, spread_paid):
+    """Median bid / ask, median fill (bid + spread_paid x spread) and n quotes for one leg over the entry window."""
+    sub = q[(q.strike == strike) & (q.cp == cp) & (q.askPrc > 0) & (q.askPrc >= q.bidPrc)]
+    if sub.empty:
+        return dict(bid=np.nan, ask=np.nan, px=np.nan, n=0)
+    fills = sub.bidPrc + spread_paid * (sub.askPrc - sub.bidPrc)
+    return dict(bid=sub.bidPrc.median(), ask=sub.askPrc.median(), px=bs.round_up_cent(fills.median()), n=len(sub))
+
+
+def build_tab(eng, entry_time, flows, spread_paid=bs.SPREAD_PAID, otm_bps=bs.OTM_BPS, window_sec=bs.ENTRY_WINDOW_SEC,
+              max_pushes=bs.MAX_PUSHES):
+    """One row per event for `entry_time` (hold to expiry), columns per COLUMNS + TAIL_COLS (baseline-Friday
+    richness and realized-vol richness), sorted by est_flow_bn desc. Args -- eng: dev engine; entry_time: entry
+    snap; flows: eff_date/symbol/event_type frame; spread_paid: fraction of spread paid; otm_bps: min OTM per leg;
+    window_sec: median-fill window; max_pushes: one-strike push-outs allowed when cost > MAX_COST_BPS."""
+    label = entry_time.strftime('%H:%M')
+    events = bs.load_events(spot_col=label)
+    bt = bs.run_backtest(events, eng, entry_time=entry_time, otm_bps=otm_bps, spread_paid=spread_paid,
+                         window_sec=window_sec, max_pushes=max_pushes)
+    bt = bt.merge(flows, on=['eff_date', 'symbol'], how='left')
+    end = (dt.datetime.combine(dt.date.today(), entry_time) + dt.timedelta(seconds=window_sec)).time()
+    rows = []
+    for r in bt.itertuples(index=False):
+        q = bs.load_entry_quotes(eng, r.symbol, r.eff_date, entry_time, end)
+        c = leg_quote_stats(q, r.call_strike, 'Call', spread_paid)
+        p = leg_quote_stats(q, r.put_strike, 'Put', spread_paid)
+        total = c['px'] + p['px']
+        payoff = max(r.close - r.call_strike, 0.0) + max(r.put_strike - r.close, 0.0)
+        rows.append({
+            'eff_date': r.eff_date, 'symbol': r.symbol, 'pnl_bps': r.pnl_hold_bps,
+            'event_type': EVENT_TYPE.get((r.event_type, r.direction), r.event_type),
+            'est_flow_bn': r.est_flow_bn, 'px_trade_time': r.spot_1500, 'close': r.close, 'move_bps': r.move_bps,
+            'call_strike': r.call_strike, 'put_strike': r.put_strike,
+            'call_bid': c['bid'], 'call_ask': c['ask'], 'call_px': c['px'],
+            'put_bid': p['bid'], 'put_ask': p['ask'], 'put_px': p['px'],
+            'total_cost': total, 'total_cost_bps': r.cost_bps,
+            'payout': (payoff - total) / total if total else np.nan,   # net: -1 = expired worthless
+            'winner': r.winner,
+            'call_max_bid': r.call_max_bid, 'call_max_bid_time': r.call_max_t,
+            'put_max_bid': r.put_max_bid, 'put_max_bid_time': r.put_max_t,
+            'entry_time': label,
+        })
+    tab = pd.DataFrame(rows)[COLUMNS]
+    # trailing richness columns: baseline Fridays (annc Friday excluded, mean) and realized-vol one-day move
+    base = br.build(eng, entry_time, save=False)
+    base_cols = ['eff_date', 'symbol'] + [c for c in TAIL_COLS if c.startswith('base')]
+    tab = tab.merge(base[base_cols].rename(columns={}), on=['eff_date', 'symbol'], how='left')
+    tab['richness_baseline'] = tab['total_cost_bps'] / tab['base_mean_bps']
+    tab['sigma_30d'] = [rv.realized_vol_tm1(s, d) for s, d in zip(tab.symbol, tab.eff_date)]
+    tab['one_day_move_bps'] = tab['sigma_30d'] / np.sqrt(252) * 100
+    tab['richness_realized'] = tab['total_cost_bps'] / tab['one_day_move_bps']
+    return tab[COLUMNS + TAIL_COLS].sort_values('est_flow_bn', ascending=False).reset_index(drop=True)
+
+
+def settings_tab():
+    """Settings / formulas used, one row each."""
+    return pd.DataFrame([
+        ('entry_times', ', '.join(t.strftime('%H:%M') for t in ENTRY_TIMES), 'one tab per entry time; strikes and spot re-picked at each'),
+        ('events', f'large_flow_events.csv, est_flow_bn >= {bs.MIN_FLOW_BN:g}, eff_date < today', f'{len(pd.read_csv(EVENTS_CSV))} listed, BE 2026-09-18 excluded (future)'),
+        ('est_flow_bn', '12% x CUR_MKT_CAP (Bloomberg, full cap, annc date) / 1e9', 'S&P adds; AVGO 16 (DOWNWGT) and AAPL 30 (UPWGT) entered by Zach'),
+        ('event_type', 'ADD = regular-cycle S&P 500 add; UPWGT = index up-weight (buy); DOWNWGT = index down-weight (sell)', ''),
+        ('px_trade_time', 'CloudQuant trade print nearest entry_time:00', 'vbam_utilities.cloudquant.get_prices_batch, team cache; intraday_prices.csv'),
+        ('close', 'Bloomberg PX_LAST, adjust=- (unadjusted)', 'vbam_utilities.bloomberg.my_bdh'),
+        ('move_bps', '(close / px_trade_time - 1) x 1e4', ''),
+        ('otm_bps', bs.OTM_BPS, 'call_strike = lowest 0DTE strike >= px x (1 + otm_bps/1e4); put_strike = highest <= px x (1 - otm_bps/1e4); 0 = closest OTM call / put'),
+        ('max_cost_bps / max_pushes', f'{bs.MAX_COST_BPS} / {bs.MAX_PUSHES}', 'if total_cost_bps > max_cost_bps push both strikes out one strike, at most max_pushes times; 0 = never push (pure first-OTM)'),
+        ('quotes', 'ThetaData v3 1-sec NBBO bars, optionsResearch.t_opra_quotes', 'pull_0dte_quotes.py: exp == eff_date, strikes within 8% of 15:00 px, 15:00-16:00'),
+        ('entry_window_sec', bs.ENTRY_WINDOW_SEC, 'quotes from entry_time:00 through entry_time:10 inclusive (11 one-sec bars)'),
+        ('spread_paid', bs.SPREAD_PAID, 'per-second fill = bid + spread_paid x (ask - bid)'),
+        ('call_bid / call_ask / put_bid / put_ask', 'median over the entry window', 'zero bid with positive ask is a real no-bid market and is kept; ask <= 0 or crossed quotes dropped'),
+        ('call_px / put_px', 'median of the per-second fills over the entry window, rounded UP to the next penny', 'not bid_med + spread_paid x (ask_med - bid_med), so it can differ by a cent'),
+        ('total_cost', 'call_px + put_px ($ per share)', ''),
+        ('total_cost_bps', 'total_cost / px_trade_time x 1e4', ''),
+        ('exit', 'hold to expiry', 'payoff = max(close - call_strike, 0) + max(put_strike - close, 0)'),
+        ('pnl_bps', '(payoff - total_cost) / px_trade_time x 1e4', ''),
+        ('payout', '(payoff - total_cost) / total_cost (net return on premium paid)', '-1 = expired worthless, 0 = break-even, 2.32 = MRVL 15:40'),
+        ('winner', 'leg that finished in the money (call / put / none)', ''),
+        ('call_max_bid / put_max_bid', 'highest 1-sec bid for the traded leg after the entry window through 16:00, with its time', 'for limit-order exit variants; not used in pnl here'),
+        ('base1..base4', 'closest-OTM strangle cost bps at the SAME entry time on the 4 Fridays before eff_date, announcement Friday (2nd back) excluded', 'pull_baseline_quotes.py quotes + baseline_spots.csv spots; NaN = no 15:00 print that day (half-days)'),
+        ('base_mean_bps', 'mean of the available base1..base4', ''),
+        ('richness_baseline', 'total_cost_bps / base_mean_bps', 'event strangle as a multiple of the name''s normal Friday'),
+        ('sigma_30d', 'Bloomberg VOLATILITY_30D (annualized realized, %) at the prior trading day close', 'cached my_bdh'),
+        ('one_day_move_bps', 'sigma_30d / sqrt(252) x 100', 'one-sigma full-day move'),
+        ('richness_realized', 'total_cost_bps / one_day_move_bps', 'strangle cost as a fraction of a normal one-day move'),
+        ('scripts', 'D:/agent_projects/large_index_flows/', 'build_flow_list.py -> pull_intraday_prices.py -> pull_0dte_quotes.py -> backtest_strangle.py -> export_backtest_excel.py'),
+        ('generated', dt.datetime.now().strftime('%Y-%m-%d %H:%M'), ''),
+    ], columns=['setting', 'value', 'note'])
+
+
+def export(sheets, base_name):
+    """Write the sheets to Downloads/<base_name>_YYYYMMDD_HHMM.xlsx with filter, frozen panes, formats."""
+    path = str(Path.home() / 'Downloads' / f"{base_name}_{dt.datetime.now():%Y%m%d_%H%M}.xlsx")
+    with pd.ExcelWriter(path, engine='openpyxl') as w:
+        for name, df in sheets.items():
+            df.to_excel(w, sheet_name=name, index=False)
+            ws = w.sheets[name]
+            ws.auto_filter.ref = ws.dimensions
+            ws.freeze_panes = 'C2'
+            for i, col in enumerate(df.columns, 1):
+                letter = get_column_letter(i)
+                width = max(len(str(col)), df[col].astype(str).str.len().max() if len(df) else 0)
+                ws.column_dimensions[letter].width = min(width + 2, 90 if name == 'Settings' else 18)
+                fmt = None
+                if col in DOLLAR_COLS:
+                    fmt = '_($* #,##0.00_);[Red]_($* (#,##0.00)'
+                elif col in BPS_COLS:
+                    fmt = '0.0;[Red]-0.0'
+                elif col == 'payout':
+                    fmt = '0.00;[Red]-0.00'
+                elif col == 'est_flow_bn':
+                    fmt = '0.0'
+                if fmt:
+                    for row in range(2, len(df) + 2):
+                        ws[f'{letter}{row}'].number_format = fmt
+    print(f'Saved: {path}')
+    return path
+
+
+if __name__ == '__main__':
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--otm-bps', type=float, default=bs.OTM_BPS,
+                    help=f'min OTM per leg in bps (default {bs.OTM_BPS}); 0 = closest OTM call and put')
+    ap.add_argument('--max-pushes', type=int, default=bs.MAX_PUSHES,
+                    help=f'one-strike push-outs allowed when cost > {bs.MAX_COST_BPS} bps (default {bs.MAX_PUSHES}); 0 = never push')
+    args = ap.parse_args()
+    bs.OTM_BPS = args.otm_bps        # so the Settings tab reports what was actually used
+    bs.MAX_PUSHES = args.max_pushes
+
+    eng = create_engine(bs.vbam_helpers.dev_connection_string, pool_pre_ping=True)
+    flows = pd.read_csv(EVENTS_CSV, parse_dates=['eff_date'])
+    flows['eff_date'] = flows['eff_date'].dt.date
+    flows = flows[['eff_date', 'symbol', 'event_type']]
+    sheets = {}
+    for t in ENTRY_TIMES:
+        tab = build_tab(eng, t, flows, otm_bps=args.otm_bps, max_pushes=args.max_pushes)
+        sheets[t.strftime('%H_%M')] = tab
+        print(f"{t:%H:%M}: {len(tab)} rows, total pnl {tab.pnl_bps.sum():,.1f} bps, win rate {(tab.pnl_bps > 0).mean():.0%}", flush=True)
+    sheets['Settings'] = settings_tab()
+    export(sheets, f"large_index_flows_strangle_hold_otm{args.otm_bps:g}" + ("_nopush" if args.max_pushes == 0 else ""))
